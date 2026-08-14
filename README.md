@@ -12,6 +12,38 @@
 - CSV 月度历史、INFO/ERROR 控制台及文件轮转日志；
 - Waitress 生产服务器。
 
+## 系统架构
+
+```mermaid
+flowchart TD
+    sensor["小米温湿度计 TH-01"] --> integration["Xiaomi Home 集成"]
+    integration --> entity["Home Assistant 温度/湿度实体"]
+    entity --> automation["状态变化触发 Automation"]
+    automation --> rest["rest_command.python_test"]
+    rest -->|"POST /temperature"| api["Temperature Monitor / Flask"]
+    api --> validate["设备校验、单位转换、在线状态处理"]
+    validate --> feishu["飞书多维表格"]
+    validate --> csv["CSV 月度历史"]
+    api --> log["轮转日志"]
+```
+
+数据链路分为三层：
+
+1. Home Assistant 通过 Xiaomi Home 集成读取传感器实体；温度或湿度发生变化时，自动化调用 `rest_command.python_test`。
+2. Flask 的 `POST /temperature` 接口校验设备与数值，并依据 `SOURCE_TEMPERATURE_UNIT` 统一转换为摄氏度。
+3. 服务将最新状态写入飞书多维表格，同时把处理结果保存到月度 CSV 和轮转日志中。离线上报只更新在线状态，不覆盖最后一次有效读数。
+
+仓库结构中的职责如下：
+
+```text
+homeassistant/       HA REST 命令与 TH-01 自动化示例
+routes/              HTTP 路由与响应处理
+services/            校验、飞书通信、Token、重试与本地存储
+app.py               Flask 应用、日志和 Waitress 启动入口
+config.py            环境变量、设备映射与运行目录配置
+Dockerfile           容器化运行配置
+```
+
 ## 本地运行
 
 建议使用 Python 3.12：
@@ -80,22 +112,28 @@ docker run -d \
 | `DATA_DIR` | 否 | `/app/data` | 容器内 CSV 目录 |
 | `LOG_DIR` | 否 | `/app/logs` | 容器内日志目录 |
 
-## Home Assistant 调用示例
+## Home Assistant 配置
+
+可直接参考 [`homeassistant/rest_command.yaml`](homeassistant/rest_command.yaml) 和 [`homeassistant/automation_th01.example.yaml`](homeassistant/automation_th01.example.yaml)。自动化中的 `sensor.th01_temperature` 与 `sensor.th01_humidity` 是脱敏后的示例实体 ID，使用前请替换为 Home Assistant 中的真实实体。
+
+REST 命令的核心配置如下：
 
 ```yaml
 rest_command:
-  send_temperature:
-    url: "http://<服务地址>:5000/temperature"
+  python_test:
+    url: "http://local-temperature-monitor:5000/temperature"
     method: POST
-    content_type: "application/json"
+    headers:
+      Content-Type: application/json
     payload: >
       {
         "device": "{{ device }}",
         "temperature": "{{ temperature }}",
-        "humidity": "{{ humidity }}",
-        "status": "{{ status }}"
+        "humidity": "{{ humidity }}"
       }
 ```
+
+示例配置没有传递 `status`；后端为了兼容现有 Home Assistant 配置，会将缺省状态视为“在线”。其他传感器可复制 TH-01 自动化，并替换设备名和两个实体 ID。
 
 请求示例：
 
