@@ -2,7 +2,7 @@
 
 安装后，在 Add-on 的“配置”页面填写飞书应用凭据。程序默认按飞书表中的“设备编号”字段自动匹配设备名并识别 `record_id`。
 
-若字段名称不同，请修改 `device_id_field`。也可以使用可选的 JSON `device_record_map` 手动覆盖个别设备：
+若字段名称不同，请修改 `device_id_field`。如果 HA 上报设备名和飞书设备编号不同，使用可选的 JSON `device_name_map` 映射，例如 `{"sensor.warehouse_temp":"DEV-01"}`。也可以使用可选的 JSON `device_record_map` 手动覆盖个别设备：
 
 ```json
 {"DEV-01":"recxxxxxxxxxxxx"}

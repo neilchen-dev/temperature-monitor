@@ -40,6 +40,10 @@ def _load_hassio_options() -> None:
     if device_record_map not in (None, ""):
         os.environ.setdefault("DEVICE_RECORD_MAP", str(device_record_map))
 
+    device_name_map = options.get("device_name_map")
+    if device_name_map not in (None, ""):
+        os.environ.setdefault("DEVICE_NAME_MAP", str(device_name_map))
+
 
 _load_hassio_options()
 
@@ -113,7 +117,31 @@ def _get_devices() -> dict[str, dict[str, str]]:
     return devices
 
 
+def _get_device_name_map() -> dict[str, str]:
+    raw_value = os.getenv("DEVICE_NAME_MAP", "").strip()
+    if not raw_value:
+        return {}
+
+    try:
+        mapping = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("DEVICE_NAME_MAP 必须是有效的 JSON 对象") from exc
+
+    if not isinstance(mapping, dict):
+        raise ValueError("DEVICE_NAME_MAP 必须是 JSON 对象")
+
+    normalized_mapping: dict[str, str] = {}
+    for source_name, bitable_name in mapping.items():
+        source = str(source_name).strip().upper()
+        target = str(bitable_name).strip().upper()
+        if not source or not target:
+            raise ValueError("DEVICE_NAME_MAP 中的设备名不能为空")
+        normalized_mapping[source] = target
+    return normalized_mapping
+
+
 DEVICES = _get_devices()
+DEVICE_NAME_MAP = _get_device_name_map()
 
 
 def ensure_runtime_directories() -> None:
