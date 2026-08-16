@@ -121,7 +121,7 @@ Dockerfile           容器化运行配置
 建议使用 Python 3.12：
 
 ```powershell
-git clone https://github.com/zhengzhi65535-bot/temperature-monitor.git
+git clone https://github.com/neilchen-dev/temperature-monitor.git
 cd temperature-monitor
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
