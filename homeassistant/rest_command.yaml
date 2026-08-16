@@ -1,6 +1,8 @@
 rest_command:
   python_test:
-    url: "http://local-temperature-monitor:5000/temperature"
+    # Replace <addon-hostname> with the internal hostname assigned to this
+    # installed Add-on. It is repository-specific for custom repositories.
+    url: "http://<addon-hostname>:5000/temperature"
     method: POST
     headers:
       Content-Type: application/json

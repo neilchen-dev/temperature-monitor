@@ -9,6 +9,12 @@ import config
 
 
 class DeviceConfigurationTests(unittest.TestCase):
+    def test_default_source_temperature_unit_is_celsius(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            reloaded_config = importlib.reload(config)
+
+        self.assertEqual(reloaded_config.SOURCE_TEMPERATURE_UNIT, "C")
+
     def test_device_name_map_normalizes_source_and_target(self) -> None:
         with patch.dict(
             os.environ,
