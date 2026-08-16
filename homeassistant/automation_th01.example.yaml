@@ -2,19 +2,10 @@ alias: TH-01
 description: "温度或湿度变化时，将 TH-01 的当前读数上报给 temperature-monitor"
 
 triggers:
-  - trigger: humidity.changed
-    target:
-      entity_id: sensor.th01_humidity
-    options:
-      threshold:
-        type: any
-
-  - trigger: temperature.changed
-    target:
-      entity_id: sensor.th01_temperature
-    options:
-      threshold:
-        type: any
+  - trigger: state
+    entity_id:
+      - sensor.th01_temperature
+      - sensor.th01_humidity
 
 conditions: []
 
