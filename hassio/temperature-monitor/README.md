@@ -8,4 +8,4 @@
 {"DEV-01":"recxxxxxxxxxxxx"}
 ```
 
-启动 Add-on 后，Home Assistant 自动化可通过 `http://<home-assistant-host>:5000/temperature` 调用服务。健康检查地址为 `/health`。
+启动 Add-on 后，Home Assistant 自动化应通过 Add-on 的内部主机名调用服务：`http://<addon-hostname>:5000/temperature`。请将 `<addon-hostname>` 替换为当前安装实例的名称；从自定义 GitHub 仓库安装时，该名称由 Home Assistant 根据仓库生成，不能假定为固定的 `local-temperature-monitor`。健康检查地址为 `/health`。

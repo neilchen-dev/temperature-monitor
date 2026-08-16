@@ -76,8 +76,8 @@ WAITRESS_THREADS = _get_int("WAITRESS_THREADS", 4)
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 LOG_DIR = Path(os.getenv("LOG_DIR", str(BASE_DIR / "logs")))
 
-# 保持旧版默认行为：HA 当前发送华氏温度，由服务转换为摄氏温度。
-SOURCE_TEMPERATURE_UNIT = os.getenv("SOURCE_TEMPERATURE_UNIT", "F").upper()
+# Home Assistant commonly reports Celsius; values are stored in Celsius.
+SOURCE_TEMPERATURE_UNIT = os.getenv("SOURCE_TEMPERATURE_UNIT", "C").upper()
 USE_SYSTEM_PROXY = _get_bool("USE_SYSTEM_PROXY", False)
 
 REQUEST_TIMEOUT_SECONDS = _get_float("REQUEST_TIMEOUT_SECONDS", 10.0)
