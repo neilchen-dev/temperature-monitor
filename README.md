@@ -9,7 +9,7 @@
 - **IoT 数据接入**：Home Assistant 读取 Xiaomi Home 温湿度传感器状态，变化时自动上报。
 - **后端服务**：Flask 提供 `POST /temperature` 接口，负责设备校验、单位转换与在线状态处理。
 - **业务系统集成**：通过飞书开放 API 写入多维表格，实现现场数据实时更新与留痕。
-- **状态判定**：支持离线状态、数据陈旧、启动保护等监测逻辑；离线上报不会覆盖最后一次有效温湿度。
+- **状态判定**：支持由 Home Assistant 明确上报的在线/离线状态；离线上报不会覆盖最后一次有效温湿度。
 - **现场闭环**：多维表格 Demo 中包含监测记录、异常事件、作业登记、区域/点检等业务对象，并通过 Dashboard 汇总关键状态。
 - **工程化运行**：Token 缓存与刷新、429/5xx/超时重试、CSV 历史记录、轮转日志、Waitress 与 Docker 部署。
 
@@ -80,7 +80,7 @@ crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temp
 {"DEV-01":"recxxxxxxxxxxxx","DEV-02":"recyyyyyyyyyyyy"}
 ```
 
-Add-on 启动后，Home Assistant 自动化可访问 `http://<home-assistant-host>:5000/temperature`；健康检查为 `/health`。HA Container（无 Supervisor）不支持 Add-on，请使用上方 Docker Compose 部署方式。
+Add-on 启动后，Home Assistant 自动化应通过 Add-on 的**内部主机名**访问 `http://<addon-hostname>:5000/temperature`；健康检查为 `/health`。自定义 GitHub 仓库安装的 Add-on 内部主机名由 Home Assistant 按仓库生成，并非可靠的固定 `local-temperature-monitor`。请在下方 REST 命令中替换 `<addon-hostname>` 为当前安装实例分配的内部主机名。HA Container（无 Supervisor）不支持 Add-on，请使用上方 Docker Compose 部署方式。
 
 ## 系统架构
 
@@ -166,7 +166,7 @@ Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 
 | `DEVICE_RECORD_MAP` | 否 | 空 | JSON 格式的设备名到飞书 record ID 手动覆盖，例如 `{"DEV-01":"recxxx"}` |
 | `DEVICE_ID_FIELD` | 否 | `设备编号` | 自动识别 record ID 时，在飞书表中匹配设备名的字段 |
 | `DEVICE_NAME_MAP` | 否 | 空 | JSON 格式的 Home Assistant 上报名到飞书设备编号映射，例如 `{"sensor.warehouse_temp":"DEV-01"}` |
-| `SOURCE_TEMPERATURE_UNIT` | 否 | `F` | 上报温度单位：`F` 或 `C` |
+| `SOURCE_TEMPERATURE_UNIT` | 否 | `C` | 上报温度单位：`F` 或 `C` |
 | `HOST` | 否 | `0.0.0.0` | HTTP 监听地址 |
 | `PORT` | 否 | `5000` | HTTP 监听端口 |
 | `USE_SYSTEM_PROXY` | 否 | `false` | 飞书请求是否读取系统代理 |
@@ -183,7 +183,9 @@ Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 
 ```yaml
 rest_command:
   python_test:
-    url: "http://local-temperature-monitor:5000/temperature"
+    # 将 <addon-hostname> 替换为当前 Add-on 安装实例的内部主机名。
+    # 自定义 GitHub 仓库的名称并不固定为 local-temperature-monitor。
+    url: "http://<addon-hostname>:5000/temperature"
     method: POST
     headers:
       Content-Type: application/json
@@ -206,4 +208,4 @@ rest_command:
 }
 ```
 
-若未传 `status`，后端会按在线处理。默认 `SOURCE_TEMPERATURE_UNIT=F`；如果 Home Assistant 已发送摄氏温度，请将它设置为 `C`。
+若未传 `status`，后端会按在线处理。默认 `SOURCE_TEMPERATURE_UNIT=C`；如果上游发送华氏温度，请将它设置为 `F`。
