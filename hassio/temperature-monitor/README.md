@@ -1,6 +1,8 @@
 # Temperature Monitor Home Assistant Add-on
 
-安装后，在 Add-on 的“配置”页面填写飞书应用凭据，并使用 JSON 格式设置设备名到飞书多维表格记录 ID 的映射：
+安装后，在 Add-on 的“配置”页面填写飞书应用凭据。程序默认按飞书表中的“设备编号”字段自动匹配设备名并识别 `record_id`。
+
+若字段名称不同，请修改 `device_id_field`。也可以使用可选的 JSON `device_record_map` 手动覆盖个别设备：
 
 ```json
 {"DEV-01":"recxxxxxxxxxxxx"}

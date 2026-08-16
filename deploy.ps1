@@ -9,7 +9,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 
 if (-not (Test-Path -LiteralPath ".env")) {
     Copy-Item -LiteralPath ".env.example" -Destination ".env"
-    Write-Host "已创建 .env。请填写飞书凭据和 DEVICE_RECORD_MAP 后，再次运行此脚本。" -ForegroundColor Yellow
+    Write-Host "已创建 .env。请填写飞书凭据；record_id 默认自动识别，随后再次运行此脚本。" -ForegroundColor Yellow
     exit 1
 }
 
