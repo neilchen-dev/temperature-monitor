@@ -50,7 +50,7 @@
 3. Linux/macOS 或任意终端运行：
 
    ```bash
-   docker compose up -d --build
+   docker compose up -d
    ```
 
 部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok"}` 即表示服务已启动。更新版本时，在项目目录再次执行同一条命令即可。
@@ -144,10 +144,10 @@ Invoke-RestMethod http://127.0.0.1:5000/health
 ```bash
 cp .env.example .env
 # 编辑 .env 后执行
-docker compose up -d --build
+docker compose up -d
 ```
 
-Compose 会将 CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
+Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
 
 ## 环境变量
 

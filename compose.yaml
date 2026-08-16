@@ -1,7 +1,6 @@
 services:
   temperature-monitor:
-    build:
-      context: .
+    image: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:latest
     container_name: temperature-monitor
     restart: unless-stopped
     env_file:
