@@ -49,6 +49,7 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
     for auth_attempt in range(2):
         token = get_token(force_refresh=(auth_attempt == 1))
         page_token: str | None = None
+        matching_record_ids: list[str] = []
 
         while True:
             query = {"page_size": "500"}
@@ -83,6 +84,11 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
                     record_id = str(record.get("record_id", "")).strip()
                     if not record_id:
                         raise RuntimeError("飞书返回的匹配记录缺少 record_id")
+                    matching_record_ids.append(record_id)
+
+            if not data.get("has_more"):
+                if len(matching_record_ids) == 1:
+                    record_id = matching_record_ids[0]
                     with _record_id_lock:
                         _record_id_cache[normalized_device] = record_id
                     logger.info(
@@ -91,8 +97,12 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
                         config.DEVICE_ID_FIELD,
                     )
                     return record_id
-
-            if not data.get("has_more"):
+                if len(matching_record_ids) > 1:
+                    record_ids = ", ".join(matching_record_ids)
+                    raise RuntimeError(
+                        f"飞书表中设备编号 {normalized_device} 重复；"
+                        f"请保留唯一记录后重试。重复 record_id: {record_ids}"
+                    )
                 raise RuntimeError(
                     f"未在飞书表中找到设备 {normalized_device}；"
                     f"请检查字段 {config.DEVICE_ID_FIELD} 或 DEVICE_RECORD_MAP"

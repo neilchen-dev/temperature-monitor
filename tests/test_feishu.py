@@ -45,6 +45,28 @@ class RecordDiscoveryTests(unittest.TestCase):
             )
         request.assert_not_called()
 
+    def test_rejects_duplicate_device_identifiers(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "items": [
+                    {"record_id": "rec_a", "fields": {"设备编号": "DEV-01"}},
+                    {"record_id": "rec_b", "fields": {"设备编号": "DEV-01"}},
+                ],
+                "has_more": False,
+            },
+        }
+
+        with (
+            patch.object(feishu, "get_token", return_value="token"),
+            patch.object(feishu, "request_with_retry", return_value=response),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"设备编号 DEV-01 重复.*rec_a, rec_b"
+            ):
+                feishu.resolve_record_id("DEV-01")
+
 
 if __name__ == "__main__":
     unittest.main()
