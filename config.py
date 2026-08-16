@@ -29,6 +29,7 @@ def _load_hassio_options() -> None:
         "table_id": "TABLE_ID",
         "source_temperature_unit": "SOURCE_TEMPERATURE_UNIT",
         "waitress_threads": "WAITRESS_THREADS",
+        "device_id_field": "DEVICE_ID_FIELD",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -84,27 +85,15 @@ LOG_MAX_BYTES = _get_int("LOG_MAX_BYTES", 5 * 1024 * 1024)
 LOG_BACKUP_COUNT = _get_int("LOG_BACKUP_COUNT", 5)
 
 
-# 可通过 DEVICE_RECORD_MAP 注入设备映射，避免为每个部署者修改并提交 config.py。
+# DEVICE_RECORD_MAP 是可选手动覆盖项；未配置的设备会按设备编号字段自动查找。
 # 格式：{"DEV-01":"recxxxx","DEV-02":"recyyyy"}
-DEFAULT_DEVICES = {
-    "TH-01": {"record_id": "YOUR EECORD ID"},
-    "TH-02": {"record_id": "YOUR EECORD ID"},
-    "TH-03": {"record_id": "YOUR EECORD ID"},
-    "TH-04": {"record_id": "YOUR EECORD ID"},
-    "TH-05": {"record_id": "YOUR EECORD ID"},
-    "TH-06": {"record_id": "YOUR EECORD ID"},
-    "TH-07": {"record_id": "YOUR EECORD ID"},
-    "TH-08": {"record_id": "YOUR EECORD ID"},
-    "TH-09": {"record_id": "YOUR EECORD ID"},
-    "TH-10": {"record_id": "YOUR EECORD ID"},
-    "TH-11": {"record_id": "YOUR EECORD ID"},
-}
+DEVICE_ID_FIELD = os.getenv("DEVICE_ID_FIELD", "设备编号").strip() or "设备编号"
 
 
 def _get_devices() -> dict[str, dict[str, str]]:
     raw_value = os.getenv("DEVICE_RECORD_MAP", "").strip()
     if not raw_value:
-        return DEFAULT_DEVICES
+        return {}
 
     try:
         mapping = json.loads(raw_value)
