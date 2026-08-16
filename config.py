@@ -6,6 +6,41 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+HASSIO_OPTIONS_PATH = Path(os.getenv("HASSIO_OPTIONS_PATH", "/data/options.json"))
+
+
+def _load_hassio_options() -> None:
+    """Load Home Assistant Add-on options into the existing environment-based config."""
+    if not HASSIO_OPTIONS_PATH.is_file():
+        return
+
+    try:
+        options = json.loads(HASSIO_OPTIONS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("无法读取 Home Assistant Add-on 配置") from exc
+
+    if not isinstance(options, dict):
+        raise ValueError("Home Assistant Add-on 配置必须是 JSON 对象")
+
+    option_names = {
+        "app_id": "APP_ID",
+        "app_secret": "APP_SECRET",
+        "app_token": "APP_TOKEN",
+        "table_id": "TABLE_ID",
+        "source_temperature_unit": "SOURCE_TEMPERATURE_UNIT",
+        "waitress_threads": "WAITRESS_THREADS",
+    }
+    for option_name, environment_name in option_names.items():
+        value = options.get(option_name)
+        if value not in (None, ""):
+            os.environ.setdefault(environment_name, str(value))
+
+    device_record_map = options.get("device_record_map")
+    if device_record_map not in (None, ""):
+        os.environ.setdefault("DEVICE_RECORD_MAP", str(device_record_map))
+
+
+_load_hassio_options()
 
 
 def _get_bool(name: str, default: bool) -> bool:
