@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 
@@ -48,8 +49,9 @@ LOG_MAX_BYTES = _get_int("LOG_MAX_BYTES", 5 * 1024 * 1024)
 LOG_BACKUP_COUNT = _get_int("LOG_BACKUP_COUNT", 5)
 
 
-# 设备与飞书多维表格记录的映射保持原版本不变。
-DEVICES = {
+# 可通过 DEVICE_RECORD_MAP 注入设备映射，避免为每个部署者修改并提交 config.py。
+# 格式：{"DEV-01":"recxxxx","DEV-02":"recyyyy"}
+DEFAULT_DEVICES = {
     "TH-01": {"record_id": "YOUR EECORD ID"},
     "TH-02": {"record_id": "YOUR EECORD ID"},
     "TH-03": {"record_id": "YOUR EECORD ID"},
@@ -62,6 +64,32 @@ DEVICES = {
     "TH-10": {"record_id": "YOUR EECORD ID"},
     "TH-11": {"record_id": "YOUR EECORD ID"},
 }
+
+
+def _get_devices() -> dict[str, dict[str, str]]:
+    raw_value = os.getenv("DEVICE_RECORD_MAP", "").strip()
+    if not raw_value:
+        return DEFAULT_DEVICES
+
+    try:
+        mapping = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("DEVICE_RECORD_MAP 必须是有效的 JSON 对象") from exc
+
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("DEVICE_RECORD_MAP 必须是非空 JSON 对象")
+
+    devices: dict[str, dict[str, str]] = {}
+    for device, record_id in mapping.items():
+        normalized_device = str(device).strip().upper()
+        normalized_record_id = str(record_id).strip()
+        if not normalized_device or not normalized_record_id:
+            raise ValueError("DEVICE_RECORD_MAP 中的设备名和 record_id 不能为空")
+        devices[normalized_device] = {"record_id": normalized_record_id}
+    return devices
+
+
+DEVICES = _get_devices()
 
 
 def ensure_runtime_directories() -> None:
