@@ -1,0 +1,30 @@
+name: Temperature Monitor
+version: latest
+slug: temperature_monitor
+description: Receive Home Assistant temperature and humidity readings and sync them to Feishu Bitable.
+url: https://github.com/neilchen-dev/temperature-monitor
+arch:
+  - amd64
+startup: application
+init: false
+ports:
+  5000/tcp: 5000
+ports_description:
+  5000/tcp: Temperature Monitor API
+image: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor
+options:
+  app_id: ""
+  app_secret: ""
+  app_token: ""
+  table_id: ""
+  device_record_map: '{"DEV-01":"rec_replace_me"}'
+  source_temperature_unit: C
+  waitress_threads: 4
+schema:
+  app_id: str
+  app_secret: password
+  app_token: password
+  table_id: str
+  device_record_map: str
+  source_temperature_unit: list(C|F)
+  waitress_threads: int(1,32)

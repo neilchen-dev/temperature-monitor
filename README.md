@@ -55,6 +55,27 @@
 
 部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok"}` 即表示服务已启动。更新版本时，在项目目录再次执行同一条命令即可。
 
+## Home Assistant Add-on 一键安装
+
+适用于 **Home Assistant OS / Supervised** 且为 `amd64`（Intel / AMD）主机。已配置为使用阿里云容器镜像：
+
+```text
+crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:latest
+```
+
+1. 在 Home Assistant 中打开 **设置 → Add-ons → Add-on Store → 右上角菜单 → Repositories**。
+2. 添加仓库：`https://github.com/neilchen-dev/temperature-monitor`。
+3. 在 Add-on Store 选择 **Temperature Monitor**，点击 **Install**。
+4. 在 Add-on 的 **Configuration** 页面填写飞书凭据和 `device_record_map`，点击 **Save** 后 **Start**。
+
+`device_record_map` 使用 JSON 格式，将 Home Assistant 上报的设备名映射到飞书多维表格记录 ID：
+
+```json
+{"DEV-01":"recxxxxxxxxxxxx","DEV-02":"recyyyyyyyyyyyy"}
+```
+
+Add-on 启动后，Home Assistant 自动化可访问 `http://<home-assistant-host>:5000/temperature`；健康检查为 `/health`。HA Container（无 Supervisor）不支持 Add-on，请使用上方 Docker Compose 部署方式。
+
 ## 系统架构
 
 ```mermaid
@@ -85,6 +106,7 @@ flowchart TD
 
 ```text
 homeassistant/       Home Assistant REST 命令与自动化示例
+hassio/              Home Assistant Add-on 清单与说明
 routes/              HTTP 路由与响应处理
 services/            校验、飞书通信、令牌、重试与本地存储
 examples/            脱敏的飞书多维表格 Demo
