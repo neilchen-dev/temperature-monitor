@@ -8,7 +8,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 import config
-from services.feishu import update_feishu_fields
+from services.feishu import resolve_record_id, update_feishu_fields
 from services.storage import save_history
 from services.validator import is_offline_status, normalize_humidity, normalize_temperature
 
@@ -26,14 +26,12 @@ def temperature():
     device = str(data.get("device", "")).strip().upper()
     if not device:
         return jsonify({"status": "error", "error": "缺少 device"}), 400
-    if device not in config.DEVICES:
-        return jsonify({"status": "error", "error": "未知设备", "device": device}), 400
-
     # 兼容旧 HA 配置：没有 status 时仍按在线数据处理。
     status_value = data.get("status", "在线")
-    record_id = config.DEVICES[device]["record_id"]
 
     try:
+        configured_device = config.DEVICES.get(device, {})
+        record_id = resolve_record_id(device, configured_device.get("record_id"))
         if is_offline_status(status_value):
             # 离线时只修改在线状态，保留飞书中的最后温湿度和更新时间。
             result = update_feishu_fields(record_id, {"在线状态": "离线"})
