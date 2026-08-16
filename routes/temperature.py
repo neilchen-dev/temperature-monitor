@@ -30,8 +30,9 @@ def temperature():
     status_value = data.get("status", "在线")
 
     try:
-        configured_device = config.DEVICES.get(device, {})
-        record_id = resolve_record_id(device, configured_device.get("record_id"))
+        bitable_device = config.DEVICE_NAME_MAP.get(device, device)
+        configured_device = config.DEVICES.get(bitable_device, {})
+        record_id = resolve_record_id(bitable_device, configured_device.get("record_id"))
         if is_offline_status(status_value):
             # 离线时只修改在线状态，保留飞书中的最后温湿度和更新时间。
             result = update_feishu_fields(record_id, {"在线状态": "离线"})
