@@ -18,7 +18,7 @@
 | --- | --- |
 | ![Demo monitoring records](docs/images/bitable-records.png) | ![Demo dashboard](docs/images/dashboard.png) |
 
-| 现场作业登记 | 现场表单明细 |
+| 现场作业登记 | 仓库环境点检 |
 | --- | --- |
 | ![Field work log](docs/images/field-work-log.png) | ![Field work log detail](docs/images/field-work-log-detail.png) |
 
