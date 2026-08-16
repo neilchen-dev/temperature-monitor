@@ -34,6 +34,27 @@
 | --- | --- |
 | ![Field work log](docs/images/field-work-log.png) | ![Warehouse inspection](docs/images/field-work-log-detail.png) |
 
+## 一键部署
+
+部署者只需准备 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）和自己的飞书应用凭据。项目不包含任何真实凭据。
+
+1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID`，以及设备和多维表格记录的 `DEVICE_RECORD_MAP`。
+2. Windows 用户双击或在 PowerShell 中运行：
+
+   ```powershell
+   .\deploy.ps1
+   ```
+
+   首次运行会自动创建 `.env` 模板；填写后再次运行即可启动。
+
+3. Linux/macOS 或任意终端运行：
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok"}` 即表示服务已启动。更新版本时，在项目目录再次执行同一条命令即可。
+
 ## 系统架构
 
 ```mermaid
@@ -96,25 +117,15 @@ python app.py
 Invoke-RestMethod http://127.0.0.1:5000/health
 ```
 
-## Docker 运行
+## Docker Compose 说明
 
 ```bash
-docker build -t temperature-monitor:latest .
-
-docker run -d \
-  --name temperature-monitor \
-  --restart unless-stopped \
-  -p 5000:5000 \
-  -e APP_ID="your_app_id" \
-  -e APP_SECRET="your_app_secret" \
-  -e APP_TOKEN="your_app_token" \
-  -e TABLE_ID="your_table_id" \
-  -v temperature-monitor-data:/app/data \
-  -v temperature-monitor-logs:/app/logs \
-  temperature-monitor:latest
+cp .env.example .env
+# 编辑 .env 后执行
+docker compose up -d --build
 ```
 
-凭据请通过环境变量或密钥管理服务注入，切勿写入代码、镜像构建参数或提交到仓库。
+Compose 会将 CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
 
 ## 环境变量
 
@@ -124,6 +135,7 @@ docker run -d \
 | `APP_SECRET` | 是 | — | 飞书应用密钥 |
 | `APP_TOKEN` | 是 | — | 飞书多维表格 App Token |
 | `TABLE_ID` | 是 | — | 飞书数据表 ID |
+| `DEVICE_RECORD_MAP` | 是 | — | JSON 格式的设备名到飞书 record ID 映射，例如 `{"DEV-01":"recxxx"}` |
 | `SOURCE_TEMPERATURE_UNIT` | 否 | `F` | 上报温度单位：`F` 或 `C` |
 | `HOST` | 否 | `0.0.0.0` | HTTP 监听地址 |
 | `PORT` | 否 | `5000` | HTTP 监听端口 |
