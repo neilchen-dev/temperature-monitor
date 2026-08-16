@@ -1,16 +1,28 @@
 # Temperature Monitor
 
-一个面向现场环境受控场景的温湿度监控服务示例。它接收 Home Assistant 上报的传感器数据，完成校验和单位转换后同步到飞书多维表格，并保留本地 CSV 历史记录及轮转日志。
+面向生产现场环境监控场景的轻量级数字化项目：通过 **Home Assistant + Python/Flask + REST API + 飞书多维表格**，将温湿度传感器数据、设备在线状态、现场作业登记、环境点检与异常记录串成一套可追溯的监测流程。
 
-> 本仓库仅包含公开演示所需的代码、截图和合成数据。设备编号、区域、业务流程与多维表格数据均已匿名化。
+> 本仓库中的设备编号、区域名称、业务表单和展示数据均已脱敏或使用 Demo 数据。生产环境中的客户、人员、内部区域与平台凭据不包含在公开仓库中。
 
 ## 项目亮点
 
-- **端到端链路**：Home Assistant → Flask API → 飞书多维表格 / CSV / 日志。
-- **设备状态管理**：在线、离线状态独立处理；离线不会覆盖最后一条有效温湿度读数。
-- **可靠的飞书写入**：访问令牌缓存和提前刷新，面对 `429`、`5xx`、连接超时自动指数退避重试。
-- **可运维性**：月度 CSV 历史、控制台与文件轮转日志、Waitress 生产服务器，以及 Docker 部署支持。
-- **公开 Demo**：提供可导入的脱敏飞书多维表格示例和实际界面截图。
+- **IoT 数据接入**：Home Assistant 读取 Xiaomi Home 温湿度传感器状态，变化时自动上报。
+- **后端服务**：Flask 提供 `POST /temperature` 接口，负责设备校验、单位转换与在线状态处理。
+- **业务系统集成**：通过飞书开放 API 写入多维表格，实现现场数据实时更新与留痕。
+- **状态判定**：支持离线状态、数据陈旧、启动保护等监测逻辑；离线上报不会覆盖最后一次有效温湿度。
+- **现场闭环**：多维表格 Demo 中包含监测记录、异常事件、作业登记、区域/点检等业务对象，并通过 Dashboard 汇总关键状态。
+- **工程化运行**：Token 缓存与刷新、429/5xx/超时重试、CSV 历史记录、轮转日志、Waitress 与 Docker 部署。
+
+## 业务 Demo
+
+公开展示版使用 `DEV-xx`、`Area-x`、`Storage-x` 等匿名标识重建现场环境监控场景，主要包含：
+
+1. **实时监测台账**：设备编号、温湿度、更新时间、在线状态及区域映射；
+2. **环境受控作业登记**：现场人员提交当前工艺、区域、监测点与备注，监测数据由系统侧自动记录；
+3. **仓库环境点检**：现场确认监测系统、报警与仓储状态，无需重复手工抄录温湿度；
+4. **环境监控 Dashboard**：汇总超限点位、监测点总数、在线点位及各点位温湿度与控制区间。
+
+这部分用于展示 **“业务需求 → 数据模型 → 自动采集 → 状态判定 → 表单/点检 → Dashboard”** 的完整数字化链路，而非公开生产环境数据。
 
 ## 预览
 
@@ -20,18 +32,20 @@
 
 | 现场作业登记 | 仓库环境点检 |
 | --- | --- |
-| ![Field work log](docs/images/field-work-log.png) | ![Field work log detail](docs/images/field-work-log-detail.png) |
+| ![Field work log](docs/images/field-work-log.png) | ![Warehouse inspection](docs/images/field-work-log-detail.png) |
 
 ## 系统架构
 
 ```mermaid
-flowchart LR
-    sensor["温湿度传感器"] --> ha["Home Assistant"]
-    ha --> automation["Automation / REST Command"]
-    automation --> api["Temperature Monitor\nFlask API"]
-    api --> validate["数据校验、单位转换\n在线状态处理"]
-    validate --> bitable["飞书多维表格"]
-    validate --> csv["月度 CSV 历史"]
+flowchart TD
+    sensor["小米温湿度计 / Demo DEV-xx"] --> integration["Xiaomi Home 集成"]
+    integration --> entity["Home Assistant 温度/湿度实体"]
+    entity --> automation["状态变化触发 Automation"]
+    automation --> rest["rest_command.python_test"]
+    rest -->|"POST /temperature"| api["Temperature Monitor / Flask"]
+    api --> validate["设备校验、单位转换、在线状态处理"]
+    validate --> feishu["飞书多维表格 / Dashboard"]
+    validate --> csv["CSV 月度历史"]
     api --> log["轮转日志"]
 ```
 
