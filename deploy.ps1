@@ -13,7 +13,7 @@ if (-not (Test-Path -LiteralPath ".env")) {
     exit 1
 }
 
-docker compose up -d --build
+docker compose up -d
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
