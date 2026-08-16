@@ -68,7 +68,13 @@ crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temp
 3. 在 Add-on Store 选择 **Temperature Monitor**，点击 **Install**。
 4. 在 Add-on 的 **Configuration** 页面填写飞书凭据；默认使用 `device_id_field`（`设备编号`）自动识别每台设备的 `record_id`，点击 **Save** 后 **Start**。
 
-如设备字段名称不是“设备编号”，将 `device_id_field` 改为你的字段名。`device_record_map` 仍可选填，用于固定覆盖个别设备的自动识别结果：
+如设备字段名称不是“设备编号”，将 `device_id_field` 改为你的字段名。如果 Home Assistant 上报的设备名与飞书表中的设备编号不同，使用 `device_name_map` 做名称映射，例如：
+
+```json
+{"sensor.warehouse_temp":"DEV-01","sensor.warehouse_humidity":"DEV-02"}
+```
+
+`device_record_map` 仍可选填，用于固定覆盖个别设备的自动识别结果：
 
 ```json
 {"DEV-01":"recxxxxxxxxxxxx","DEV-02":"recyyyyyyyyyyyy"}
@@ -159,6 +165,7 @@ Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 
 | `TABLE_ID` | 是 | — | 飞书数据表 ID |
 | `DEVICE_RECORD_MAP` | 否 | 空 | JSON 格式的设备名到飞书 record ID 手动覆盖，例如 `{"DEV-01":"recxxx"}` |
 | `DEVICE_ID_FIELD` | 否 | `设备编号` | 自动识别 record ID 时，在飞书表中匹配设备名的字段 |
+| `DEVICE_NAME_MAP` | 否 | 空 | JSON 格式的 Home Assistant 上报名到飞书设备编号映射，例如 `{"sensor.warehouse_temp":"DEV-01"}` |
 | `SOURCE_TEMPERATURE_UNIT` | 否 | `F` | 上报温度单位：`F` 或 `C` |
 | `HOST` | 否 | `0.0.0.0` | HTTP 监听地址 |
 | `PORT` | 否 | `5000` | HTTP 监听端口 |
