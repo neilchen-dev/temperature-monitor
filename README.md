@@ -38,7 +38,7 @@
 
 部署者只需准备 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）和自己的飞书应用凭据。项目不包含任何真实凭据。
 
-1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID`，以及设备和多维表格记录的 `DEVICE_RECORD_MAP`。
+1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID`。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
 2. Windows 用户双击或在 PowerShell 中运行：
 
    ```powershell
@@ -66,9 +66,9 @@ crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temp
 1. 在 Home Assistant 中打开 **设置 → Add-ons → Add-on Store → 右上角菜单 → Repositories**。
 2. 添加仓库：`https://github.com/neilchen-dev/temperature-monitor`。
 3. 在 Add-on Store 选择 **Temperature Monitor**，点击 **Install**。
-4. 在 Add-on 的 **Configuration** 页面填写飞书凭据和 `device_record_map`，点击 **Save** 后 **Start**。
+4. 在 Add-on 的 **Configuration** 页面填写飞书凭据；默认使用 `device_id_field`（`设备编号`）自动识别每台设备的 `record_id`，点击 **Save** 后 **Start**。
 
-`device_record_map` 使用 JSON 格式，将 Home Assistant 上报的设备名映射到飞书多维表格记录 ID：
+如设备字段名称不是“设备编号”，将 `device_id_field` 改为你的字段名。`device_record_map` 仍可选填，用于固定覆盖个别设备的自动识别结果：
 
 ```json
 {"DEV-01":"recxxxxxxxxxxxx","DEV-02":"recyyyyyyyyyyyy"}
@@ -157,7 +157,8 @@ Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 
 | `APP_SECRET` | 是 | — | 飞书应用密钥 |
 | `APP_TOKEN` | 是 | — | 飞书多维表格 App Token |
 | `TABLE_ID` | 是 | — | 飞书数据表 ID |
-| `DEVICE_RECORD_MAP` | 是 | — | JSON 格式的设备名到飞书 record ID 映射，例如 `{"DEV-01":"recxxx"}` |
+| `DEVICE_RECORD_MAP` | 否 | 空 | JSON 格式的设备名到飞书 record ID 手动覆盖，例如 `{"DEV-01":"recxxx"}` |
+| `DEVICE_ID_FIELD` | 否 | `设备编号` | 自动识别 record ID 时，在飞书表中匹配设备名的字段 |
 | `SOURCE_TEMPERATURE_UNIT` | 否 | `F` | 上报温度单位：`F` 或 `C` |
 | `HOST` | 否 | `0.0.0.0` | HTTP 监听地址 |
 | `PORT` | 否 | `5000` | HTTP 监听端口 |
