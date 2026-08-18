@@ -40,6 +40,32 @@ class RecordDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(request.call_count, 1)
 
+    def test_normalizes_formula_display_value(self) -> None:
+        formula_value = {
+            "type": 1,
+            "value": [{"text": "正常", "type": "text"}],
+        }
+
+        self.assertEqual(feishu.normalize_field_value(formula_value), "正常")
+
+    def test_normalizes_formula_current_status_display_value(self) -> None:
+        formula_value = {
+            "type": 1,
+            "value": [{"text": "仅监测", "type": "text"}],
+        }
+
+        self.assertEqual(feishu.normalize_field_value(formula_value), "仅监测")
+
+    def test_normalizes_plain_text_array(self) -> None:
+        self.assertEqual(
+            feishu.normalize_field_value([{"text": "TH-04", "type": "text"}]),
+            "TH-04",
+        )
+
+    def test_normalizes_number_and_empty_value_compatibly(self) -> None:
+        self.assertEqual(feishu.normalize_field_value(27.1), "27.1")
+        self.assertEqual(feishu.normalize_field_value(None), "")
+
     def test_manual_mapping_bypasses_lookup(self) -> None:
         with patch.object(feishu, "request_with_retry") as request:
             self.assertEqual(
