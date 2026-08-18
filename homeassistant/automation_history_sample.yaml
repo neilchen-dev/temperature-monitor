@@ -1,0 +1,14 @@
+alias: 温湿度历史记录每10分钟采样
+description: "每逢整十分钟请求一次全量历史快照"
+
+triggers:
+  - trigger: time_pattern
+    minutes: "/10"
+
+conditions: []
+
+actions:
+  - action: rest_command.temperature_history_sample
+
+mode: single
+max_exceeded: warning

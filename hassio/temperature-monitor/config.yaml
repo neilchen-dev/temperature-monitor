@@ -1,5 +1,5 @@
 name: Temperature Monitor
-version: 1.0.3
+version: 1.1.0
 slug: temperature_monitor
 description: Receive Home Assistant temperature and humidity readings and sync them to Feishu Bitable.
 url: https://github.com/neilchen-dev/temperature-monitor
@@ -18,6 +18,13 @@ options:
   app_secret: ""
   app_token: ""
   table_id: ""
+  history_api_key: ""
+  history_interval_minutes: 10
+  history_timezone: Asia/Shanghai
+  history_cleanup_enabled: false
+  history_retention_days: 90
+  history_cleanup_hour: 2
+  history_table_map: '{"TH-01":"tbldiElwYsCb4gcE","TH-02":"tbljWQNUpGW9t3bm","TH-03":"tbla7CSkhXuskiER","TH-04":"tblttlcPgae1yTem","TH-05":"tblQcJG7xt0bRPlK","TH-06":"tblii2ZnHQ9kMN9P","TH-07":"tblaDZTIHvZUh2nf","TH-08":"tblY4lIhNbhcaOOS","TH-09":"tblE88Cb1hGL7Eno","TH-10":"tblA9G55kbjbA5wz","TH-11":"tblWCWdsNxh12dOc"}'
   device_record_map: ""
   device_id_field: 设备编号
   device_name_map: ""
@@ -28,6 +35,13 @@ schema:
   app_secret: password
   app_token: password
   table_id: str
+  history_api_key: password
+  history_interval_minutes: int(1,1440)
+  history_timezone: str
+  history_cleanup_enabled: bool
+  history_retention_days: int(1,3650)
+  history_cleanup_hour: int(0,23)
+  history_table_map: str
   device_record_map: str
   device_id_field: str
   device_name_map: str
