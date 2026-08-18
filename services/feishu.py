@@ -31,6 +31,12 @@ def normalize_field_value(value: Any) -> str:
             item for item in (normalize_field_value(item) for item in value) if item
         )
     if isinstance(value, dict):
+        # Feishu formula fields return their displayed value in a nested
+        # ``value`` rich-text array, rather than at the top-level ``text``.
+        # Normalize it recursively so history stores the displayed result as
+        # immutable plain text.
+        if "value" in value:
+            return normalize_field_value(value["value"])
         return str(value.get("text", value.get("name", ""))).strip()
     return str(value or "").strip()
 

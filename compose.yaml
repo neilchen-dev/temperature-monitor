@@ -1,6 +1,6 @@
 services:
   temperature-monitor:
-    image: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:${IMAGE_TAG:-1.1.1}
+    image: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:${IMAGE_TAG:-1.1.3}
     container_name: temperature-monitor
     restart: unless-stopped
     env_file:

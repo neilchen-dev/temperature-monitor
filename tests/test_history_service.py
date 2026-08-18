@@ -80,6 +80,24 @@ class HistoryServiceTests(unittest.TestCase):
         self.assertEqual(result["当前判定状态"], "设备离线")
         self.assertEqual(result["当前工艺"], "N/A")
 
+    def test_formula_statuses_are_frozen_as_display_text(self) -> None:
+        sample_time = datetime(2026, 8, 18, 14, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        fields = self._snapshot_records()[3]["fields"]
+        fields.update({
+            "温度判定": {"type": 1, "value": [{"text": "正常", "type": "text"}]},
+            "湿度判定": {"type": 1, "value": [{"text": "正常", "type": "text"}]},
+            "当前判定状态": {
+                "type": 1,
+                "value": [{"text": "仅监测", "type": "text"}],
+            },
+        })
+
+        result = history.build_history_fields(fields, sample_time)
+
+        self.assertEqual(result["温度判定"], "正常")
+        self.assertEqual(result["湿度判定"], "正常")
+        self.assertEqual(result["当前判定状态"], "仅监测")
+
     def test_writes_one_record_to_each_history_table(self) -> None:
         now = datetime(2026, 8, 18, 1, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
         with (
