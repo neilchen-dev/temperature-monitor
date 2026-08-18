@@ -1,8 +1,8 @@
 rest_command:
   python_test:
-    # Replace <addon-hostname> with the internal hostname assigned to this
-    # installed Add-on. It is repository-specific for custom repositories.
-    url: "http://<addon-hostname>:5000/temperature"
+    # HA Container 使用 host 网络时填 127.0.0.1；使用 bridge 网络时填
+    # Docker 主机局域网 IP；若两个容器共享 Docker 网络则填 temperature-monitor。
+    url: "http://<temperature-monitor-host>:5000/temperature"
     method: POST
     headers:
       Content-Type: application/json
@@ -12,3 +12,12 @@ rest_command:
         "temperature": "{{ temperature }}",
         "humidity": "{{ humidity }}"
       }
+
+  temperature_history_sample:
+    url: "http://<temperature-monitor-host>:5000/history/sample"
+    method: POST
+    headers:
+      Content-Type: application/json
+      X-History-Key: !secret temperature_monitor_history_api_key
+    payload: "{}"
+    timeout: 120

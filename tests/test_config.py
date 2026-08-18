@@ -34,6 +34,19 @@ class DeviceConfigurationTests(unittest.TestCase):
 
         self.assertEqual(reloaded_config.DEVICES, {})
 
+    def test_history_table_map_normalizes_device_names(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HISTORY_TABLE_MAP": '{"th-01":"tbl_history_01"}'},
+            clear=False,
+        ):
+            reloaded_config = importlib.reload(config)
+
+        self.assertEqual(
+            reloaded_config.HISTORY_TABLE_MAP,
+            {"TH-01": "tbl_history_01"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

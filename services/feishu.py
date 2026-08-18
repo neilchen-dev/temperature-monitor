@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+import uuid
 from typing import Any
 from urllib.parse import urlencode
 
@@ -11,9 +13,10 @@ from services.token import clear_token, get_token
 
 
 logger = logging.getLogger("temperature_monitor")
-_feishu_write_lock = threading.Lock()
+_feishu_api_lock = threading.RLock()
 _record_id_cache: dict[str, str] = {}
 _record_id_lock = threading.Lock()
+_TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
 
 
 def _validate_bitable_config() -> None:
@@ -21,12 +24,103 @@ def _validate_bitable_config() -> None:
         raise RuntimeError("缺少飞书环境变量 APP_TOKEN 或 TABLE_ID")
 
 
-def _normalize_field_value(value: Any) -> str:
+def normalize_field_value(value: Any) -> str:
+    """Convert Feishu rich/select values into stable text for history fields."""
     if isinstance(value, list):
-        return " ".join(_normalize_field_value(item) for item in value)
+        return " ".join(
+            item for item in (normalize_field_value(item) for item in value) if item
+        )
     if isinstance(value, dict):
         return str(value.get("text", value.get("name", ""))).strip()
     return str(value or "").strip()
+
+
+def _bitable_table_url(table_id: str, suffix: str = "") -> str:
+    normalized_table_id = str(table_id).strip()
+    if not normalized_table_id:
+        raise RuntimeError("飞书 table_id 不能为空")
+    return (
+        "https://open.feishu.cn/open-apis/bitable/v1/apps/"
+        f"{config.APP_TOKEN}/tables/{normalized_table_id}{suffix}"
+    )
+
+
+def _request_bitable_json(
+    method: str,
+    url: str,
+    *,
+    operation: str,
+    json_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Call Bitable serially and retry token, rate-limit, and write conflicts."""
+    max_attempts = max(1, config.REQUEST_RETRY_TIMES)
+    attempt = 1
+    token_refreshed = False
+
+    with _feishu_api_lock:
+        while attempt <= max_attempts:
+            token = get_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            if json_data is not None:
+                headers["Content-Type"] = "application/json; charset=utf-8"
+
+            response = request_with_retry(
+                method,
+                url,
+                headers=headers,
+                json_data=json_data,
+            )
+            try:
+                result = response.json()
+            except ValueError:
+                return {
+                    "code": -2,
+                    "msg": f"飞书{operation}接口返回了非 JSON 内容",
+                    "http_status": response.status_code,
+                }
+
+            code = int(result.get("code", -1))
+            if code == 99991663 and not token_refreshed:
+                logger.warning("Token 无效，清空缓存后重试 | operation=%s", operation)
+                clear_token()
+                token_refreshed = True
+                continue
+
+            transient = (
+                response.status_code == 429
+                or response.status_code >= 500
+                or code in _TRANSIENT_BITABLE_CODES
+            )
+            if transient and attempt < max_attempts:
+                delay = config.REQUEST_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "飞书业务暂时异常，准备重试 | operation=%s | HTTP=%s | "
+                    "code=%s | attempt=%s/%s",
+                    operation,
+                    response.status_code,
+                    code,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+
+            if response.status_code != 200 and code == 0:
+                result = dict(result)
+                result["code"] = -response.status_code
+                result["msg"] = f"HTTP {response.status_code}"
+            return result
+
+    return {"code": -3, "msg": f"飞书{operation}失败"}
+
+
+def _require_success(result: dict[str, Any], operation: str) -> dict[str, Any]:
+    if int(result.get("code", -1)) != 0:
+        raise RuntimeError(
+            f"飞书{operation}失败: code={result.get('code')}, msg={result.get('msg')}"
+        )
+    return result
 
 
 def resolve_record_id(device: str, configured_record_id: str | None = None) -> str:
@@ -41,113 +135,187 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
         return cached_record_id
 
     _validate_bitable_config()
-    base_url = (
-        "https://open.feishu.cn/open-apis/bitable/v1/apps/"
-        f"{config.APP_TOKEN}/tables/{config.TABLE_ID}/records"
-    )
+    base_url = _bitable_table_url(config.TABLE_ID, "/records")
+    page_token: str | None = None
+    matching_record_ids: list[str] = []
 
-    for auth_attempt in range(2):
-        token = get_token(force_refresh=(auth_attempt == 1))
-        page_token: str | None = None
-        matching_record_ids: list[str] = []
-
-        while True:
-            query = {"page_size": "500"}
-            if page_token:
-                query["page_token"] = page_token
-            response = request_with_retry(
+    while True:
+        query = {"page_size": "500"}
+        if page_token:
+            query["page_token"] = page_token
+        result = _require_success(
+            _request_bitable_json(
                 "GET",
                 f"{base_url}?{urlencode(query)}",
-                headers={"Authorization": f"Bearer {token}"},
+                operation="查询记录",
+            ),
+            "查询记录",
+        )
+
+        data = result.get("data", {})
+        for record in data.get("items", []):
+            fields = record.get("fields", {})
+            field_value = normalize_field_value(fields.get(config.DEVICE_ID_FIELD))
+            if field_value.upper() == normalized_device:
+                record_id = str(record.get("record_id", "")).strip()
+                if not record_id:
+                    raise RuntimeError("飞书返回的匹配记录缺少 record_id")
+                matching_record_ids.append(record_id)
+
+        if not data.get("has_more"):
+            if len(matching_record_ids) == 1:
+                record_id = matching_record_ids[0]
+                with _record_id_lock:
+                    _record_id_cache[normalized_device] = record_id
+                logger.info(
+                    "自动识别飞书 record_id 成功 | device=%s | field=%s",
+                    normalized_device,
+                    config.DEVICE_ID_FIELD,
+                )
+                return record_id
+            if len(matching_record_ids) > 1:
+                record_ids = ", ".join(matching_record_ids)
+                raise RuntimeError(
+                    f"飞书表中设备编号 {normalized_device} 重复；"
+                    f"请保留唯一记录后重试。重复 record_id: {record_ids}"
+                )
+            raise RuntimeError(
+                f"未在飞书表中找到设备 {normalized_device}；"
+                f"请检查字段 {config.DEVICE_ID_FIELD} 或 DEVICE_RECORD_MAP"
             )
-            try:
-                result = response.json()
-            except ValueError as exc:
-                raise RuntimeError("飞书查询记录接口返回了非 JSON 内容") from exc
-
-            if result.get("code") == 99991663 and auth_attempt == 0:
-                logger.warning("Token 无效，清空缓存后重试记录识别")
-                clear_token()
-                break
-            if response.status_code != 200 or result.get("code") != 0:
-                raise RuntimeError(
-                    "飞书查询记录失败: "
-                    f"HTTP={response.status_code}, code={result.get('code')}, "
-                    f"msg={result.get('msg')}"
-                )
-
-            data = result.get("data", {})
-            for record in data.get("items", []):
-                fields = record.get("fields", {})
-                field_value = _normalize_field_value(fields.get(config.DEVICE_ID_FIELD))
-                if field_value.upper() == normalized_device:
-                    record_id = str(record.get("record_id", "")).strip()
-                    if not record_id:
-                        raise RuntimeError("飞书返回的匹配记录缺少 record_id")
-                    matching_record_ids.append(record_id)
-
-            if not data.get("has_more"):
-                if len(matching_record_ids) == 1:
-                    record_id = matching_record_ids[0]
-                    with _record_id_lock:
-                        _record_id_cache[normalized_device] = record_id
-                    logger.info(
-                        "自动识别飞书 record_id 成功 | device=%s | field=%s",
-                        normalized_device,
-                        config.DEVICE_ID_FIELD,
-                    )
-                    return record_id
-                if len(matching_record_ids) > 1:
-                    record_ids = ", ".join(matching_record_ids)
-                    raise RuntimeError(
-                        f"飞书表中设备编号 {normalized_device} 重复；"
-                        f"请保留唯一记录后重试。重复 record_id: {record_ids}"
-                    )
-                raise RuntimeError(
-                    f"未在飞书表中找到设备 {normalized_device}；"
-                    f"请检查字段 {config.DEVICE_ID_FIELD} 或 DEVICE_RECORD_MAP"
-                )
-            page_token = str(data.get("page_token", "")).strip()
-            if not page_token:
-                raise RuntimeError("飞书记录分页响应缺少 page_token")
-
-    raise RuntimeError("飞书记录自动识别失败")
+        page_token = str(data.get("page_token", "")).strip()
+        if not page_token:
+            raise RuntimeError("飞书记录分页响应缺少 page_token")
 
 
 def update_feishu_fields(record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
     _validate_bitable_config()
-    url = (
-        "https://open.feishu.cn/open-apis/bitable/v1/apps/"
-        f"{config.APP_TOKEN}/tables/{config.TABLE_ID}/records/{record_id}"
+    return _request_bitable_json(
+        "PUT",
+        _bitable_table_url(config.TABLE_ID, f"/records/{record_id}"),
+        operation="更新记录",
+        json_data={"fields": fields},
     )
 
-    with _feishu_write_lock:
-        for auth_attempt in range(2):
-            token = get_token(force_refresh=(auth_attempt == 1))
-            response = request_with_retry(
-                "PUT",
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json_data={"fields": fields},
-            )
 
-            try:
-                result = response.json()
-            except ValueError:
-                return {"code": -2, "msg": "飞书更新接口返回了非 JSON 内容"}
+def list_realtime_snapshots(field_names: list[str]) -> list[dict[str, Any]]:
+    """Read all current records with the minimum fields needed for a snapshot."""
+    _validate_bitable_config()
+    base_url = _bitable_table_url(config.TABLE_ID, "/records/search")
+    page_token: str | None = None
+    records: list[dict[str, Any]] = []
 
-            if response.status_code == 200 and result.get("code") == 0:
-                return result
+    while True:
+        query = {"page_size": "500"}
+        if page_token:
+            query["page_token"] = page_token
+        result = _require_success(
+            _request_bitable_json(
+                "POST",
+                f"{base_url}?{urlencode(query)}",
+                operation="读取实时快照",
+                json_data={"field_names": field_names},
+            ),
+            "读取实时快照",
+        )
+        data = result.get("data", {})
+        records.extend(data.get("items", []))
+        if not data.get("has_more"):
+            return records
+        page_token = str(data.get("page_token", "")).strip()
+        if not page_token:
+            raise RuntimeError("飞书实时快照分页响应缺少 page_token")
 
-            # 保持旧版行为：飞书返回 Token 无效后，清缓存并自动刷新一次。
-            if result.get("code") == 99991663 and auth_attempt == 0:
-                logger.warning("Token 无效，清空缓存后重试")
-                clear_token()
-                continue
 
-            return result
+def get_latest_history_timestamp(table_id: str) -> Any | None:
+    """Return the newest sampling time from a history table, or None if empty."""
+    _validate_bitable_config()
+    url = f"{_bitable_table_url(table_id, '/records/search')}?page_size=1"
+    result = _require_success(
+        _request_bitable_json(
+            "POST",
+            url,
+            operation="查询最新历史记录",
+            json_data={
+                "field_names": ["采集时间"],
+                "sort": [{"field_name": "采集时间", "desc": True}],
+            },
+        ),
+        "查询最新历史记录",
+    )
+    items = result.get("data", {}).get("items", [])
+    if not items:
+        return None
+    return items[0].get("fields", {}).get("采集时间")
 
-    return {"code": -3, "msg": "飞书更新失败"}
+
+def create_history_record(table_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Create one history record with an idempotency token reused by retries."""
+    _validate_bitable_config()
+    query = urlencode({"client_token": str(uuid.uuid4())})
+    return _request_bitable_json(
+        "POST",
+        f"{_bitable_table_url(table_id, '/records')}?{query}",
+        operation="新增历史记录",
+        json_data={"fields": fields},
+    )
+
+
+def find_expired_history_record_ids(table_id: str, cutoff_date: str) -> list[str]:
+    """Cloud-filter and paginate all history records before a cutoff date."""
+    _validate_bitable_config()
+    base_url = _bitable_table_url(table_id, "/records/search")
+    page_token: str | None = None
+    record_ids: list[str] = []
+    body = {
+        "field_names": ["采集时间"],
+        "filter": {
+            "conjunction": "and",
+            "conditions": [
+                {
+                    "field_name": "采集时间",
+                    "operator": "isLess",
+                    "value": [f"ExactDate({cutoff_date})"],
+                }
+            ],
+        },
+    }
+
+    while True:
+        query = {"page_size": "500"}
+        if page_token:
+            query["page_token"] = page_token
+        result = _require_success(
+            _request_bitable_json(
+                "POST",
+                f"{base_url}?{urlencode(query)}",
+                operation="筛选过期历史记录",
+                json_data=body,
+            ),
+            "筛选过期历史记录",
+        )
+        data = result.get("data", {})
+        for item in data.get("items", []):
+            record_id = str(item.get("record_id", "")).strip()
+            if record_id:
+                record_ids.append(record_id)
+        if not data.get("has_more"):
+            return record_ids
+        page_token = str(data.get("page_token", "")).strip()
+        if not page_token:
+            raise RuntimeError("飞书过期记录分页响应缺少 page_token")
+
+
+def delete_history_records(table_id: str, record_ids: list[str]) -> dict[str, Any]:
+    """Delete one already-bounded batch; callers must enforce the feature gate."""
+    if not record_ids:
+        return {"code": 0, "msg": "no records"}
+    if len(record_ids) > 500:
+        raise ValueError("单次历史记录删除不得超过 500 条")
+    _validate_bitable_config()
+    return _request_bitable_json(
+        "POST",
+        _bitable_table_url(table_id, "/records/batch_delete"),
+        operation="删除过期历史记录",
+        json_data={"records": record_ids},
+    )

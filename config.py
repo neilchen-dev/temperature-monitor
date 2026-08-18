@@ -27,6 +27,12 @@ def _load_hassio_options() -> None:
         "app_secret": "APP_SECRET",
         "app_token": "APP_TOKEN",
         "table_id": "TABLE_ID",
+        "history_api_key": "HISTORY_API_KEY",
+        "history_interval_minutes": "HISTORY_INTERVAL_MINUTES",
+        "history_timezone": "HISTORY_TIMEZONE",
+        "history_cleanup_enabled": "HISTORY_CLEANUP_ENABLED",
+        "history_retention_days": "HISTORY_RETENTION_DAYS",
+        "history_cleanup_hour": "HISTORY_CLEANUP_HOUR",
         "source_temperature_unit": "SOURCE_TEMPERATURE_UNIT",
         "waitress_threads": "WAITRESS_THREADS",
         "device_id_field": "DEVICE_ID_FIELD",
@@ -43,6 +49,10 @@ def _load_hassio_options() -> None:
     device_name_map = options.get("device_name_map")
     if device_name_map not in (None, ""):
         os.environ.setdefault("DEVICE_NAME_MAP", str(device_name_map))
+
+    history_table_map = options.get("history_table_map")
+    if history_table_map not in (None, ""):
+        os.environ.setdefault("HISTORY_TABLE_MAP", str(history_table_map))
 
 
 _load_hassio_options()
@@ -87,6 +97,15 @@ TOKEN_REFRESH_MARGIN_SECONDS = _get_int("TOKEN_REFRESH_MARGIN_SECONDS", 300)
 
 LOG_MAX_BYTES = _get_int("LOG_MAX_BYTES", 5 * 1024 * 1024)
 LOG_BACKUP_COUNT = _get_int("LOG_BACKUP_COUNT", 5)
+
+# 历史快照由 Home Assistant 每十分钟触发一次。删除默认硬关闭，只有重启后
+# 读取到 HISTORY_CLEANUP_ENABLED=true 才可能执行，HTTP 请求不能覆盖此配置。
+HISTORY_API_KEY = os.getenv("HISTORY_API_KEY", "").strip()
+HISTORY_INTERVAL_MINUTES = _get_int("HISTORY_INTERVAL_MINUTES", 10)
+HISTORY_TIMEZONE = os.getenv("HISTORY_TIMEZONE", "Asia/Shanghai").strip()
+HISTORY_CLEANUP_ENABLED = _get_bool("HISTORY_CLEANUP_ENABLED", False)
+HISTORY_RETENTION_DAYS = _get_int("HISTORY_RETENTION_DAYS", 90)
+HISTORY_CLEANUP_HOUR = _get_int("HISTORY_CLEANUP_HOUR", 2)
 
 
 # DEVICE_RECORD_MAP 是可选手动覆盖项；未配置的设备会按设备编号字段自动查找。
@@ -140,8 +159,32 @@ def _get_device_name_map() -> dict[str, str]:
     return normalized_mapping
 
 
+def _get_history_table_map() -> dict[str, str]:
+    raw_value = os.getenv("HISTORY_TABLE_MAP", "").strip()
+    if not raw_value:
+        return {}
+
+    try:
+        mapping = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("HISTORY_TABLE_MAP 必须是有效的 JSON 对象") from exc
+
+    if not isinstance(mapping, dict):
+        raise ValueError("HISTORY_TABLE_MAP 必须是 JSON 对象")
+
+    normalized_mapping: dict[str, str] = {}
+    for device, table_id in mapping.items():
+        normalized_device = str(device).strip().upper()
+        normalized_table_id = str(table_id).strip()
+        if not normalized_device or not normalized_table_id:
+            raise ValueError("HISTORY_TABLE_MAP 中的设备名和 table_id 不能为空")
+        normalized_mapping[normalized_device] = normalized_table_id
+    return normalized_mapping
+
+
 DEVICES = _get_devices()
 DEVICE_NAME_MAP = _get_device_name_map()
+HISTORY_TABLE_MAP = _get_history_table_map()
 
 
 def ensure_runtime_directories() -> None:
