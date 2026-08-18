@@ -261,9 +261,14 @@ def create_history_record(table_id: str, fields: dict[str, Any]) -> dict[str, An
     )
 
 
-def find_expired_history_record_ids(table_id: str, cutoff_date: str) -> list[str]:
-    """Cloud-filter and paginate all history records before a cutoff date."""
+def find_expired_history_record_ids(
+    table_id: str,
+    cutoff_timestamp_ms: int,
+) -> list[str]:
+    """Cloud-filter history records strictly before a cutoff timestamp's date."""
     _validate_bitable_config()
+    if isinstance(cutoff_timestamp_ms, bool) or cutoff_timestamp_ms <= 0:
+        raise ValueError("历史清理截止时间必须是正整数毫秒时间戳")
     base_url = _bitable_table_url(table_id, "/records/search")
     page_token: str | None = None
     record_ids: list[str] = []
@@ -275,7 +280,7 @@ def find_expired_history_record_ids(table_id: str, cutoff_date: str) -> list[str
                 {
                     "field_name": "采集时间",
                     "operator": "isLess",
-                    "value": [f"ExactDate({cutoff_date})"],
+                    "value": ["ExactDate", str(cutoff_timestamp_ms)],
                 }
             ],
         },

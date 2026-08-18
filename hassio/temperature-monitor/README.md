@@ -8,6 +8,6 @@
 {"DEV-01":"recxxxxxxxxxxxx"}
 ```
 
-历史采样使用配置中的 `history_table_map`，每十分钟从实时总表读取 TH-01 至 TH-11 的完整状态并分别写入历史表。第一阶段务必保持 `history_cleanup_enabled: false`；此时只做过期记录预检，不会调用删除接口。
+历史采样使用配置中的 `history_table_map`，每十分钟从实时总表读取 TH-01 至 TH-11 的完整状态并分别写入历史表。第一阶段务必保持 `history_cleanup_enabled: false`；此时会完全跳过过期记录筛选与删除接口。
 
 启动 Add-on 后，Home Assistant 自动化应通过 Add-on 的内部主机名调用服务：实时更新为 `http://<addon-hostname>:5000/temperature`，历史采样为 `http://<addon-hostname>:5000/history/sample`。请将 `<addon-hostname>` 替换为当前安装实例的名称；从自定义 GitHub 仓库安装时，该名称由 Home Assistant 根据仓库生成，不能假定为固定的 `local-temperature-monitor`。健康检查地址为 `/health`。
