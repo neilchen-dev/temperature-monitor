@@ -7,6 +7,7 @@ from flask import Flask
 from waitress import serve
 
 import config
+from routes.history import history_bp
 from routes.temperature import temperature_bp
 
 
@@ -41,6 +42,7 @@ def create_app() -> Flask:
     configure_logging()
     flask_app = Flask(__name__)
     flask_app.register_blueprint(temperature_bp)
+    flask_app.register_blueprint(history_bp)
     return flask_app
 
 
@@ -50,9 +52,12 @@ app = create_app()
 def run_server() -> None:
     logger = logging.getLogger("temperature_monitor")
     logger.info(
-        "温湿度监控服务启动 | 设备数量=%s | HA温度源单位=%s | 离线状态由HA明确提供",
+        "温湿度监控服务启动 | 设备数量=%s | HA温度源单位=%s | "
+        "历史表数量=%s | 历史清理启用=%s | 离线状态由HA明确提供",
         len(config.DEVICES),
         config.SOURCE_TEMPERATURE_UNIT,
+        len(config.HISTORY_TABLE_MAP),
+        config.HISTORY_CLEANUP_ENABLED,
     )
     serve(
         app,

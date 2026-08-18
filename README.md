@@ -10,6 +10,7 @@
 - **后端服务**：Flask 提供 `POST /temperature` 接口，负责设备校验、单位转换与在线状态处理。
 - **业务系统集成**：通过飞书开放 API 写入多维表格，实现现场数据实时更新与留痕。
 - **状态判定**：支持由 Home Assistant 明确上报的在线/离线状态；离线上报不会覆盖最后一次有效温湿度。
+- **定时历史快照**：Home Assistant 每十分钟调用一次 `POST /history/sample`，后端将实时总表的 11 台设备完整快照分别写入历史表，并按采集时间去重。
 - **现场闭环**：多维表格 Demo 中包含监测记录、异常事件、作业登记、区域/点检等业务对象，并通过 Dashboard 汇总关键状态。
 - **工程化运行**：Token 缓存与刷新、429/5xx/超时重试、CSV 历史记录、轮转日志、Waitress 与 Docker 部署。
 
@@ -34,11 +35,11 @@
 | --- | --- |
 | ![Field work log](docs/images/field-work-log.png) | ![Warehouse inspection](docs/images/field-work-log-detail.png) |
 
-## 一键部署
+## Docker Compose 部署（Home Assistant Container）
 
 部署者只需准备 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）和自己的飞书应用凭据。项目不包含任何真实凭据。
 
-1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID`。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
+1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID` 和随机生成的 `HISTORY_API_KEY`。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
 2. Windows 用户双击或在 PowerShell 中运行：
 
    ```powershell
@@ -50,23 +51,32 @@
 3. Linux/macOS 或任意终端运行：
 
    ```bash
-   docker compose up -d
+   docker compose pull
+   docker compose up -d --remove-orphans --wait --wait-timeout 120
    ```
 
-部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok"}` 即表示服务已启动。更新版本时，在项目目录再次执行同一条命令即可。
+部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok"}` 即表示服务已启动。Compose 默认使用版本化镜像 `1.1.0`；以后升级时先将 `IMAGE_TAG` 改为目标版本，再重复“拉取 + 启动”命令。生产环境不要只依赖 `latest`。
 
-## Home Assistant Add-on 一键安装
+Home Assistant Container 不使用 Add-on 内部主机名。`rest_command` 中的 `<temperature-monitor-host>` 按 HA 容器网络模式填写：
 
-适用于 **Home Assistant OS / Supervised** 且为 `amd64`（Intel / AMD）主机。已配置为使用阿里云容器镜像：
+- HA 使用 `network_mode: host`：填 `127.0.0.1`。
+- HA 使用普通 bridge 网络：填 Docker 主机的局域网 IP，例如 `192.168.1.10`；不能填 `localhost`，因为它只代表 HA 容器自身。
+- HA 与本服务加入同一个自定义 Docker 网络：填容器名 `temperature-monitor`。
+
+服务端口已由 Compose 映射为宿主机的 `${PORT:-5000}`。部署 HA 配置前，先从 HA 容器所在网络确认 `http://<temperature-monitor-host>:5000/health` 可访问。
+
+## 可选：Home Assistant Add-on
+
+仅适用于 **Home Assistant OS / Supervised**；Home Assistant Container 用户可忽略本节。已配置为使用阿里云容器镜像：
 
 ```text
-crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:latest
+crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:1.1.0
 ```
 
 1. 在 Home Assistant 中打开 **设置 → Add-ons → Add-on Store → 右上角菜单 → Repositories**。
 2. 添加仓库：`https://github.com/neilchen-dev/temperature-monitor`。
 3. 在 Add-on Store 选择 **Temperature Monitor**，点击 **Install**。
-4. 在 Add-on 的 **Configuration** 页面填写飞书凭据；默认使用 `device_id_field`（`设备编号`）自动识别每台设备的 `record_id`，点击 **Save** 后 **Start**。
+4. 在 Add-on 的 **Configuration** 页面填写飞书凭据和至少 32 字节的 `history_api_key`；默认使用 `device_id_field`（`设备编号`）自动识别每台设备的 `record_id`，点击 **Save** 后 **Start**。
 
 如设备字段名称不是“设备编号”，将 `device_id_field` 改为你的字段名。如果 Home Assistant 上报的设备名与飞书表中的设备编号不同，使用 `device_name_map` 做名称映射，例如：
 
@@ -89,8 +99,11 @@ flowchart TD
     sensor["小米温湿度计 / Demo DEV-xx"] --> integration["Xiaomi Home 集成"]
     integration --> entity["Home Assistant 温度/湿度实体"]
     entity --> automation["状态变化触发 Automation"]
+    entity --> historyAutomation["每10分钟历史采样 Automation"]
     automation --> rest["rest_command.python_test"]
+    historyAutomation --> historyRest["rest_command.temperature_history_sample"]
     rest -->|"POST /temperature"| api["Temperature Monitor / Flask"]
+    historyRest -->|"POST /history/sample"| api
     api --> validate["设备校验、单位转换、在线状态处理"]
     validate --> feishu["飞书多维表格 / Dashboard"]
     validate --> csv["CSV 月度历史"]
@@ -100,6 +113,7 @@ flowchart TD
 1. Home Assistant 在温度、湿度或在线状态改变时调用 `POST /temperature`。
 2. 服务校验设备与数值，并依据 `SOURCE_TEMPERATURE_UNIT` 将温度统一为摄氏度。
 3. 最新状态写入飞书多维表格，同时保留月度 CSV 和日志；离线事件只更新状态，不覆盖最后一次有效读数。
+4. 每逢整十分钟，后端读取实时总表并向 TH-01 至 TH-11 历史表各写一条同时间点快照；重复请求不会重复写入。
 
 ## Demo 资源
 
@@ -150,10 +164,13 @@ Invoke-RestMethod http://127.0.0.1:5000/health
 ```bash
 cp .env.example .env
 # 编辑 .env 后执行
-docker compose up -d
+docker compose pull
+docker compose up -d --remove-orphans --wait --wait-timeout 120
 ```
 
-Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
+Compose 默认直接拉取已发布的 ACR `1.1.0` 镜像，无需在本地构建。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
+
+如需回滚，在 `.env` 中设置上一稳定版本（例如 `IMAGE_TAG=1.0.3`），然后重新执行拉取和启动命令。`HISTORY_CLEANUP_ENABLED` 只从部署配置读取；第一阶段必须为 `false`，修改后需要重建容器才会生效。
 
 ## 环境变量
 
@@ -163,6 +180,13 @@ Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 
 | `APP_SECRET` | 是 | — | 飞书应用密钥 |
 | `APP_TOKEN` | 是 | — | 飞书多维表格 App Token |
 | `TABLE_ID` | 是 | — | 飞书数据表 ID |
+| `HISTORY_API_KEY` | 使用历史采样时是 | — | `POST /history/sample` 的共享密钥，至少 32 字节 |
+| `HISTORY_TABLE_MAP` | 使用历史采样时是 | 空 | JSON 格式的 TH-01～TH-11 到历史表 ID 的完整映射 |
+| `HISTORY_INTERVAL_MINUTES` | 否 | `10` | 历史采样去重时间桶分钟数；需与 HA 自动化一致 |
+| `HISTORY_TIMEZONE` | 否 | `Asia/Shanghai` | 历史采样与清理截止日使用的时区 |
+| `HISTORY_CLEANUP_ENABLED` | 否 | `false` | 是否真正删除过期记录；第一阶段必须保持 `false` |
+| `HISTORY_RETENTION_DAYS` | 否 | `90` | 历史记录保留天数 |
+| `HISTORY_CLEANUP_HOUR` | 否 | `2` | 每日首次执行清理检查的本地小时 |
 | `DEVICE_RECORD_MAP` | 否 | 空 | JSON 格式的设备名到飞书 record ID 手动覆盖，例如 `{"DEV-01":"recxxx"}` |
 | `DEVICE_ID_FIELD` | 否 | `设备编号` | 自动识别 record ID 时，在飞书表中匹配设备名的字段 |
 | `DEVICE_NAME_MAP` | 否 | 空 | JSON 格式的 Home Assistant 上报名到飞书设备编号映射，例如 `{"sensor.warehouse_temp":"DEV-01"}` |
@@ -178,14 +202,14 @@ Compose 默认直接拉取已发布的 ACR 镜像，无需在本地构建。CSV 
 
 ## Home Assistant 配置
 
-参考 [`homeassistant/rest_command.yaml`](homeassistant/rest_command.yaml) 和 [`homeassistant/automation_th01.example.yaml`](homeassistant/automation_th01.example.yaml)。其中实体 ID 与设备名称均为示例值，请替换为你自己的配置。
+参考 [`homeassistant/rest_command.yaml`](homeassistant/rest_command.yaml)、[`homeassistant/automation_th01.example.yaml`](homeassistant/automation_th01.example.yaml) 和 [`homeassistant/automation_history_sample.yaml`](homeassistant/automation_history_sample.yaml)。将 `homeassistant/secrets.example.yaml` 中的密钥项复制到 HA 的 `secrets.yaml`，并确保它与服务端 `HISTORY_API_KEY` 完全一致。
 
 ```yaml
 rest_command:
   python_test:
-    # 将 <addon-hostname> 替换为当前 Add-on 安装实例的内部主机名。
-    # 自定义 GitHub 仓库的名称并不固定为 local-temperature-monitor。
-    url: "http://<addon-hostname>:5000/temperature"
+    # HA 使用 host 网络时填 127.0.0.1；bridge 网络填 Docker 主机局域网 IP；
+    # 两个容器共享自定义网络时填 temperature-monitor。
+    url: "http://<temperature-monitor-host>:5000/temperature"
     method: POST
     headers:
       Content-Type: application/json
@@ -195,6 +219,15 @@ rest_command:
         "temperature": "{{ temperature }}",
         "humidity": "{{ humidity }}"
       }
+
+  temperature_history_sample:
+    url: "http://<temperature-monitor-host>:5000/history/sample"
+    method: POST
+    headers:
+      Content-Type: application/json
+      X-History-Key: !secret temperature_monitor_history_api_key
+    payload: "{}"
+    timeout: 120
 ```
 
 请求体示例：
@@ -209,3 +242,5 @@ rest_command:
 ```
 
 若未传 `status`，后端会按在线处理。默认 `SOURCE_TEMPERATURE_UNIT=C`；如果上游发送华氏温度，请将它设置为 `F`。
+
+历史采样接口读取实时总表中的区域、温湿度、在线状态、温湿度判定、工艺、综合判定、作业状态和警报状态，再分别写入 11 张历史表。同一十分钟时间桶重复调用会被跳过。第一阶段 `HISTORY_CLEANUP_ENABLED=false` 时只进行过期记录只读预检，代码不会调用飞书删除接口；观察稳定 24～48 小时并人工确认后，才能修改配置并重启服务启用清理。
