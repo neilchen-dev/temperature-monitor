@@ -208,14 +208,26 @@ def _chunked(values: list[str], size: int) -> list[list[str]]:
 
 def run_cleanup_if_due(sample_time: datetime) -> dict[str, Any]:
     cleanup_enabled = bool(config.HISTORY_CLEANUP_ENABLED)
+    if not cleanup_enabled:
+        return {
+            "status": "disabled",
+            "enabled": False,
+        }
+
     if sample_time.hour < config.HISTORY_CLEANUP_HOUR:
         return {
             "status": "not_due",
-            "enabled": cleanup_enabled,
+            "enabled": True,
         }
 
     today = sample_time.date()
     cutoff_date = today - timedelta(days=config.HISTORY_RETENTION_DAYS)
+    cutoff_time = datetime.combine(
+        cutoff_date,
+        datetime_time.min,
+        tzinfo=sample_time.tzinfo,
+    )
+    cutoff_timestamp_ms = int(cutoff_time.timestamp() * 1000)
     results: dict[str, Any] = {}
     failures: dict[str, str] = {}
 
@@ -227,40 +239,32 @@ def run_cleanup_if_due(sample_time: datetime) -> dict[str, Any]:
         try:
             expired_ids = find_expired_history_record_ids(
                 table_id,
-                cutoff_date.isoformat(),
+                cutoff_timestamp_ms,
             )
-            if cleanup_enabled:
-                deleted = 0
-                for batch in _chunked(expired_ids, 500):
-                    result = delete_history_records(table_id, batch)
-                    if int(result.get("code", -1)) != 0:
-                        raise RuntimeError(
-                            f"code={result.get('code')}, msg={result.get('msg')}"
-                        )
-                    deleted += len(batch)
-                results[device] = {
-                    "status": "deleted",
-                    "candidate_count": len(expired_ids),
-                    "deleted_count": deleted,
-                }
-            else:
-                results[device] = {
-                    "status": "preflight_only",
-                    "candidate_count": len(expired_ids),
-                    "deleted_count": 0,
-                }
+            deleted = 0
+            for batch in _chunked(expired_ids, 500):
+                result = delete_history_records(table_id, batch)
+                if int(result.get("code", -1)) != 0:
+                    raise RuntimeError(
+                        f"code={result.get('code')}, msg={result.get('msg')}"
+                    )
+                deleted += len(batch)
+            results[device] = {
+                "status": "deleted",
+                "candidate_count": len(expired_ids),
+                "deleted_count": deleted,
+            }
             _cleanup_date_by_table[table_id] = today
         except Exception as exc:  # per-table retry is intentionally deferred
             logger.exception("历史清理检查失败 | device=%s", device)
             failures[device] = str(exc)
 
-    status = "partial" if failures else (
-        "completed" if cleanup_enabled else "disabled_preflight"
-    )
+    status = "partial" if failures else "completed"
     return {
         "status": status,
-        "enabled": cleanup_enabled,
+        "enabled": True,
         "cutoff_date": cutoff_date.isoformat(),
+        "cutoff_timestamp_ms": cutoff_timestamp_ms,
         "tables": results,
         "failures": failures,
     }
@@ -311,7 +315,11 @@ def sample_history(now: datetime | None = None) -> tuple[dict[str, Any], int]:
                 logger.exception("历史快照写入失败 | device=%s", device)
                 failures[device] = str(exc)
 
-        cleanup = run_cleanup_if_due(sample_time)
+        cleanup = (
+            run_cleanup_if_due(sample_time)
+            if cleanup_enabled
+            else {"status": "disabled", "enabled": False}
+        )
         duration_ms = int((time.monotonic() - started) * 1000)
         if failures and not created and not skipped:
             status_text = "error"
