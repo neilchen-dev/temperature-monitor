@@ -143,7 +143,7 @@ class RecordDiscoveryTests(unittest.TestCase):
         ):
             record_ids = feishu.find_expired_history_record_ids(
                 "tbl_history",
-                "2026-05-20",
+                1779206400000,
             )
 
         self.assertEqual(record_ids, ["rec_old_1", "rec_old_2"])
@@ -152,7 +152,7 @@ class RecordDiscoveryTests(unittest.TestCase):
             "conditions"
         ][0]
         self.assertEqual(condition["operator"], "isLess")
-        self.assertEqual(condition["value"], ["ExactDate(2026-05-20)"])
+        self.assertEqual(condition["value"], ["ExactDate", "1779206400000"])
 
 
 if __name__ == "__main__":

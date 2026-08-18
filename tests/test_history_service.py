@@ -86,13 +86,19 @@ class HistoryServiceTests(unittest.TestCase):
             patch.object(history, "list_realtime_snapshots", return_value=self._snapshot_records()),
             patch.object(history, "get_latest_history_timestamp", return_value=None),
             patch.object(history, "create_history_record", return_value={"code": 0}) as create,
-            patch.object(history, "run_cleanup_if_due", return_value={"status": "not_due"}),
+            patch.object(
+                history,
+                "run_cleanup_if_due",
+                return_value={"status": "not_due"},
+            ) as cleanup,
         ):
             payload, status_code = history.sample_history(now)
 
         self.assertEqual(status_code, 200)
         self.assertEqual(len(payload["created"]), 11)
         self.assertEqual(create.call_count, 11)
+        self.assertEqual(payload["cleanup"], {"status": "disabled", "enabled": False})
+        cleanup.assert_not_called()
         timestamps = {
             history_call.args[1]["采集时间"] for history_call in create.call_args_list
         }
@@ -133,7 +139,7 @@ class HistoryServiceTests(unittest.TestCase):
         self.assertIn("TH-01", payload["failures"])
         self.assertEqual(len(payload["created"]), 10)
 
-    def test_disabled_cleanup_only_preflights_and_never_deletes(self) -> None:
+    def test_disabled_cleanup_short_circuits_without_feishu_calls(self) -> None:
         sample_time = datetime(2026, 8, 18, 2, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         with (
             patch.object(
@@ -145,13 +151,9 @@ class HistoryServiceTests(unittest.TestCase):
         ):
             result = history.run_cleanup_if_due(sample_time)
 
-        self.assertEqual(result["status"], "disabled_preflight")
-        self.assertEqual(find.call_count, 11)
+        self.assertEqual(result, {"status": "disabled", "enabled": False})
+        find.assert_not_called()
         delete.assert_not_called()
-        self.assertEqual(
-            find.call_args_list[0],
-            call("tbl01", "2026-05-20"),
-        )
 
     def test_enabled_cleanup_deletes_in_batches_of_500(self) -> None:
         config.HISTORY_CLEANUP_ENABLED = True
@@ -162,7 +164,7 @@ class HistoryServiceTests(unittest.TestCase):
                 history,
                 "find_expired_history_record_ids",
                 return_value=expired_ids,
-            ),
+            ) as find,
             patch.object(
                 history,
                 "delete_history_records",
@@ -172,6 +174,12 @@ class HistoryServiceTests(unittest.TestCase):
             result = history.run_cleanup_if_due(sample_time)
 
         self.assertEqual(result["status"], "completed")
+        expected_cutoff_ms = int(
+            datetime(2026, 5, 20, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+            * 1000
+        )
+        self.assertEqual(result["cutoff_timestamp_ms"], expected_cutoff_ms)
+        self.assertEqual(find.call_args_list[0], call("tbl01", expected_cutoff_ms))
         self.assertEqual(delete.call_count, 22)
         first_table_calls = delete.call_args_list[:2]
         self.assertEqual(len(first_table_calls[0].args[1]), 500)
