@@ -2,6 +2,7 @@
 **/pycache/
 *.pyc
 *.pyo
+*.log
 logs/*
 data/*
 .env
