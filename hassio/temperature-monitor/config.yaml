@@ -1,5 +1,5 @@
 name: Temperature Monitor
-version: 1.2.0
+version: 1.2.1
 slug: temperature_monitor
 description: Receive Home Assistant temperature and humidity readings and sync them to Feishu Bitable.
 url: https://github.com/neilchen-dev/temperature-monitor

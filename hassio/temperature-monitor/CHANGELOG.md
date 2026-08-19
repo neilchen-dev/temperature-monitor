@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1
+
+- 修复 SQLite 初始化遇到文件系统异常（如权限不足）时可能阻断服务启动的问题；现在任何初始化异常都只停用本地镜像。
+- Home Assistant Add-on 环境下 SQLite/CSV 默认写入 Supervisor 持久目录 `/data`，避免升级或重建容器时本地数据丢失。
+- 修复 Dashboard 温湿度数据集在部分设备缺数据时的标签错位问题，统一设备轴并以空值占位。
+- Dashboard 设备总览表输出增加 HTML 转义。
+- 查询接口 `limit` / `days` 非法参数回退默认值，不再返回 500。
+- 修复 README 环境变量表与章节标题间的 Markdown 换行问题。
+
 ## 1.2.0
 
 - 新增 SQLite 本地数据服务层：best-effort 镜像温度上报（append-only 事件日志）与历史快照（复合主键幂等），WAL 模式；飞书仍是唯一事实源，`SQLITE_ENABLED=false` 可整体关闭。

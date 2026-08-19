@@ -57,7 +57,7 @@
    docker compose up -d --remove-orphans --wait --wait-timeout 120
    ```
 
-部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok",...}` 即表示服务已启动。Compose 默认使用版本化镜像 `1.2.0`；以后升级时先将 `IMAGE_TAG` 改为目标版本，再重复“拉取 + 启动”命令。生产环境不要只依赖 `latest`。
+部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok",...}` 即表示服务已启动。Compose 默认使用版本化镜像 `1.2.1`；以后升级时先将 `IMAGE_TAG` 改为目标版本，再重复“拉取 + 启动”命令。生产环境不要只依赖 `latest`。
 
 Home Assistant Container 不使用 Add-on 内部主机名。`rest_command` 中的 `<temperature-monitor-host>` 按 HA 容器网络模式填写：
 
@@ -72,7 +72,7 @@ Home Assistant Container 不使用 Add-on 内部主机名。`rest_command` 中�
 仅适用于 **Home Assistant OS / Supervised**；Home Assistant Container 用户可忽略本节。已配置为使用阿里云容器镜像：
 
 ```text
-crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:1.2.0
+crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:1.2.1
 ```
 
 1. 在 Home Assistant 中打开 **设置 → Add-ons → Add-on Store → 右上角菜单 → Repositories**。
@@ -166,7 +166,7 @@ docker compose pull
 docker compose up -d --remove-orphans --wait --wait-timeout 120
 ```
 
-Compose 默认直接拉取已发布的 ACR `1.2.0` 镜像，无需在本地构建。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
+Compose 默认直接拉取已发布的 ACR `1.2.1` 镜像，无需在本地构建。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
 
 如需回滚，在 `.env` 中设置上一稳定版本（例如 `IMAGE_TAG=1.0.3`），然后重新执行拉取和启动命令。`HISTORY_CLEANUP_ENABLED` 只从部署配置读取；第一阶段必须为 `false`，修改后需要重建容器才会生效。
 
