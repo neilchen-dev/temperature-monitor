@@ -34,6 +34,7 @@ def _load_hassio_options() -> None:
         "history_retention_days": "HISTORY_RETENTION_DAYS",
         "history_cleanup_hour": "HISTORY_CLEANUP_HOUR",
         "source_temperature_unit": "SOURCE_TEMPERATURE_UNIT",
+        "sqlite_enabled": "SQLITE_ENABLED",
         "waitress_threads": "WAITRESS_THREADS",
         "device_id_field": "DEVICE_ID_FIELD",
     }
