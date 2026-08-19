@@ -117,12 +117,9 @@ flowchart TD
 3. 最新状态写入飞书多维表格，同时保留月度 CSV 和日志；离线事件只更新状态，不覆盖最后一次有效读数。
 4. 每逢整十分钟，后端读取实时总表并向 TH-01 至 TH-11 历史表各写一条同时间点快照；重复请求不会重复写入。
 
-## Demo 资源
+## 界面预览
 
-- [`examples/temperature-monitor-demo.base`](examples/temperature-monitor-demo.base)：可导入的飞书多维表格公开示例，包含合成记录、仪表盘与演示流程。
 - [`docs/images/`](docs/images/)：监测记录、现场登记表单与仪表盘预览截图。
-
-`.base` 是飞书的迁移格式，可能包含平台自动生成的内部标识。本示例未包含 API 密钥、真实人员、客户、组织或生产数据；请不要将自己的生产 `.base` 文件直接公开。
 
 ## 仓库结构
 
@@ -131,7 +128,6 @@ homeassistant/       Home Assistant REST 命令与自动化示例
 hassio/              Home Assistant Add-on 清单与说明
 routes/              HTTP 路由与响应处理
 services/            校验、飞书通信、令牌、重试与本地存储
-examples/            脱敏的飞书多维表格 Demo
 docs/images/         README 预览截图
 app.py               Flask 应用、日志和 Waitress 启动入口
 config.py            环境变量、设备映射与运行目录配置
