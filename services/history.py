@@ -9,6 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
+from services import db
 from services.feishu import (
     create_history_record,
     delete_history_records,
@@ -309,6 +310,7 @@ def sample_history(now: datetime | None = None) -> tuple[dict[str, Any], int]:
                     raise RuntimeError(
                         f"code={result.get('code')}, msg={result.get('msg')}"
                     )
+                db.save_history_snapshot(device, sample_time, history_fields)
                 _latest_sample_cache[device] = sample_time
                 created.append(device)
             except Exception as exc:

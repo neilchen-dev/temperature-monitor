@@ -7,8 +7,11 @@ from flask import Flask
 from waitress import serve
 
 import config
+from routes.analytics import analytics_bp
+from routes.dashboard import dashboard_bp
 from routes.history import history_bp
 from routes.temperature import temperature_bp
+from services import db
 
 
 def configure_logging() -> logging.Logger:
@@ -40,9 +43,12 @@ def configure_logging() -> logging.Logger:
 
 def create_app() -> Flask:
     configure_logging()
+    db.init_db()
     flask_app = Flask(__name__)
     flask_app.register_blueprint(temperature_bp)
     flask_app.register_blueprint(history_bp)
+    flask_app.register_blueprint(analytics_bp)
+    flask_app.register_blueprint(dashboard_bp)
     return flask_app
 
 

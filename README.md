@@ -197,6 +197,45 @@ Compose 默认直接拉取已发布的 ACR `1.1.3` 镜像，无需在本地构�
 | `WAITRESS_THREADS` | 否 | `4` | Waitress 工作线程数 |
 | `DATA_DIR` | 否 | `/app/data` | CSV 目录 |
 | `LOG_DIR` | 否 | `/app/logs` | 日志目录 |
+| `SQLITE_ENABLED` | 否 | `true` | 是否启用 SQLite 本地镜像（温度上报与历史快照的本地副本，不影响飞书主链路） |
+| `SQLITE_DB_PATH` | 否 | `${DATA_DIR}/temperature_monitor.db` | SQLite 数据库文件路径 |## SQLite 本地镜像与查询 API
+
+服务在写入飞书的同时，将数据镜像到本地 SQLite（WAL 模式，默认 `data/temperature_monitor.db`）。设计原则：
+
+- **飞书多维表格仍是唯一事实源**，SQLite 只是本地副本；初始化或写入失败只记日志并累加失败计数，绝不影响飞书链路、去重与清理逻辑；
+- `SQLITE_ENABLED=false` 可整体关闭并快速回退；
+- `history_snapshots` 以 `(设备, 采集时间)` 为复合主键，天然幂等；`temperature_reports` 是原始事件日志，允许 HA 重试产生重复行；
+- 空温湿度为 NULL：设备离线（`online_status=离线`）与在线但数值不可解析两种情况通过 `online_status` 区分；
+- 当前并发假设为**单进程单实例**（Waitress 多线程由内部锁保护）；数据库文件与 `-wal`/`-shm` 均落在同一 `data/` 持久卷内。
+
+### 只读查询与统计接口
+
+三个接口均需 `X-History-Key` 请求头（与历史采样共享密钥），镜像未启用时返回 503。
+
+```bash
+# 查询快照明细：支持 device / start / end（epoch 秒、毫秒或 ISO 8601）/ limit
+curl -H "X-History-Key: $KEY" \
+  "http://127.0.0.1:5000/history/query?device=TH-01&start=2026-08-18T00:00:00%2B08:00&limit=500"
+
+# 每日统计：每设备每天的平均/最小/最大温湿度、离线次数、超限次数（离线样本不计入超限）
+curl -H "X-History-Key: $KEY" \
+  "http://127.0.0.1:5000/history/stats/daily?device=TH-01&days=7"
+
+# 设备总览：最后快照值、快照数、上报次数、离线时长估算（离线样本数 × 采样间隔）
+curl -H "X-History-Key: $KEY" "http://127.0.0.1:5000/history/stats/devices"
+```
+
+`GET /health` 的响应中包含 `sqlite` 对象（`enabled`、`write_failures`、两张表的行数），行数也可作为镜像是否落后于飞书的粗略指标。
+
+### 可视化看板
+
+浏览器访问 `http://127.0.0.1:5000/dashboard?key=<HISTORY_API_KEY>&days=7`（`days` 可选，1～90），页面由服务端渲染，包含：
+
+- **超限与离线趋势**：按天汇总的温度/湿度超限次数与离线次数；
+- **各设备平均温湿度**：窗口期内每设备平均温度（°C）与平均湿度（%RH）双轴对比；
+- **设备总览表**：最后快照值、在线状态、快照数、上报次数、最后快照/上报时间、估算离线时长。
+
+注意：`key` 通过 URL query string 传递，**会出现在浏览器历史、书签以及反向代理/网关的 access log 中**。请勿分享带 key 的链接，生产环境建议将 key 放在只有你访问的受控设备上打开，或为 dashboard 配置独立密钥。离线时长为估算值（离线样本数 × 采样间隔），漏采或停机会导致偏差。图表依赖 CDN 的 Chart.js，加载失败时图表区域显示占位提示，总览表不受影响。
 
 ## Home Assistant 配置
 

@@ -8,6 +8,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 import config
+from services import db
 from services.feishu import resolve_record_id, update_feishu_fields
 from services.storage import save_history
 from services.validator import is_offline_status, normalize_humidity, normalize_temperature
@@ -100,4 +101,4 @@ def temperature():
 
 @temperature_bp.get("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "sqlite": db.get_stats()}), 200

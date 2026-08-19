@@ -98,6 +98,13 @@ TOKEN_REFRESH_MARGIN_SECONDS = _get_int("TOKEN_REFRESH_MARGIN_SECONDS", 300)
 LOG_MAX_BYTES = _get_int("LOG_MAX_BYTES", 5 * 1024 * 1024)
 LOG_BACKUP_COUNT = _get_int("LOG_BACKUP_COUNT", 5)
 
+# SQLite 本地镜像：仅作为飞书数据的本地副本（温度上报 + 历史快照），
+# 不改变飞书写入、去重与清理逻辑；写入失败只记日志并继续。
+SQLITE_ENABLED = _get_bool("SQLITE_ENABLED", True)
+SQLITE_DB_PATH = Path(
+    os.getenv("SQLITE_DB_PATH", str(DATA_DIR / "temperature_monitor.db"))
+)
+
 # 历史快照由 Home Assistant 每十分钟触发一次。删除默认硬关闭，只有重启后
 # 读取到 HISTORY_CLEANUP_ENABLED=true 才可能执行，HTTP 请求不能覆盖此配置。
 HISTORY_API_KEY = os.getenv("HISTORY_API_KEY", "").strip()

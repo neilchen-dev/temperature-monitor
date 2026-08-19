@@ -9,7 +9,9 @@ from app import create_app
 
 class TemperatureRouteTests(unittest.TestCase):
     def setUp(self) -> None:
+        config.SQLITE_ENABLED = False
         self.client = create_app().test_client()
+        config.SQLITE_ENABLED = True
         config.DEVICE_NAME_MAP = {"WAREHOUSE-TEMP": "DEV-01"}
         config.DEVICES = {}
 

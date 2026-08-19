@@ -9,7 +9,9 @@ from app import create_app
 
 class HistoryRouteTests(unittest.TestCase):
     def setUp(self) -> None:
+        config.SQLITE_ENABLED = False
         self.client = create_app().test_client()
+        config.SQLITE_ENABLED = True
 
     def test_rejects_request_when_api_key_is_not_configured(self) -> None:
         with patch.object(config, "HISTORY_API_KEY", ""):

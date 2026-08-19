@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 import config
+from services import db
 
 
 _history_lock = threading.Lock()
@@ -20,6 +21,14 @@ def save_history(
     feishu_message: str,
 ) -> None:
     config.ensure_runtime_directories()
+    db.save_temperature_report(
+        device,
+        temperature_c,
+        humidity,
+        status,
+        feishu_code,
+        feishu_message,
+    )
     history_file = config.DATA_DIR / time.strftime("history_%Y-%m.csv")
 
     with _history_lock:
