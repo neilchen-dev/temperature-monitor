@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 from datetime import datetime, timedelta
+from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -142,18 +143,20 @@ def _render_device_table(devices: list[dict[str, Any]]) -> str:
     rows = []
     for item in devices:
         status_class = "ok" if item["last_online_status"] == "在线" else "bad"
-        status_text = item["last_online_status"] or "—"
-        temp = "—" if item["last_temperature"] is None else f"{item['last_temperature']} °C"
-        humidity = "—" if item["last_humidity"] is None else f"{item['last_humidity']} %"
+        # All string-ish DB values pass through escape() so a device name or
+        # status containing HTML metacharacters can never inject markup.
+        status_text = escape(str(item["last_online_status"] or "—"))
+        temp = "—" if item["last_temperature"] is None else escape(f"{item['last_temperature']} °C")
+        humidity = "—" if item["last_humidity"] is None else escape(f"{item['last_humidity']} %")
         offline_sec = item.get("estimated_offline_duration_sec") or 0
         rows.append(
-            f"<tr><td>{item['device']}</td>"
+            f"<tr><td>{escape(str(item['device']))}</td>"
             f"<td class='num'>{temp}</td><td class='num'>{humidity}</td>"
             f"<td class='{status_class}'>{status_text}</td>"
             f"<td class='num'>{item['snapshot_count']}</td>"
             f"<td class='num'>{item['report_count']}</td>"
-            f"<td class='num'>{item['last_sample_iso'] or '—'}</td>"
-            f"<td class='num'>{item['last_report_at'] or '—'}</td>"
+            f"<td class='num'>{escape(str(item['last_sample_iso'] or '—'))}</td>"
+            f"<td class='num'>{escape(str(item['last_report_at'] or '—'))}</td>"
             f"<td class='num'>{offline_sec // 60} 分钟</td></tr>"
         )
     return (
@@ -197,7 +200,8 @@ def dashboard():
         )
 
     trend_by_date: dict[str, dict[str, int]] = {}
-    avg_by_device: dict[str, list[float]] = {}
+    temperature_by_device: dict[str, list[float]] = {}
+    humidity_by_device: dict[str, list[float]] = {}
     for row in daily:
         date_key = str(row["local_date"])
         bucket = trend_by_date.setdefault(
@@ -208,7 +212,24 @@ def dashboard():
         bucket["humidity"] += row["humidity_abnormal_count"] or 0
         bucket["offline"] += row["offline_count"] or 0
         if row["avg_temperature"] is not None:
-            avg_by_device.setdefault(str(row["device"]), []).append(row["avg_temperature"])
+            temperature_by_device.setdefault(
+                str(row["device"]), []
+            ).append(row["avg_temperature"])
+        if row["avg_humidity"] is not None:
+            humidity_by_device.setdefault(
+                str(row["device"]), []
+            ).append(row["avg_humidity"])
+
+    # Unified device axis: every dataset is aligned to the same sorted device
+    # list with None for missing values, so a device that has temperature but
+    # no humidity (or vice versa) can never shift the other series' labels.
+    devices_axis = sorted(set(temperature_by_device) | set(humidity_by_device))
+
+    def _window_average(values_by_device: dict[str, list[float]], device: str):
+        values = values_by_device.get(device)
+        if not values:
+            return None
+        return round(sum(values) / len(values), 2)
 
     payload = {
         "trend": {
@@ -224,22 +245,17 @@ def dashboard():
             ],
         },
         "avg": {
-            "devices": sorted(avg_by_device),
+            "devices": devices_axis,
             "temperature": [
-                round(sum(avg_by_device[device]) / len(avg_by_device[device]), 2)
-                for device in sorted(avg_by_device)
+                _window_average(temperature_by_device, device)
+                for device in devices_axis
             ],
-            "humidity": [],
+            "humidity": [
+                _window_average(humidity_by_device, device)
+                for device in devices_axis
+            ],
         },
     }
-    humidity_by_device: dict[str, list[float]] = {}
-    for row in daily:
-        if row["avg_humidity"] is not None:
-            humidity_by_device.setdefault(str(row["device"]), []).append(row["avg_humidity"])
-    payload["avg"]["humidity"] = [
-        round(sum(values) / len(values), 2)
-        for device, values in sorted(humidity_by_device.items())
-    ]
 
     # ``<`` escaping keeps embedded JSON from breaking out of the script tag.
     embedded_json = (

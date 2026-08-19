@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -116,6 +117,60 @@ class AnalyticsRouteTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_query_invalid_limit_falls_back_without_500(self) -> None:
+        response = self.client.get(
+            "/history/query?limit=abc",
+            headers=self.HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["count"], 4)
+
+    def test_daily_invalid_days_falls_back_without_500(self) -> None:
+        response = self.client.get(
+            "/history/stats/daily?days=abc",
+            headers=self.HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["count"], 2)
+
+    def test_dashboard_datasets_share_unified_device_axis(self) -> None:
+        # TH-03 has temperature but no humidity; TH-04 has humidity but no
+        # temperature. Both series must stay aligned on one device axis.
+        timezone = ZoneInfo("Asia/Shanghai")
+        sample_time = datetime(2026, 8, 18, 10, 0, tzinfo=timezone)
+        db.save_history_snapshot("TH-03", sample_time, {
+            "采集时间": int(sample_time.timestamp() * 1000),
+            "当前温度": 23.0, "当前湿度": None, "在线状态": "在线",
+        })
+        db.save_history_snapshot("TH-04", sample_time, {
+            "采集时间": int(sample_time.timestamp() * 1000),
+            "当前温度": None, "当前湿度": 45.0, "在线状态": "在线",
+        })
+
+        response = self.client.get(
+            f"/dashboard?key={'k' * 32}&days=7",
+        )
+        body = response.get_data(as_text=True)
+        embedded = body.partition("const data = ")[2].partition(";\n")[0]
+        data = json.loads(embedded)
+
+        self.assertEqual(
+            data["avg"]["devices"],
+            ["TH-01", "TH-02", "TH-03", "TH-04"],
+        )
+        temperature = data["avg"]["temperature"]
+        humidity = data["avg"]["humidity"]
+        self.assertEqual(len(temperature), 4)
+        self.assertEqual(len(humidity), 4)
+        # TH-03: temperature only -> humidity slot is null.
+        self.assertEqual(temperature[2], 23.0)
+        self.assertIsNone(humidity[2])
+        # TH-04: humidity only -> temperature slot is null.
+        self.assertIsNone(temperature[3])
+        self.assertEqual(humidity[3], 45.0)
 
     def test_daily_stats_aggregates_and_excludes_offline_from_abnormal(self) -> None:
         response = self.client.get(

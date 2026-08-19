@@ -195,10 +195,12 @@ Compose 默认直接拉取已发布的 ACR `1.2.0` 镜像，无需在本地构�
 | `REQUEST_TIMEOUT_SECONDS` | 否 | `10` | 单次 HTTP 请求超时秒数 |
 | `REQUEST_RETRY_TIMES` | 否 | `3` | HTTP 请求最大尝试次数 |
 | `WAITRESS_THREADS` | 否 | `4` | Waitress 工作线程数 |
-| `DATA_DIR` | 否 | `/app/data` | CSV 目录 |
+| `DATA_DIR` | 否 | `/app/data`（Add-on 环境为 `/data`） | CSV 与 SQLite 数据目录 |
 | `LOG_DIR` | 否 | `/app/logs` | 日志目录 |
 | `SQLITE_ENABLED` | 否 | `true` | 是否启用 SQLite 本地镜像（温度上报与历史快照的本地副本，不影响飞书主链路） |
-| `SQLITE_DB_PATH` | 否 | `${DATA_DIR}/temperature_monitor.db` | SQLite 数据库文件路径 |## SQLite 本地镜像与查询 API
+| `SQLITE_DB_PATH` | 否 | `${DATA_DIR}/temperature_monitor.db` | SQLite 数据库文件路径 |
+
+## SQLite 本地镜像与查询 API
 
 服务在写入飞书的同时，将数据镜像到本地 SQLite（WAL 模式，默认 `data/temperature_monitor.db`）。设计原则：
 

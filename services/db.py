@@ -98,7 +98,11 @@ def _get_connection() -> sqlite3.Connection | None:
             "SQLite 本地镜像已启用 | path=%s", config.SQLITE_DB_PATH
         )
         return _connection
-    except sqlite3.Error:
+    except Exception:
+        # This module is an isolation boundary: whatever goes wrong during
+        # init (sqlite errors, permission errors, OSError from mkdir, ...)
+        # may only disable the mirror, never break the Feishu main path or
+        # the Flask startup.
         _init_failed = True
         logger.exception(
             "SQLite 初始化失败，本地镜像已停用 | path=%s", config.SQLITE_DB_PATH

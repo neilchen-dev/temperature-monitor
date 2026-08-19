@@ -86,7 +86,10 @@ def query_snapshots():
         return jsonify({"status": "error", "error": parse_error}), 400
 
     device = request.args.get("device", "").strip().upper() or None
-    limit = request.args.get("limit", default=500, type=int)
+    # ``type=int`` yields None for non-numeric input; fall back to the default
+    # and clamp instead of letting a TypeError turn into a 500.
+    limit = request.args.get("limit", default=500, type=int) or 500
+    limit = max(1, min(limit, 10000))
 
     items = db.fetch_history_snapshots(
         device=device,
@@ -118,7 +121,7 @@ def daily_stats():
         return jsonify({"status": "error", "error": parse_error}), 400
 
     device = request.args.get("device", "").strip().upper() or None
-    days = request.args.get("days", default=7, type=int)
+    days = request.args.get("days", default=7, type=int) or 7
     days = max(1, min(days, 90))
 
     # Default window: the last N local days ending now, so an unparameterized

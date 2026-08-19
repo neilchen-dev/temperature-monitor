@@ -84,7 +84,13 @@ TABLE_ID = os.getenv("TABLE_ID", "")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _get_int("PORT", 5000)
 WAITRESS_THREADS = _get_int("WAITRESS_THREADS", 4)
-DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
+# Home Assistant Add-on 中 /app/data 位于容器内、升级即丢；Supervisor 的
+# /data 才是持久目录。检测到 Add-on 环境时默认切换，仍可用 DATA_DIR 覆盖。
+IS_HOME_ASSISTANT_ADDON = HASSIO_OPTIONS_PATH.is_file()
+DATA_DIR = Path(
+    os.getenv("DATA_DIR")
+    or ("/data" if IS_HOME_ASSISTANT_ADDON else str(BASE_DIR / "data"))
+)
 LOG_DIR = Path(os.getenv("LOG_DIR", str(BASE_DIR / "logs")))
 
 # Home Assistant commonly reports Celsius; values are stored in Celsius.

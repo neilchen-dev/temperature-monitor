@@ -158,6 +158,24 @@ class SqliteMirrorTests(unittest.TestCase):
         self.assertIsNone(rows[0]["humidity"])
         self.assertEqual(rows[0]["online_status"], "离线")
 
+    def test_init_failure_degrades_without_raising(self) -> None:
+        # A regular file as the parent directory makes mkdir() raise an
+        # OSError: initialization must swallow it and disable the mirror
+        # instead of breaking the Flask startup.
+        blocker = Path(self._tmp_dir.name) / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        config.SQLITE_DB_PATH = blocker / "mirror.db"
+
+        db.init_db()
+
+        self.assertFalse(db.is_enabled())
+        self.assertIsNone(db._get_connection())
+        # Writes on a failed mirror are silent no-ops.
+        db.save_temperature_report(
+            device="DEV-01", temperature_c=1.0, humidity=1.0,
+            status="在线", feishu_code=0, feishu_message="success",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
