@@ -1,0 +1,167 @@
+name: Build and Deploy
+
+# CI -> CD 架构：
+#   tests.yml 在 main 分支 push 后运行测试；
+#   测试成功后由 workflow_run 触发本 workflow 完成构建、推送 ACR 和生产部署。
+#   PR 只跑测试（tests.yml），永远不会触发本 workflow 的部署。
+
+on:
+  workflow_run:
+    workflows:
+      - Tests
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+env:
+  REGISTRY: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com
+  IMAGE_NAME: noef-temperature/temperature-monitor
+
+jobs:
+  build:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Define image tag
+        id: meta
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            BUILD_VERSION=${{ env.IMAGE_TAG }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.result == 'success'
+
+    steps:
+      - name: Deploy to production server
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          REGISTRY: ${{ env.REGISTRY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          envs: IMAGE_TAG,ACR_USERNAME,ACR_PASSWORD,REGISTRY,DEPLOY_PATH
+          script_stop: true
+
+          script: |
+            set -euo pipefail
+
+            echo "Deploying image tag: ${IMAGE_TAG}"
+
+            cd "${DEPLOY_PATH}"
+
+            if [ ! -f compose.yaml ]; then
+              echo "ERROR: compose.yaml not found in ${DEPLOY_PATH}"
+              exit 1
+            fi
+
+            if [ ! -f .env ]; then
+              echo "ERROR: .env not found in ${DEPLOY_PATH}"
+              exit 1
+            fi
+
+            # 同步 compose.yaml 等仓库文件（服务器目录是 Git 仓库时）。
+            # 禁止 git clean -fdx：.env、data/、logs/ 必须保留。
+            if [ -d .git ]; then
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            # 安全读取 .env 中的 PORT（不 source .env，避免特殊字符破坏 shell）
+            APP_PORT=$(grep -E '^PORT=' .env | tail -n 1 | cut -d= -f2 | tr -d '\r' || true)
+            APP_PORT="${APP_PORT:-5000}"
+
+            # 记录旧镜像，用于失败回滚
+            OLD_IMAGE=$(docker inspect temperature-monitor --format='{{.Config.Image}}' 2>/dev/null || true)
+            OLD_TAG=$(grep -E '^IMAGE_TAG=' .env | tail -n 1 | cut -d= -f2 | tr -d '\r' || true)
+            echo "Previous image: ${OLD_IMAGE:-none}"
+
+            echo "${ACR_PASSWORD}" | docker login "${REGISTRY}" \
+              --username "${ACR_USERNAME}" \
+              --password-stdin
+
+            rollback() {
+              ROLLBACK_TAG="${OLD_TAG:-latest}"
+              echo "ERROR: deployment failed, rolling back to IMAGE_TAG=${ROLLBACK_TAG}"
+              if grep -q '^IMAGE_TAG=' .env; then
+                sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${ROLLBACK_TAG}/" .env
+              else
+                echo "IMAGE_TAG=${ROLLBACK_TAG}" >> .env
+              fi
+              docker compose up -d --remove-orphans --wait --wait-timeout 120 || true
+              echo "Rolled back to ${ROLLBACK_TAG}"
+              exit 1
+            }
+
+            # 只修改 IMAGE_TAG 行，保留 .env 其余所有业务配置
+            if grep -q '^IMAGE_TAG=' .env; then
+              sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${IMAGE_TAG}/" .env
+            else
+              echo "IMAGE_TAG=${IMAGE_TAG}" >> .env
+            fi
+
+            docker compose pull || rollback
+
+            # 不使用 down -v；data/ 与 logs/ 挂载卷中的 SQLite 数据和日志保持不动
+            docker compose up -d --remove-orphans --wait --wait-timeout 120 || rollback
+
+            docker compose ps
+
+            if ! curl --fail --silent --show-error --retry 10 --retry-delay 3 \
+              "http://127.0.0.1:${APP_PORT}/health"; then
+              rollback
+            fi
+
+            echo
+            echo "Deployment successful: ${IMAGE_TAG}"

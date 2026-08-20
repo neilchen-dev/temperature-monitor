@@ -37,6 +37,44 @@
 | --- | --- |
 | ![Field work log](docs/images/field-work-log.png) | ![Warehouse inspection](docs/images/field-work-log-detail.png) |
 
+## CI/CD
+
+仓库使用 GitHub Actions 实现自动化测试与部署，流程如下：
+
+```text
+Pull Request ──> tests.yml（只测试，不部署）
+main push     ──> tests.yml（自动测试）
+                    │ 测试通过
+                    ▼
+               deploy.yml（workflow_run 触发）
+                    ├── 构建 Docker 镜像（commit SHA + latest 双标签）
+                    ├── 推送阿里云 ACR
+                    ▼
+               SSH 登录生产服务器
+                    ├── 同步 compose.yaml
+                    ├── 更新 .env 中的 IMAGE_TAG（保留其余配置）
+                    ├── docker compose pull / up -d --wait
+                    ▼
+               GET /health 健康检查
+                    ├── 成功 → 部署完成
+                    └── 失败 → 自动回滚到上一个镜像并使 Actions 失败
+```
+
+服务器上的 `data/`（SQLite 数据）、`logs/`（日志）与 `.env`（飞书等业务凭据）在部署过程中始终保留，部署脚本不会执行 `docker compose down -v`、`git clean -fdx` 或任何删除数据的操作。
+
+CD 依赖以下 GitHub Repository Secrets（只存名称于仓库文档，实际值配置在 GitHub Settings → Secrets and variables → Actions，绝不提交到 Git）：
+
+| Secret | 说明 |
+|---|---|
+| `SERVER_HOST` | 生产服务器公网 IP |
+| `SERVER_USER` | SSH 登录用户（例如 `root`） |
+| `SERVER_SSH_KEY` | 专用于部署的 SSH 私钥（OpenSSH 格式） |
+| `DEPLOY_PATH` | 服务器部署目录（例如 `/root/temperature-monitor`，内含 `compose.yaml`、`.env`、`data/`、`logs/`） |
+| `ACR_USERNAME` | 阿里云容器镜像仓库用户名 |
+| `ACR_PASSWORD` | 阿里云容器镜像仓库密码 |
+
+镜像标签策略：每次 main 分支提交同时推送 `<commit SHA>` 与 `latest` 两个标签；生产部署始终使用精确 SHA 标签（写入服务器 `.env` 的 `IMAGE_TAG`），具备可追踪、可回滚、可审计的能力。正式发版时可额外推送 `1.2.x` 之类的版本号标签。
+
 ## Docker Compose 部署（Home Assistant Container）
 
 部署者只需准备 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）和自己的飞书应用凭据。项目不包含任何真实凭据。
@@ -57,7 +95,7 @@
    docker compose up -d --remove-orphans --wait --wait-timeout 120
    ```
 
-部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok",...}` 即表示服务已启动。Compose 默认使用版本化镜像 `1.2.1`；以后升级时先将 `IMAGE_TAG` 改为目标版本，再重复“拉取 + 启动”命令。生产环境不要只依赖 `latest`。
+部署完成后访问 `http://localhost:5000/health`，返回 `{"status":"ok",...}` 即表示服务已启动。Compose 默认使用 `latest` 标签，便于手动快速启动；生产自动部署会通过 `IMAGE_TAG=<commit SHA>` 显式锁定精确版本。手动升级时先将 `.env` 中的 `IMAGE_TAG` 改为目标版本，再重复“拉取 + 启动”命令。
 
 Home Assistant Container 不使用 Add-on 内部主机名。`rest_command` 中的 `<temperature-monitor-host>` 按 HA 容器网络模式填写：
 
@@ -166,7 +204,7 @@ docker compose pull
 docker compose up -d --remove-orphans --wait --wait-timeout 120
 ```
 
-Compose 默认直接拉取已发布的 ACR `1.2.1` 镜像，无需在本地构建。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
+Compose 默认直接拉取已发布的 ACR `latest` 镜像，无需在本地构建；服务器自动部署时会显式使用 `IMAGE_TAG=<commit SHA>`。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
 
 如需回滚，在 `.env` 中设置上一稳定版本（例如 `IMAGE_TAG=1.0.3`），然后重新执行拉取和启动命令。`HISTORY_CLEANUP_ENABLED` 只从部署配置读取；第一阶段必须为 `false`，修改后需要重建容器才会生效。
 
