@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from typing import Any
@@ -18,8 +19,26 @@ temperature_bp = Blueprint("temperature", __name__)
 logger = logging.getLogger("temperature_monitor")
 
 
+def _temperature_auth_error() -> Any:
+    """Optional shared-key auth; stays disabled when TEMPERATURE_API_KEY is empty."""
+    if not config.TEMPERATURE_API_KEY:
+        return None
+
+    provided = (
+        request.headers.get("X-Temperature-Key", "")
+        or request.headers.get("X-History-Key", "")
+    )
+    if not provided or not hmac.compare_digest(provided, config.TEMPERATURE_API_KEY):
+        return jsonify({"status": "error", "error": "温度上报鉴权失败"}), 401
+    return None
+
+
 @temperature_bp.post("/temperature")
 def temperature():
+    auth_error = _temperature_auth_error()
+    if auth_error:
+        return auth_error
+
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"status": "error", "error": "请求体必须是 JSON 对象"}), 400

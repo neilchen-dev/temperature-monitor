@@ -45,6 +45,7 @@ def create_app() -> Flask:
     configure_logging()
     db.init_db()
     flask_app = Flask(__name__)
+    flask_app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
     flask_app.register_blueprint(temperature_bp)
     flask_app.register_blueprint(history_bp)
     flask_app.register_blueprint(analytics_bp)

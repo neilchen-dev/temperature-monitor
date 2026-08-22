@@ -102,6 +102,16 @@ jobs:
 
             cd "${DEPLOY_PATH}"
 
+            # 容器以 uid 1000 运行；确保挂载目录存在且可写。
+            mkdir -p data logs
+            if [ "$(stat -c %u data 2>/dev/null || echo 1000)" != "1000" ]; then
+              if sudo -n chown -R 1000:1000 data logs 2>/dev/null; then
+                echo "Fixed ownership of data/ and logs/"
+              else
+                echo "WARN: data/ 属主不是 1000 且无法自动修正；若容器写入失败请手动执行: sudo chown -R 1000:1000 data logs"
+              fi
+            fi
+
             if [ ! -f compose.yaml ]; then
               echo "ERROR: compose.yaml not found in ${DEPLOY_PATH}"
               exit 1

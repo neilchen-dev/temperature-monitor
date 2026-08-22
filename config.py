@@ -112,6 +112,13 @@ SQLITE_DB_PATH = Path(
     os.getenv("SQLITE_DB_PATH", str(DATA_DIR / "temperature_monitor.db"))
 )
 
+# 温度上报接口的可选共享密钥；设置后 /temperature 必须携带
+# X-Temperature-Key 头（或 X-History-Key），留空则保持无鉴权以兼容旧配置。
+TEMPERATURE_API_KEY = os.getenv("TEMPERATURE_API_KEY", "").strip()
+
+# 请求体大小上限，防止异常大的 payload 占用内存。
+MAX_CONTENT_LENGTH = _get_int("MAX_CONTENT_LENGTH", 16 * 1024)
+
 # 历史快照由 Home Assistant 每十分钟触发一次。删除默认硬关闭，只有重启后
 # 读取到 HISTORY_CLEANUP_ENABLED=true 才可能执行，HTTP 请求不能覆盖此配置。
 HISTORY_API_KEY = os.getenv("HISTORY_API_KEY", "").strip()
