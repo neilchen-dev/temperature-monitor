@@ -19,6 +19,8 @@ options:
   app_token: ""
   table_id: ""
   history_api_key: ""
+  temperature_api_key: ""
+  history_devices: ""
   history_interval_minutes: 10
   history_timezone: Asia/Shanghai
   history_cleanup_enabled: false
@@ -37,6 +39,8 @@ schema:
   app_token: password
   table_id: str
   history_api_key: password
+  temperature_api_key: password
+  history_devices: str
   history_interval_minutes: int(1,1440)
   history_timezone: str
   history_cleanup_enabled: bool

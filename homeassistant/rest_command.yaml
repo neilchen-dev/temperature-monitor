@@ -6,6 +6,8 @@ rest_command:
     method: POST
     headers:
       Content-Type: application/json
+      # 服务端设置 TEMPERATURE_API_KEY 后取消注释启用鉴权
+      # X-Temperature-Key: !secret temperature_monitor_temperature_api_key
     payload: >
       {
         "device": "{{ device }}",

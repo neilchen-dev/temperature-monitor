@@ -21,7 +21,8 @@ from services.feishu import (
 
 
 logger = logging.getLogger("temperature_monitor")
-EXPECTED_HISTORY_DEVICES = tuple(f"TH-{index:02d}" for index in range(1, 12))
+# 默认 TH-01～TH-11；可用 HISTORY_DEVICES 环境变量/Add-on 选项覆盖。
+EXPECTED_HISTORY_DEVICES = config.HISTORY_DEVICES
 SNAPSHOT_FIELDS = [
     "设备编号",
     "区域",
@@ -69,6 +70,8 @@ def validate_history_config() -> ZoneInfo:
         raise HistoryConfigurationError("HISTORY_CLEANUP_HOUR 必须在 0 到 23 之间")
 
     expected = set(EXPECTED_HISTORY_DEVICES)
+    if not expected:
+        raise HistoryConfigurationError("HISTORY_DEVICES 至少需要一个设备名")
     actual = set(config.HISTORY_TABLE_MAP)
     if actual != expected:
         missing = sorted(expected - actual)
@@ -79,7 +82,8 @@ def validate_history_config() -> ZoneInfo:
         if extra:
             details.append(f"未知设备: {', '.join(extra)}")
         raise HistoryConfigurationError(
-            "HISTORY_TABLE_MAP 必须完整包含 TH-01 至 TH-11；" + "；".join(details)
+            "HISTORY_TABLE_MAP 必须与 HISTORY_DEVICES 的设备列表完全一致；"
+            + "；".join(details)
         )
 
     table_ids = list(config.HISTORY_TABLE_MAP.values())

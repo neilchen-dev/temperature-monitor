@@ -79,7 +79,7 @@ CD 依赖以下 GitHub Repository Secrets（只存名称于仓库文档，实际
 
 部署者只需准备 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）和自己的飞书应用凭据。项目不包含任何真实凭据。
 
-1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID` 和随机生成的 `HISTORY_API_KEY`。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
+1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID` 和随机生成的 `HISTORY_API_KEY`。如需保护温度上报接口，同时设置 `TEMPERATURE_API_KEY`（见下方环境变量表）。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
 2. Windows 用户双击或在 PowerShell 中运行：
 
    ```powershell
@@ -206,6 +206,8 @@ docker compose up -d --remove-orphans --wait --wait-timeout 120
 
 Compose 默认直接拉取已发布的 ACR `latest` 镜像，无需在本地构建；服务器自动部署时会显式使用 `IMAGE_TAG=<commit SHA>`。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
 
+容器以非 root 用户（uid/gid 1000）运行：自动部署脚本会在启动前将宿主 `data/`、`logs/` 的属主修正为 1000；手动部署时若目录已存在且属主不是 1000，请先执行 `sudo chown -R 1000:1000 data logs`，否则容器内无法写入 SQLite 与日志。Compose 已为容器 stdout 配置 `json-file` 日志轮转（10MB × 3 个文件），应用自身文件日志另有独立的轮转配置。
+
 如需回滚，在 `.env` 中设置上一稳定版本（例如 `IMAGE_TAG=1.0.3`），然后重新执行拉取和启动命令。`HISTORY_CLEANUP_ENABLED` 只从部署配置读取；第一阶段必须为 `false`，修改后需要重建容器才会生效。
 
 ## 环境变量
@@ -217,6 +219,9 @@ Compose 默认直接拉取已发布的 ACR `latest` 镜像，无需在本地构�
 | `APP_TOKEN` | 是 | — | 飞书多维表格 App Token |
 | `TABLE_ID` | 是 | — | 飞书数据表 ID |
 | `HISTORY_API_KEY` | 使用历史采样时是 | — | `POST /history/sample` 的共享密钥，至少 32 字节 |
+| `HISTORY_DEVICES` | 否 | `TH-01,…,TH-11` | 参与历史采样的设备列表（逗号分隔）；覆盖时 `HISTORY_TABLE_MAP` 必须与之一致 |
+| `TEMPERATURE_API_KEY` | 否 | 空 | `POST /temperature` 的可选共享密钥；设置后请求必须携带 `X-Temperature-Key`（或 `X-History-Key`）头，留空则不鉴权以兼容旧配置。生产环境建议设置 |
+| `MAX_CONTENT_LENGTH` | 否 | `16384` | 请求体大小上限（字节），超限返回 413 |
 | `HISTORY_TABLE_MAP` | 使用历史采样时是 | 空 | JSON 格式的 TH-01～TH-11 到历史表 ID 的完整映射 |
 | `HISTORY_INTERVAL_MINUTES` | 否 | `10` | 历史采样去重时间桶分钟数；需与 HA 自动化一致 |
 | `HISTORY_TIMEZONE` | 否 | `Asia/Shanghai` | 历史采样与清理截止日使用的时区 |
@@ -275,7 +280,7 @@ curl -H "X-History-Key: $KEY" "http://127.0.0.1:5000/history/stats/devices"
 - **各设备平均温湿度**：窗口期内每设备平均温度（°C）与平均湿度（%RH）双轴对比；
 - **设备总览表**：最后快照值、在线状态、快照数、上报次数、最后快照/上报时间、估算离线时长。
 
-注意：`key` 通过 URL query string 传递，**会出现在浏览器历史、书签以及反向代理/网关的 access log 中**。请勿分享带 key 的链接，生产环境建议将 key 放在只有你访问的受控设备上打开，或为 dashboard 配置独立密钥。离线时长为估算值（离线样本数 × 采样间隔），漏采或停机会导致偏差。图表依赖 CDN 的 Chart.js，加载失败时图表区域显示占位提示，总览表不受影响。
+注意：`key` 通过 URL query string 传递，**会出现在浏览器历史、书签以及反向代理/网关的 access log 中**。请勿分享带 key 的链接，生产环境建议将 key 放在只有你访问的受控设备上打开，或为 dashboard 配置独立密钥；程序化访问也可改用 `Authorization: Bearer <HISTORY_API_KEY>` 请求头，避免密钥进 URL。离线时长为估算值（离线样本数 × 采样间隔），漏采或停机会导致偏差。图表脚本（Chart.js 4.4.3）由服务本地 `/static/` 提供，无需外网 CDN。
 
 ## Home Assistant 配置
 
@@ -290,6 +295,8 @@ rest_command:
     method: POST
     headers:
       Content-Type: application/json
+      # 服务端设置 TEMPERATURE_API_KEY 后取消注释启用鉴权
+      # X-Temperature-Key: !secret temperature_monitor_temperature_api_key
     payload: >
       {
         "device": "{{ device }}",

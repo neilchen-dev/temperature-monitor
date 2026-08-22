@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hmac
 from datetime import datetime
-from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Blueprint, jsonify, request

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+安全加固：
+
+- `POST /temperature` 支持可选共享密钥 `TEMPERATURE_API_KEY`：设置后请求必须携带 `X-Temperature-Key`（或复用 `X-History-Key`）头；留空保持无鉴权以兼容旧 HA 配置。Add-on 新增 `temperature_api_key` 选项。
+- 容器改为非 root 用户（uid/gid 1000）运行；自动部署脚本会修正宿主 `data/`、`logs/` 目录属主，手动部署需确保目录可被 uid 1000 写入。
+- 新增请求体大小上限 `MAX_CONTENT_LENGTH`（默认 16KB），超限返回 413。
+- Compose 为容器 stdout 配置 `json-file` 日志轮转（10MB × 3 个文件）。
+- Dashboard 鉴权额外支持 `Authorization: Bearer <HISTORY_API_KEY>` 请求头，便于程序化访问且避免密钥进入 URL。
+
+性能与可靠性：
+
+- 飞书 API 调用的串行化粒度从全局锁改为按资源（record/table）加锁：不同设备写不同记录、不同历史表之间可并行，慢请求的重试退避不再阻塞无关设备。
+- 自动识别的 record_id 缓存增加 1 小时 TTL，飞书表记录重建后无需重启服务即可恢复。
+- 未找到的设备名增加 5 分钟负缓存，避免未知设备反复触发全表分页扫描。
+
+可配置性：
+
+- 新增 `HISTORY_DEVICES` 环境变量 / Add-on 选项：历史采样设备列表默认 TH-01～TH-11，可用逗号分隔列表覆盖；`HISTORY_TABLE_MAP` 必须与之一致。
+- 环境变量整数/浮点解析失败时输出包含变量名和当前值的友好错误；空字符串回退默认值。
+
+其他：
+
+- Chart.js 4.4.3 改为由服务本地 `/static/` 目录提供，Dashboard 不再依赖外部 CDN。
+- CI（Tests workflow）新增 `ruff` 错误级 lint 检查；仓库根新增 `ruff.toml` 固定规则集。
+
 ## 1.2.1
 
 - 修复 SQLite 初始化遇到文件系统异常（如权限不足）时可能阻断服务启动的问题；现在任何初始化异常都只停用本地镜像。

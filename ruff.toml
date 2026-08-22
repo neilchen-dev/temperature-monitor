@@ -1,0 +1,4 @@
+# 只启用错误级（correctness）规则，保持与 CI 一致且零噪音；
+# 风格类规则（import 排序等）暂不启用，避免大面积无意义 diff。
+[lint]
+select = ["E4", "E7", "E9", "F"]

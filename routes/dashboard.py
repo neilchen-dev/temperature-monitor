@@ -21,7 +21,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>温湿度监控 · 本地分析看板</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="/static/chart.umd.min.js"></script>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -69,7 +69,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <script>
 function showChartFallback() {
   document.querySelectorAll('.chart-box').forEach(el => {
-    el.innerHTML = '<div class="empty">图表脚本加载失败（CDN 不可达），数据统计请使用 API 接口；下方设备总览表不受影响</div>';
+    el.innerHTML = '<div class="empty">图表脚本加载失败，数据统计请使用 API 接口；下方设备总览表不受影响</div>';
   });
 }
 const data = __DATA__;
@@ -125,9 +125,14 @@ def _auth_error():
     if not config.HISTORY_API_KEY:
         return "未配置 HISTORY_API_KEY，看板不可用", 503
 
-    # The dashboard is rendered server-side, so the key travels in the query
-    # string. Keep the URL private; API endpoints still require the header.
-    provided_key = request.args.get("key", "")
+    # The dashboard is rendered server-side, so browsers pass the key in the
+    # query string (keep the URL private). Authorization: Bearer is also
+    # accepted for programmatic access where headers are available.
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        provided_key = auth_header[len("Bearer "):].strip()
+    else:
+        provided_key = request.args.get("key", "")
     if not provided_key or not hmac.compare_digest(
         provided_key,
         config.HISTORY_API_KEY,

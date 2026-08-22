@@ -10,6 +10,7 @@ from services import feishu
 class RecordDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         feishu._record_id_cache.clear()
+        feishu._record_not_found_until.clear()
         config.APP_TOKEN = "app_token"
         config.TABLE_ID = "table_id"
         config.DEVICE_ID_FIELD = "设备编号"
@@ -37,6 +38,21 @@ class RecordDiscoveryTests(unittest.TestCase):
         ):
             self.assertEqual(feishu.resolve_record_id("dev-01"), "rec_discovered")
             self.assertEqual(feishu.resolve_record_id("DEV-01"), "rec_discovered")
+
+        self.assertEqual(request.call_count, 1)
+
+    def test_not_found_is_negative_cached_to_avoid_full_scans(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": 0, "data": {"items": [], "has_more": False}}
+
+        with (
+            patch.object(feishu, "get_token", return_value="token"),
+            patch.object(feishu, "request_with_retry", return_value=response) as request,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "未在飞书表中找到设备 DEV-99"):
+                feishu.resolve_record_id("DEV-99")
+            with self.assertRaisesRegex(RuntimeError, "负缓存生效中"):
+                feishu.resolve_record_id("DEV-99")
 
         self.assertEqual(request.call_count, 1)
 

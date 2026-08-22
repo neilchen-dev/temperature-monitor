@@ -13,10 +13,25 @@ from services.token import clear_token, get_token
 
 
 logger = logging.getLogger("temperature_monitor")
-_feishu_api_lock = threading.RLock()
-_record_id_cache: dict[str, str] = {}
+# 串行化粒度是“资源”（某张表或某条记录），而不是全局：不同设备写不同
+# record、不同历史表之间可以并行，慢请求的重试退避只阻塞同一资源。
+_resource_locks: dict[str, threading.RLock] = {}
+_resource_locks_guard = threading.Lock()
+_record_id_cache: dict[str, tuple[str, float]] = {}
+_record_not_found_until: dict[str, float] = {}
 _record_id_lock = threading.Lock()
+_RECORD_ID_CACHE_TTL_SECONDS = 3600
+_RECORD_NOT_FOUND_TTL_SECONDS = 300
 _TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
+
+
+def _resource_lock(key: str) -> threading.RLock:
+    with _resource_locks_guard:
+        lock = _resource_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _resource_locks[key] = lock
+        return lock
 
 
 def _validate_bitable_config() -> None:
@@ -57,13 +72,14 @@ def _request_bitable_json(
     *,
     operation: str,
     json_data: dict[str, Any] | None = None,
+    lock_key: str,
 ) -> dict[str, Any]:
-    """Call Bitable serially and retry token, rate-limit, and write conflicts."""
+    """Call Bitable serialized per resource; retry token, rate-limit, conflicts."""
     max_attempts = max(1, config.REQUEST_RETRY_TIMES)
     attempt = 1
     token_refreshed = False
 
-    with _feishu_api_lock:
+    with _resource_lock(lock_key):
         while attempt <= max_attempts:
             token = get_token()
             headers = {"Authorization": f"Bearer {token}"}
@@ -135,10 +151,18 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
         return configured_record_id
 
     normalized_device = device.strip().upper()
+    now = time.time()
     with _record_id_lock:
-        cached_record_id = _record_id_cache.get(normalized_device)
-    if cached_record_id:
-        return cached_record_id
+        cached = _record_id_cache.get(normalized_device)
+        if cached and now < cached[1]:
+            return cached[0]
+        not_found_until = _record_not_found_until.get(normalized_device)
+        if not_found_until and now < not_found_until:
+            raise RuntimeError(
+                f"未在飞书表中找到设备 {normalized_device}（负缓存生效中，最多 "
+                f"{_RECORD_NOT_FOUND_TTL_SECONDS} 秒后重查）；"
+                f"请检查字段 {config.DEVICE_ID_FIELD} 或 DEVICE_RECORD_MAP"
+            )
 
     _validate_bitable_config()
     base_url = _bitable_table_url(config.TABLE_ID, "/records")
@@ -154,6 +178,7 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
                 "GET",
                 f"{base_url}?{urlencode(query)}",
                 operation="查询记录",
+                lock_key=f"table:{config.TABLE_ID}",
             ),
             "查询记录",
         )
@@ -172,7 +197,11 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
             if len(matching_record_ids) == 1:
                 record_id = matching_record_ids[0]
                 with _record_id_lock:
-                    _record_id_cache[normalized_device] = record_id
+                    _record_id_cache[normalized_device] = (
+                        record_id,
+                        time.time() + _RECORD_ID_CACHE_TTL_SECONDS,
+                    )
+                    _record_not_found_until.pop(normalized_device, None)
                 logger.info(
                     "自动识别飞书 record_id 成功 | device=%s | field=%s",
                     normalized_device,
@@ -184,6 +213,11 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
                 raise RuntimeError(
                     f"飞书表中设备编号 {normalized_device} 重复；"
                     f"请保留唯一记录后重试。重复 record_id: {record_ids}"
+                )
+            # 未找到：短暂负缓存，避免未知设备名反复触发全表扫描。
+            with _record_id_lock:
+                _record_not_found_until[normalized_device] = (
+                    time.time() + _RECORD_NOT_FOUND_TTL_SECONDS
                 )
             raise RuntimeError(
                 f"未在飞书表中找到设备 {normalized_device}；"
@@ -201,6 +235,7 @@ def update_feishu_fields(record_id: str, fields: dict[str, Any]) -> dict[str, An
         _bitable_table_url(config.TABLE_ID, f"/records/{record_id}"),
         operation="更新记录",
         json_data={"fields": fields},
+        lock_key=f"record:{record_id}",
     )
 
 
@@ -221,6 +256,7 @@ def list_realtime_snapshots(field_names: list[str]) -> list[dict[str, Any]]:
                 f"{base_url}?{urlencode(query)}",
                 operation="读取实时快照",
                 json_data={"field_names": field_names},
+                lock_key=f"table:{config.TABLE_ID}:search",
             ),
             "读取实时快照",
         )
@@ -246,6 +282,7 @@ def get_latest_history_timestamp(table_id: str) -> Any | None:
                 "field_names": ["采集时间"],
                 "sort": [{"field_name": "采集时间", "desc": True}],
             },
+            lock_key=f"table:{table_id}",
         ),
         "查询最新历史记录",
     )
@@ -264,6 +301,7 @@ def create_history_record(table_id: str, fields: dict[str, Any]) -> dict[str, An
         f"{_bitable_table_url(table_id, '/records')}?{query}",
         operation="新增历史记录",
         json_data={"fields": fields},
+        lock_key=f"table:{table_id}",
     )
 
 
@@ -302,6 +340,7 @@ def find_expired_history_record_ids(
                 f"{base_url}?{urlencode(query)}",
                 operation="筛选过期历史记录",
                 json_data=body,
+                lock_key=f"table:{table_id}",
             ),
             "筛选过期历史记录",
         )
@@ -329,4 +368,5 @@ def delete_history_records(table_id: str, record_ids: list[str]) -> dict[str, An
         _bitable_table_url(table_id, "/records/batch_delete"),
         operation="删除过期历史记录",
         json_data={"records": record_ids},
+        lock_key=f"table:{table_id}",
     )

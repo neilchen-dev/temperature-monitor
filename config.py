@@ -28,6 +28,8 @@ def _load_hassio_options() -> None:
         "app_token": "APP_TOKEN",
         "table_id": "TABLE_ID",
         "history_api_key": "HISTORY_API_KEY",
+        "temperature_api_key": "TEMPERATURE_API_KEY",
+        "history_devices": "HISTORY_DEVICES",
         "history_interval_minutes": "HISTORY_INTERVAL_MINUTES",
         "history_timezone": "HISTORY_TIMEZONE",
         "history_cleanup_enabled": "HISTORY_CLEANUP_ENABLED",
@@ -67,11 +69,23 @@ def _get_bool(name: str, default: bool) -> bool:
 
 
 def _get_int(name: str, default: int) -> int:
-    return int(os.getenv(name, str(default)))
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise ValueError(f"环境变量 {name} 必须是整数，当前值: {raw!r}") from None
 
 
 def _get_float(name: str, default: float) -> float:
-    return float(os.getenv(name, str(default)))
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        raise ValueError(f"环境变量 {name} 必须是数字，当前值: {raw!r}") from None
 
 
 # 飞书凭据只从运行环境读取，默认空值方便本地启动和健康检查。
@@ -180,6 +194,21 @@ def _get_device_name_map() -> dict[str, str]:
     return normalized_mapping
 
 
+def _get_history_devices() -> tuple[str, ...]:
+    """参与历史采样的设备列表；默认 TH-01～TH-11，可用逗号分隔列表覆盖。"""
+    raw_value = os.getenv("HISTORY_DEVICES", "").strip()
+    if not raw_value:
+        return tuple(f"TH-{index:02d}" for index in range(1, 12))
+
+    devices = [part.strip().upper() for part in raw_value.split(",")]
+    devices = [device for device in devices if device]
+    if not devices:
+        raise ValueError("HISTORY_DEVICES 至少需要一个设备名")
+    if len(set(devices)) != len(devices):
+        raise ValueError("HISTORY_DEVICES 中的设备名不能重复")
+    return tuple(devices)
+
+
 def _get_history_table_map() -> dict[str, str]:
     raw_value = os.getenv("HISTORY_TABLE_MAP", "").strip()
     if not raw_value:
@@ -205,6 +234,7 @@ def _get_history_table_map() -> dict[str, str]:
 
 DEVICES = _get_devices()
 DEVICE_NAME_MAP = _get_device_name_map()
+HISTORY_DEVICES = _get_history_devices()
 HISTORY_TABLE_MAP = _get_history_table_map()
 
 

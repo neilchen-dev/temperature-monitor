@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 import os
 import tempfile
 import unittest
@@ -49,6 +48,37 @@ class DeviceConfigurationTests(unittest.TestCase):
             reloaded_config.HISTORY_TABLE_MAP,
             {"TH-01": "tbl_history_01"},
         )
+
+    def test_history_devices_defaults_to_th01_th11(self) -> None:
+        with patch.dict(os.environ, {"HISTORY_DEVICES": ""}, clear=False):
+            reloaded_config = importlib.reload(config)
+
+        self.assertEqual(
+            reloaded_config.HISTORY_DEVICES,
+            tuple(f"TH-{index:02d}" for index in range(1, 12)),
+        )
+
+    def test_history_devices_overrides_and_normalizes(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HISTORY_DEVICES": " dev-01 , TH-02 "},
+            clear=False,
+        ):
+            reloaded_config = importlib.reload(config)
+
+        self.assertEqual(reloaded_config.HISTORY_DEVICES, ("DEV-01", "TH-02"))
+
+    def test_invalid_int_env_raises_friendly_error(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"WAITRESS_THREADS": "four"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"WAITRESS_THREADS 必须是整数",
+            ):
+                importlib.reload(config)
 
     def test_addon_environment_defaults_data_dir_to_persistent_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
