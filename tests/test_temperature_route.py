@@ -20,6 +20,7 @@ class TemperatureRouteTests(unittest.TestCase):
             patch("routes.temperature.resolve_record_id", return_value="rec_01") as resolve,
             patch("routes.temperature.update_feishu_fields", return_value={"code": 0}),
             patch("routes.temperature.save_history"),
+            patch("routes.temperature.devices.record_sample") as record,
         ):
             response = self.client.post(
                 "/temperature",
@@ -33,6 +34,11 @@ class TemperatureRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         resolve.assert_called_once_with("DEV-01", None)
+        # 统一设备模型使用映射后的设备编号（与飞书/历史采样同一身份），
+        # 而不是 HA 上报的原始名称
+        record.assert_called_once()
+        self.assertEqual(record.call_args.kwargs["device"], "DEV-01")
+        self.assertEqual(record.call_args.kwargs["source"], "home_assistant")
 
     def test_rejects_wrong_key_when_temperature_key_configured(self) -> None:
         config.TEMPERATURE_API_KEY = "unit-test-secret-key-0123456789"
@@ -59,6 +65,7 @@ class TemperatureRouteTests(unittest.TestCase):
                 patch("routes.temperature.resolve_record_id", return_value="rec_01"),
                 patch("routes.temperature.update_feishu_fields", return_value={"code": 0}),
                 patch("routes.temperature.save_history"),
+                patch("routes.temperature.devices.record_sample"),
             ):
                 response = self.client.post(
                     "/temperature",

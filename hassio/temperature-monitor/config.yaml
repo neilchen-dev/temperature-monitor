@@ -12,6 +12,9 @@ ports:
 ports_description:
   5000/tcp: Temperature Monitor API
 watchdog: http://[HOST]:[PORT:5000]/health
+# Modbus RTU（USB-RS485）串口访问：uart: true 会自动映射宿主机的
+# 全部 UART/串口设备，无需再逐个声明 devices。
+uart: true
 image: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor
 options:
   app_id: ""
@@ -33,6 +36,21 @@ options:
   source_temperature_unit: C
   sqlite_enabled: true
   waitress_threads: 4
+  modbus_enabled: false
+  modbus_transport: tcp
+  modbus_host: 127.0.0.1
+  modbus_port: 5020
+  modbus_serial_port: ""
+  modbus_baudrate: 9600
+  modbus_parity: N
+  modbus_stopbits: 1
+  modbus_bytesize: 8
+  modbus_unit_id: 1
+  modbus_device_id: PLC-01
+  modbus_poll_interval_seconds: 5
+  modbus_timeout_seconds: 5
+  modbus_register_map: ""
+  event_temperature_high_c: ""
 schema:
   app_id: str
   app_secret: password
@@ -53,3 +71,18 @@ schema:
   source_temperature_unit: list(C|F)
   sqlite_enabled: bool
   waitress_threads: int(1,32)
+  modbus_enabled: bool
+  modbus_transport: list(tcp|rtu)
+  modbus_host: str
+  modbus_port: int(1,65535)
+  modbus_serial_port: str
+  modbus_baudrate: int(1200,115200)
+  modbus_parity: list(N|E|O)
+  modbus_stopbits: int(1,2)
+  modbus_bytesize: int(7,8)
+  modbus_unit_id: int(1,247)
+  modbus_device_id: str
+  modbus_poll_interval_seconds: int(1,3600)
+  modbus_timeout_seconds: int(1,60)
+  modbus_register_map: str
+  event_temperature_high_c: str

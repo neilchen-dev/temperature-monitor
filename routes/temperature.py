@@ -9,7 +9,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 import config
-from services import db
+from services import db, devices
 from services.feishu import resolve_record_id, update_feishu_fields
 from services.storage import save_history
 from services.validator import is_offline_status, normalize_humidity, normalize_temperature
@@ -91,6 +91,18 @@ def temperature():
         final_status,
         feishu_code,
         feishu_message,
+    )
+
+    # 统一设备模型：与 Modbus 采集共用同一份 device_samples 存储；
+    # 使用映射后的设备编号（与飞书/历史采样同一身份），避免同一物理设备
+    # 因 HA 上报名称不同被拆成两个身份。record_sample 内部吞掉所有异常，
+    # 绝不影响原有上报链路。
+    devices.record_sample(
+        device=bitable_device,
+        source=devices.SOURCE_HOME_ASSISTANT,
+        temperature=temperature_c if isinstance(temperature_c, (int, float)) else None,
+        humidity=humidity if isinstance(humidity, (int, float)) else None,
+        status=final_status,
     )
 
     if not success:

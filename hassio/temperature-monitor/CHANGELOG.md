@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+IIoT 数据采集（Modbus TCP / RTU）：
+
+- 新增可选 Modbus 采集：`MODBUS_ENABLED` 默认关闭；支持 TCP 与 RTU（USB-RS485，`MODBUS_TRANSPORT=rtu` + `MODBUS_SERIAL_PORT`）两种传输，输出到与 HA 上报共用的统一设备模型。Add-on 声明 `uart: true` 自动映射宿主串口，镜像内用户已加入 dialout 组。
+- 统一设备模型与事件：新增 `device_samples`（跨源统一样本）与 `device_events`（状态转移事件，仅在变化瞬间记录）表；状态机身份为 (设备, 数据源)。`/api/devices`、`/api/devices/<id>?source=`、`/api/events`、`/api/system/status` 四个新接口，鉴权与既有查询接口一致（未配置 `HISTORY_API_KEY` 返回 503）；SQLite 不可用时显式 503。
+- 寄存器映射 `MODBUS_REGISTER_MAP`：字段级 FC03/FC04 类型、`device_status` 可选（省略时读取成功即在线）、稀疏地址分段读取；`address` 为零基 PDU 地址（40001/30001 均填 0）。
+- 工业现场健壮性：短响应/异常响应安全失败不退出采集线程；通信故障主动关闭传输并自动重连（串口路径不变时含 USB 重插）；`/api/system/status` 只暴露稳定错误类别，不含串口路径/IP。
+- 新增工具：`tools/modbus_simulator.py`（本地模拟 PLC）与 `tools/modbus_probe.py`（单次读取探针；unit-id 扫描仅显式 `--scan` 启用）。
+- 新增可选温度阈值事件 `EVENT_TEMPERATURE_HIGH_C`；新增 `MODBUS_TIMEOUT_SECONDS`。
+- 依赖：新增 `pymodbus>=3.15,<3.16` 与 `pyserial>=3.5,<4`。
+
 安全加固：
 
 - `POST /temperature` 支持可选共享密钥 `TEMPERATURE_API_KEY`：设置后请求必须携带 `X-Temperature-Key`（或复用 `X-History-Key`）头；留空保持无鉴权以兼容旧 HA 配置。Add-on 新增 `temperature_api_key` 选项。

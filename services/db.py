@@ -14,6 +14,13 @@ Design notes / semantics:
   the local timezone offset for display. NULL temperature/humidity means
   either offline (``online_status = '离线'``) or a non-numeric source value
   (online but unparseable) — distinguish via ``online_status``.
+- ``device_samples`` is the cross-source unified sample store (HA reports,
+  Modbus polls, future OPC UA). Unlike ``history_snapshots`` (mirror of Feishu
+  business records) or ``temperature_reports`` (raw HA webhook audit trail),
+  it holds one normalized schema for every data source.
+- ``device_events`` stores state *transitions* only (online/offline,
+  temperature threshold crossing); repeated polls in a steady state never
+  insert rows.
 - Concurrency assumes a single process / single instance (Waitress threads
   guarded by one lock). Multi-process or multi-container deployment would
   need WAL-friendly coordination beyond the current scope.
@@ -63,6 +70,36 @@ CREATE TABLE IF NOT EXISTS history_snapshots (
     created_at TEXT NOT NULL,
     PRIMARY KEY (device, sample_time_ms)
 );
+
+CREATE TABLE IF NOT EXISTS device_samples (
+    device TEXT NOT NULL,
+    source TEXT NOT NULL,
+    sample_time_ms INTEGER NOT NULL,
+    sample_time_iso TEXT NOT NULL,
+    temperature REAL,
+    humidity REAL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (device, source, sample_time_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_device_samples_device_time
+    ON device_samples(device, sample_time_ms);
+
+CREATE TABLE IF NOT EXISTS device_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    source TEXT,
+    event_type TEXT NOT NULL,
+    old_state TEXT,
+    new_state TEXT,
+    value REAL,
+    message TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_events_device_id_created
+    ON device_events(device_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_device_events_created_at
+    ON device_events(created_at);
 """
 
 _lock = threading.RLock()
@@ -439,3 +476,249 @@ def fetch_device_stats() -> list[dict[str, Any]]:
             })
     results.sort(key=lambda item: item["device"])
     return results
+
+
+def save_device_sample(
+    device: str,
+    source: str,
+    sample_time_ms: int,
+    sample_time_iso: str,
+    temperature: Any,
+    humidity: Any,
+    status: str,
+) -> None:
+    """Insert one unified sample; (device, source, ts) makes retries idempotent."""
+    connection = _get_connection()
+    if connection is None:
+        return
+
+    try:
+        with _lock:
+            connection.execute(
+                "INSERT OR REPLACE INTO device_samples ("
+                " device, source, sample_time_ms, sample_time_iso,"
+                " temperature, humidity, status, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device,
+                    source,
+                    int(sample_time_ms),
+                    sample_time_iso,
+                    temperature if isinstance(temperature, (int, float)) else None,
+                    humidity if isinstance(humidity, (int, float)) else None,
+                    status,
+                    _now_text(),
+                ),
+            )
+            connection.commit()
+    except sqlite3.Error:
+        global _write_failures
+        _write_failures += 1
+        logger.exception("SQLite 写入统一设备样本失败 | device=%s", device)
+
+
+def fetch_previous_device_sample(
+    device: str, source: str | None = None
+) -> dict[str, Any] | None:
+    """Latest stored sample for a device, optionally within one source.
+
+    State-machine identity is (device, source): a HA report and a Modbus
+    poll for the same device_id must never derive events from each other.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return None
+
+    query = (
+        "SELECT device, source, sample_time_ms, temperature, humidity, status"
+        " FROM device_samples WHERE device = ?"
+    )
+    params: list[Any] = [device]
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    query += " ORDER BY sample_time_ms DESC LIMIT 1"
+
+    try:
+        with _lock:
+            row = connection.execute(query, params).fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备上一条样本失败 | device=%s", device)
+        return None
+
+
+def fetch_latest_device_states() -> list[dict[str, Any]]:
+    """Latest unified sample per (device, source) — no cross-source fusion.
+
+    ROW_NUMBER keeps the query portable; a device reporting through two
+    sources intentionally shows two rows, each carrying its own source.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return []
+
+    query = """
+        WITH ranked AS (
+            SELECT
+                device,
+                source,
+                sample_time_ms,
+                sample_time_iso,
+                temperature,
+                humidity,
+                status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY device, source
+                    ORDER BY sample_time_ms DESC
+                ) AS rn,
+                COUNT(*) OVER (PARTITION BY device, source) AS sample_count
+            FROM device_samples
+        )
+        SELECT
+            device, source, sample_time_ms, sample_time_iso,
+            temperature, humidity, status, sample_count
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY device, source
+    """
+    try:
+        with _lock:
+            rows = connection.execute(query).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备最新状态失败")
+        return []
+
+
+def fetch_device_samples(
+    device: str, source: str | None = None, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Most recent unified samples for one device (optionally one source)."""
+    connection = _get_connection()
+    if connection is None:
+        return []
+
+    query = (
+        "SELECT device, source, sample_time_ms, sample_time_iso,"
+        " temperature, humidity, status"
+        " FROM device_samples WHERE device = ?"
+    )
+    params: list[Any] = [device]
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    query += " ORDER BY sample_time_ms DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 1000)))
+
+    try:
+        with _lock:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备样本列表失败 | device=%s", device)
+        return []
+
+
+def save_device_event(
+    device_id: str,
+    event_type: str,
+    old_state: Any,
+    new_state: Any,
+    value: Any,
+    message: str,
+    source: str | None = None,
+) -> None:
+    """Append one device state-transition event."""
+    connection = _get_connection()
+    if connection is None:
+        return
+
+    try:
+        with _lock:
+            connection.execute(
+                "INSERT INTO device_events ("
+                " device_id, source, event_type, old_state, new_state, value,"
+                " message, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device_id,
+                    source,
+                    event_type,
+                    old_state,
+                    new_state,
+                    value if isinstance(value, (int, float)) else None,
+                    message,
+                    _now_text(),
+                ),
+            )
+            connection.commit()
+    except sqlite3.Error:
+        global _write_failures
+        _write_failures += 1
+        logger.exception("SQLite 写入设备事件失败 | device_id=%s", device_id)
+
+
+def fetch_device_events(
+    device_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Recent device events, newest first; optionally filtered by device."""
+    connection = _get_connection()
+    if connection is None:
+        return []
+
+    query = (
+        "SELECT id, device_id, source, event_type, old_state, new_state, value,"
+        " message, created_at FROM device_events"
+    )
+    params: list[Any] = []
+    if device_id:
+        query += " WHERE device_id = ?"
+        params.append(device_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 1000)))
+
+    try:
+        with _lock:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备事件失败 | device_id=%s", device_id)
+        return []
+
+
+def fetch_device_summary() -> dict[str, Any]:
+    """Aggregates for /api/system/status.
+
+    Two distinct counts with distinct meanings:
+    - ``device_count``: distinct device ids (physical-ish device count)
+    - ``identity_count``: distinct (device, source) pairs — matches the row
+      count of GET /api/devices
+    """
+    connection = _get_connection()
+    if connection is None:
+        return {
+            "device_count": 0, "identity_count": 0, "last_sample_time_ms": None,
+        }
+
+    try:
+        with _lock:
+            row = connection.execute(
+                "SELECT"
+                " (SELECT COUNT(DISTINCT device) FROM device_samples)"
+                "   AS device_count,"
+                " (SELECT COUNT(*) FROM"
+                "   (SELECT DISTINCT device, source FROM device_samples))"
+                "   AS identity_count,"
+                " (SELECT MAX(sample_time_ms) FROM device_samples)"
+                "   AS last_sample_time_ms"
+            ).fetchone()
+        return (
+            dict(row) if row
+            else {"device_count": 0, "identity_count": 0,
+                  "last_sample_time_ms": None}
+        )
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备汇总失败")
+        return {"device_count": 0, "identity_count": 0, "last_sample_time_ms": None}

@@ -8,10 +8,11 @@ from waitress import serve
 
 import config
 from routes.analytics import analytics_bp
+from routes.api import api_bp
 from routes.dashboard import dashboard_bp
 from routes.history import history_bp
 from routes.temperature import temperature_bp
-from services import db
+from services import collector, db
 
 
 def configure_logging() -> logging.Logger:
@@ -50,6 +51,7 @@ def create_app() -> Flask:
     flask_app.register_blueprint(history_bp)
     flask_app.register_blueprint(analytics_bp)
     flask_app.register_blueprint(dashboard_bp)
+    flask_app.register_blueprint(api_bp)
     return flask_app
 
 
@@ -58,20 +60,28 @@ app = create_app()
 
 def run_server() -> None:
     logger = logging.getLogger("temperature_monitor")
+    # 后台采集线程只在生产入口启动一次；create_app 保持无副作用，
+    # 测试与多次调用不会重复启动。多 worker 部署见 .env.example 注释。
+    collector.start_collectors()
     logger.info(
         "温湿度监控服务启动 | 设备数量=%s | HA温度源单位=%s | "
-        "历史表数量=%s | 历史清理启用=%s | 离线状态由HA明确提供",
+        "历史表数量=%s | 历史清理启用=%s | Modbus启用=%s | 离线状态由HA明确提供",
         len(config.DEVICES),
         config.SOURCE_TEMPERATURE_UNIT,
         len(config.HISTORY_TABLE_MAP),
         config.HISTORY_CLEANUP_ENABLED,
+        config.MODBUS_ENABLED,
     )
-    serve(
-        app,
-        host=config.HOST,
-        port=config.PORT,
-        threads=config.WAITRESS_THREADS,
-    )
+    try:
+        serve(
+            app,
+            host=config.HOST,
+            port=config.PORT,
+            threads=config.WAITRESS_THREADS,
+        )
+    finally:
+        # Waitress 正常退出/被中断时停掉采集线程，保证应用级优雅关闭。
+        collector.stop_collectors()
 
 
 if __name__ == "__main__":

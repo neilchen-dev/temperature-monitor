@@ -39,6 +39,20 @@ def _load_hassio_options() -> None:
         "sqlite_enabled": "SQLITE_ENABLED",
         "waitress_threads": "WAITRESS_THREADS",
         "device_id_field": "DEVICE_ID_FIELD",
+        "modbus_enabled": "MODBUS_ENABLED",
+        "modbus_transport": "MODBUS_TRANSPORT",
+        "modbus_host": "MODBUS_HOST",
+        "modbus_port": "MODBUS_PORT",
+        "modbus_serial_port": "MODBUS_SERIAL_PORT",
+        "modbus_baudrate": "MODBUS_BAUDRATE",
+        "modbus_parity": "MODBUS_PARITY",
+        "modbus_stopbits": "MODBUS_STOPBITS",
+        "modbus_bytesize": "MODBUS_BYTESIZE",
+        "modbus_unit_id": "MODBUS_UNIT_ID",
+        "modbus_device_id": "MODBUS_DEVICE_ID",
+        "modbus_poll_interval_seconds": "MODBUS_POLL_INTERVAL_SECONDS",
+        "modbus_timeout_seconds": "MODBUS_TIMEOUT_SECONDS",
+        "event_temperature_high_c": "EVENT_TEMPERATURE_HIGH_C",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -56,6 +70,10 @@ def _load_hassio_options() -> None:
     history_table_map = options.get("history_table_map")
     if history_table_map not in (None, ""):
         os.environ.setdefault("HISTORY_TABLE_MAP", str(history_table_map))
+
+    modbus_register_map = options.get("modbus_register_map")
+    if modbus_register_map not in (None, ""):
+        os.environ.setdefault("MODBUS_REGISTER_MAP", str(modbus_register_map))
 
 
 _load_hassio_options()
@@ -236,6 +254,47 @@ DEVICES = _get_devices()
 DEVICE_NAME_MAP = _get_device_name_map()
 HISTORY_DEVICES = _get_history_devices()
 HISTORY_TABLE_MAP = _get_history_table_map()
+
+
+def _get_optional_float(name: str) -> float | None:
+    """可选数字配置：未设置或留空表示关闭对应功能。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        raise ValueError(f"环境变量 {name} 必须是数字，当前值: {raw!r}") from None
+
+
+# ---- 工业数据采集（P0：Modbus TCP）----
+# 默认关闭；未开启时系统行为与引入本模块之前完全一致。
+# 采集线程只在单进程入口（app.run_server）启动一次；若未来迁移到多 worker
+# 部署（如 gunicorn），只允许一个 worker 开启 MODBUS_ENABLED，否则会重复轮询。
+MODBUS_ENABLED = _get_bool("MODBUS_ENABLED", False)
+# 传输层：tcp（默认，向后兼容）| rtu（USB-RS485 / 串口变送器）。
+MODBUS_TRANSPORT = os.getenv("MODBUS_TRANSPORT", "tcp").strip().lower() or "tcp"
+MODBUS_HOST = os.getenv("MODBUS_HOST", "127.0.0.1").strip() or "127.0.0.1"
+MODBUS_PORT = _get_int("MODBUS_PORT", 5020)
+# RTU 专用：Windows 填 COM3，Linux 填 /dev/ttyUSB0；transport=rtu 时必填。
+MODBUS_SERIAL_PORT = os.getenv("MODBUS_SERIAL_PORT", "").strip()
+MODBUS_BAUDRATE = _get_int("MODBUS_BAUDRATE", 9600)
+MODBUS_PARITY = os.getenv("MODBUS_PARITY", "N").strip().upper() or "N"
+MODBUS_STOPBITS = _get_int("MODBUS_STOPBITS", 1)
+MODBUS_BYTESIZE = _get_int("MODBUS_BYTESIZE", 8)
+MODBUS_UNIT_ID = _get_int("MODBUS_UNIT_ID", 1)
+MODBUS_DEVICE_ID = os.getenv("MODBUS_DEVICE_ID", "PLC-01").strip().upper() or "PLC-01"
+MODBUS_POLL_INTERVAL_SECONDS = max(1.0, _get_float("MODBUS_POLL_INTERVAL_SECONDS", 5.0))
+MODBUS_TIMEOUT_SECONDS = max(1.0, _get_float("MODBUS_TIMEOUT_SECONDS", 5.0))
+
+# 可选 JSON 覆盖默认寄存器映射；留空使用内置布局（温度=保持寄存器0，int16×0.1；
+# 湿度=寄存器1，uint16×0.1；设备状态=寄存器2，等于 online_value 视为在线）。
+# 惰性解析：非法 JSON 只记录错误并禁用 Modbus 采集，不影响服务启动。
+MODBUS_REGISTER_MAP = os.getenv("MODBUS_REGISTER_MAP", "").strip()
+
+# 设备事件：温度超过该摄氏度阈值时产生 NORMAL -> TEMPERATURE_HIGH 事件，
+# 回落后产生恢复事件。留空表示关闭温度阈值事件（在线/离线事件不受影响）。
+EVENT_TEMPERATURE_HIGH_C = _get_optional_float("EVENT_TEMPERATURE_HIGH_C")
 
 
 def ensure_runtime_directories() -> None:

@@ -165,7 +165,8 @@ flowchart TD
 homeassistant/       Home Assistant REST 命令与自动化示例
 hassio/              Home Assistant Add-on 清单与说明
 routes/              HTTP 路由与响应处理
-services/            校验、飞书通信、令牌、重试与本地存储
+services/            校验、飞书通信、令牌、重试、本地存储与工业采集
+tools/               开发/演示用模拟器（Modbus 模拟 PLC 等，不进生产主进程）
 docs/images/         README 预览截图
 app.py               Flask 应用、日志和 Waitress 启动入口
 config.py            环境变量、设备映射与运行目录配置
@@ -242,6 +243,17 @@ Compose 默认直接拉取已发布的 ACR `latest` 镜像，无需在本地构�
 | `LOG_DIR` | 否 | `/app/logs` | 日志目录 |
 | `SQLITE_ENABLED` | 否 | `true` | 是否启用 SQLite 本地镜像（温度上报与历史快照的本地副本，不影响飞书主链路） |
 | `SQLITE_DB_PATH` | 否 | `${DATA_DIR}/temperature_monitor.db` | SQLite 数据库文件路径 |
+| `MODBUS_ENABLED` | 否 | `false` | 是否启用 Modbus 采集；关闭时系统行为与引入该功能前完全一致 |
+| `MODBUS_TRANSPORT` | 否 | `tcp` | 传输层：`tcp` 或 `rtu`（USB-RS485 / 串口）；两种传输输出同一套统一设备模型 |
+| `MODBUS_HOST` / `MODBUS_PORT` | 否 | `127.0.0.1` / `5020` | TCP 专用目标地址（无硬编码，生产接真实 PLC 时修改此处） |
+| `MODBUS_SERIAL_PORT` | `rtu` 时必填 | 空 | RTU 串口路径：Windows `COM3`，Linux `/dev/ttyUSB0`；断线重连仅在路径不变时自动恢复 |
+| `MODBUS_BAUDRATE` / `MODBUS_PARITY` / `MODBUS_STOPBITS` / `MODBUS_BYTESIZE` | 否 | `9600` / `N` / `1` / `8` | RTU 串口参数 |
+| `MODBUS_UNIT_ID` | 否 | `1` | Modbus 单元/从站 ID |
+| `MODBUS_DEVICE_ID` | 否 | `PLC-01` | 该设备在统一设备模型中的设备编号 |
+| `MODBUS_POLL_INTERVAL_SECONDS` | 否 | `5` | 轮询周期（秒，最小 1） |
+| `MODBUS_TIMEOUT_SECONDS` | 否 | `5` | 单次读请求超时（秒，最小 1，两种传输共用） |
+| `MODBUS_REGISTER_MAP` | 否 | 内置布局 | JSON 覆盖寄存器映射：温度/湿度必填，`device_status` 可选（省略时读取成功即在线）；每字段可配 `type: holding(FC03,默认)/input(FC04)`；非法时记录错误并禁用采集，不影响服务启动 |
+| `EVENT_TEMPERATURE_HIGH_C` | 否 | 空（关闭） | 温度超过该摄氏度阈值时记录 `NORMAL -> TEMPERATURE_HIGH` 设备事件，回落后记录恢复事件 |
 
 ## SQLite 本地镜像与查询 API
 
@@ -281,6 +293,41 @@ curl -H "X-History-Key: $KEY" "http://127.0.0.1:5000/history/stats/devices"
 - **设备总览表**：最后快照值、在线状态、快照数、上报次数、最后快照/上报时间、估算离线时长。
 
 注意：`key` 通过 URL query string 传递，**会出现在浏览器历史、书签以及反向代理/网关的 access log 中**。请勿分享带 key 的链接，生产环境建议将 key 放在只有你访问的受控设备上打开，或为 dashboard 配置独立密钥；程序化访问也可改用 `Authorization: Bearer <HISTORY_API_KEY>` 请求头，避免密钥进 URL。离线时长为估算值（离线样本数 × 采样间隔），漏采或停机会导致偏差。图表脚本（Chart.js 4.4.3）由服务本地 `/static/` 提供，无需外网 CDN。
+
+## IIoT 数据采集（实验性）：Modbus TCP 与统一设备模型
+
+在原有 HA 上报链路之外，服务可将 **Modbus** 数据源（PLC、温湿度网关、RS485 变送器等）接入统一的设备模型，与 HA 设备共用同一份存储与查询接口。支持两种传输，输出完全一致：
+
+```text
+PLC / Modbus TCP Server ──┐      RS485 温湿度变送器 ──USB-RS485──┐
+        ↓ 轮询（后台线程）  │              ↓ 轮询（同一套代码）    │
+        └────────────────┴── Modbus 采集器 (pymodbus, TCP/RTU) ──┘
+                                     ↓
+                     统一设备样本 device_samples（SQLite）
+                                     ↓
+        GET /api/devices · /api/events · /api/system/status
+```
+
+- **默认关闭**：`MODBUS_ENABLED=false` 时不创建采集线程，系统行为与引入本功能前完全一致。
+- **TCP 与 RTU 同构**：`MODBUS_TRANSPORT=tcp|rtu` 切换传输；RTU 走 USB-RS485 串口（`MODBUS_SERIAL_PORT`），断线自动重连仅在串口路径不变时有效，COM 号/ttyUSB 编号变化需更新配置重启。
+- **无硬件演示**：`python tools/modbus_simulator.py --port 5020` 启动本地模拟 PLC（温度 18~33°C 正弦漂移、湿度 40~70%、状态字可切换），随后在 `.env` 中设置 `MODBUS_ENABLED=true` 并重启服务即可。
+- **新设备探针**：`python tools/modbus_probe.py --tcp HOST:PORT` 或 `--rtu COM3` 单次读取并打印统一样本；`--scan`（显式启用）逐个试探 unit id 1~16，帮助配置新买的 RS485 变送器。
+- **寄存器映射**：`MODBUS_REGISTER_MAP` 支持每字段 `type: holding(FC03,默认)/input(FC04)`；`device_status` 可省略（无状态字的简易变送器读取成功即在线）。**address 是零基 PDU 地址**：手册中的 `40001`/`30001` 都对应 `address: 0`。稀疏地址自动分段读取（不会把 0 和 100 展开成 0..100 的连续请求）。同类型最多拆 16 个连续区间。
+- **设备事件日志**：状态变化（`ONLINE -> OFFLINE` 等）只在变化瞬间写入 `device_events` 表，稳态轮询不产生重复记录；配置 `EVENT_TEMPERATURE_HIGH_C` 后可记录 `NORMAL -> TEMPERATURE_HIGH` 阈值事件。状态机身份是 `(设备, 数据源)`——HA 与 Modbus 共用同一设备编号时互不干扰状态判定。
+- **故障隔离**：设备不在线、超时、非法寄存器值、短响应、串口拔出只记日志与稳定错误类别（`/api/system/status` 不含串口路径/IP），采集线程与 Flask 主服务互不影响；通信失败会主动关闭传输连接，串口路径不变时 USB 重插可自动恢复。
+- **鉴权**：`/api/devices`、`/api/events` 与既有查询接口一致——未配置 `HISTORY_API_KEY` 返回 503，配置后需携带 `X-History-Key`（或 `Authorization: Bearer`）头。`/api/system/status` 与 `/health` 一样无鉴权，但只返回健康摘要。
+- **容器/Add-on RTU**：Compose 需取消注释 `devices: [/dev/ttyUSB0:...]` 映射并按宿主 dialout gid 配置 `group_add`（见 compose.yaml 注释）；Home Assistant Add-on 已声明 `uart: true`（自动映射宿主机全部 UART/串口设备，无需逐个声明）；镜像内 appuser 已加入 dialout 组。
+- **部署注意**：采集线程在单进程入口启动一次；若未来迁移 gunicorn 多 worker，只允许一个 worker 开启 `MODBUS_ENABLED`。一条 RS485 总线同一时刻只由一个采集线程使用（半双工）。
+
+```bash
+# 查看所有设备的统一状态（HA 与 Modbus 数据源并列；未配置 key 时返回 503）
+KEY=<HISTORY_API_KEY>
+curl -H "X-History-Key: $KEY" http://127.0.0.1:5000/api/devices
+
+# 最近设备事件 / 系统状态
+curl -H "X-History-Key: $KEY" "http://127.0.0.1:5000/api/events?limit=20"
+curl http://127.0.0.1:5000/api/system/status
+```
 
 ## Home Assistant 配置
 

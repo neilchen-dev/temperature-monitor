@@ -10,6 +10,12 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+    # Modbus RTU（USB-RS485）时取消注释；宿主 dialout 组 gid 与容器不同
+    # （Debian 惯例为 20）时，在 group_add 中填写宿主实际 gid。
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    # group_add:
+    #   - "20"
     logging:
       driver: json-file
       options:

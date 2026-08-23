@@ -1,3 +1,8 @@
 Flask>=3.0,<4
 requests>=2.31,<3
 waitress>=3.0,<4
+# Modbus TCP/RTU 采集；pymodbus 3.x 各版本 API 不兼容，锁定在实测过的
+# 3.15 系列（下一个 minor 即可能破坏 client/server API）。
+pymodbus>=3.15,<3.16
+# pymodbus 的 serial 支持是可选 extra，不会随包自动安装；RTU 需要
+pyserial>=3.5,<4
