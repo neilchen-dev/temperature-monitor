@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
 import config
-from services import history
+from services import db, history
 
 
 class HistoryServiceTests(unittest.TestCase):
     def setUp(self) -> None:
+        # sample_history 会写 SQLite 镜像；不隔离会把 11 台设备的快照
+        # 写进仓库默认 data/temperature_monitor.db。
+        self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._tmp_dir.cleanup)
         self.original_values = {
             "HISTORY_API_KEY": config.HISTORY_API_KEY,
             "HISTORY_INTERVAL_MINUTES": config.HISTORY_INTERVAL_MINUTES,
@@ -19,7 +25,13 @@ class HistoryServiceTests(unittest.TestCase):
             "HISTORY_RETENTION_DAYS": config.HISTORY_RETENTION_DAYS,
             "HISTORY_CLEANUP_HOUR": config.HISTORY_CLEANUP_HOUR,
             "HISTORY_TABLE_MAP": config.HISTORY_TABLE_MAP,
+            "SQLITE_ENABLED": config.SQLITE_ENABLED,
+            "SQLITE_DB_PATH": config.SQLITE_DB_PATH,
         }
+        db.close()
+        db._init_failed = False
+        config.SQLITE_ENABLED = True
+        config.SQLITE_DB_PATH = Path(self._tmp_dir.name) / "history-test.db"
         config.HISTORY_API_KEY = "x" * 32
         config.HISTORY_INTERVAL_MINUTES = 10
         config.HISTORY_TIMEZONE = "Asia/Shanghai"
@@ -32,12 +44,15 @@ class HistoryServiceTests(unittest.TestCase):
         }
         history._latest_sample_cache.clear()
         history._cleanup_date_by_table.clear()
+        self.addCleanup(self._restore)
 
-    def tearDown(self) -> None:
+    def _restore(self) -> None:
         for name, value in self.original_values.items():
             setattr(config, name, value)
         history._latest_sample_cache.clear()
         history._cleanup_date_by_table.clear()
+        db._init_failed = False
+        db.close()
 
     @staticmethod
     def _snapshot_records(status: str = "在线") -> list[dict]:

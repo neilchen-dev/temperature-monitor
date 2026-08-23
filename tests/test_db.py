@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
@@ -175,6 +176,51 @@ class SqliteMirrorTests(unittest.TestCase):
             device="DEV-01", temperature_c=1.0, humidity=1.0,
             status="在线", feishu_code=0, feishu_message="success",
         )
+
+    def test_legacy_device_events_gains_source_column(self) -> None:
+        # 旧版本建的库缺 device_events.source 列；重开连接必须补列，
+        # 且补列后带 source 的写入/读取正常、旧行数据保留。
+        db.close()
+        legacy_path = Path(self._tmp_dir.name) / "legacy.db"
+        legacy = sqlite3.connect(legacy_path)
+        legacy.execute(
+            "CREATE TABLE device_events ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " device_id TEXT NOT NULL,"
+            " event_type TEXT NOT NULL,"
+            " old_state TEXT, new_state TEXT, value REAL,"
+            " message TEXT, created_at TEXT NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO device_events"
+            " (device_id, event_type, old_state, new_state, value, message, created_at)"
+            " VALUES ('PLC-01', 'status_change', 'ONLINE', 'OFFLINE', NULL, 'x', 't')"
+        )
+        legacy.commit()
+        legacy.close()
+
+        config.SQLITE_DB_PATH = legacy_path
+        db._init_failed = False
+        db.init_db()
+
+        columns = {
+            row[1] for row in db._get_connection().execute(
+                "PRAGMA table_info(device_events)"
+            )
+        }
+        self.assertIn("source", columns)
+
+        db.save_device_event(
+            device_id="PLC-02", event_type="status_change",
+            old_state="ONLINE", new_state="OFFLINE",
+            value=None, message="migrated", source="modbus",
+        )
+        events = db.fetch_device_events()
+        self.assertEqual(len(events), 2)
+        by_device = {row["device_id"]: row for row in events}
+        self.assertEqual(by_device["PLC-02"]["source"], "modbus")
+        # 补列前就存在的旧行 source 为 NULL，数据未丢
+        self.assertIsNone(by_device["PLC-01"]["source"])
 
 
 if __name__ == "__main__":

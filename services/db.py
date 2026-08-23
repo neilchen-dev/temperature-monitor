@@ -102,6 +102,32 @@ CREATE INDEX IF NOT EXISTS idx_device_events_created_at
     ON device_events(created_at);
 """
 
+# 加性列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列。
+# 旧版本建的库（例如 device_events 缺 source 列）在连接初始化时逐列补齐。
+_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("device_events", "source", "ALTER TABLE device_events ADD COLUMN source TEXT"),
+)
+
+
+def _apply_column_migrations(connection: sqlite3.Connection) -> None:
+    for table, column, ddl in _COLUMN_MIGRATIONS:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not exists:
+            continue
+        columns = {
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in columns:
+            connection.execute(ddl)
+            connection.commit()
+            logger.info(
+                "SQLite 结构迁移：为 %s 补充列 %s | path=%s",
+                table, column, config.SQLITE_DB_PATH,
+            )
+
 _lock = threading.RLock()
 _connection: sqlite3.Connection | None = None
 _init_failed = False
@@ -130,6 +156,7 @@ def _get_connection() -> sqlite3.Connection | None:
         with _lock:
             connection.executescript(_SCHEMA)
             connection.commit()
+            _apply_column_migrations(connection)
         _connection = connection
         logger.info(
             "SQLite 本地镜像已启用 | path=%s", config.SQLITE_DB_PATH
