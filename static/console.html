@@ -6,172 +6,262 @@
 <title>温湿度监控 · 工业监控台</title>
 <script src="/static/chart.umd.min.js"></script>
 <style>
-  :root { color-scheme: light; }
+  :root {
+    color-scheme: light;
+    --bg: #edf2f5;
+    --surface: #ffffff;
+    --surface-soft: #f7f9fb;
+    --ink: #12263a;
+    --muted: #6b7c8d;
+    --line: #dbe4eb;
+    --brand: #0e6878;
+    --brand-deep: #0a3547;
+    --brand-soft: #e5f3f4;
+    --ok: #159a70;
+    --ok-soft: #e8f7f0;
+    --warn: #c47a16;
+    --warn-soft: #fff5e6;
+    --bad: #d34e59;
+    --bad-soft: #fff0f1;
+    --shadow: 0 12px 28px rgba(23, 48, 66, .07);
+  }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 20px 24px;
-    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-    background: #f4f6f9; color: #24292f;
+    max-width: 1540px; margin: 0 auto; padding: 26px clamp(18px, 3vw, 46px) 34px;
+    font-family: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); line-height: 1.45;
   }
-  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
-  h1 { font-size: 22px; margin: 0; }
-  .conn { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #57606a; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: #8c959f; display: inline-block; flex: none; }
-  .dot.ok { background: #2da44e; } .dot.bad { background: #cf222e; } .dot.warn { background: #9a6700; }
+  header.app-header {
+    display: flex; align-items: stretch; justify-content: space-between; gap: 28px;
+    min-height: 156px; padding: 26px 30px; margin-bottom: 22px;
+    color: #fff; border-radius: 20px; overflow: hidden;
+    background: linear-gradient(118deg, #0a3547 0%, #0d5b6d 58%, #0c7580 100%);
+    box-shadow: 0 18px 38px rgba(10, 53, 71, .2); position: relative;
+  }
+  header.app-header::after {
+    content: ""; position: absolute; inset: 0 0 0 62%; opacity: .08;
+    background: repeating-linear-gradient(135deg, transparent 0 20px, #fff 20px 21px);
+    pointer-events: none;
+  }
+  .brand-block, .header-side { position: relative; z-index: 1; }
+  .eyebrow { font-size: 10px; letter-spacing: .18em; font-weight: 700; opacity: .68; }
+  h1 { margin: 5px 0 4px; font-size: clamp(28px, 3vw, 40px); line-height: 1.1; letter-spacing: -.04em; }
+  .brand-block p { margin: 0; color: rgba(255,255,255,.72); font-size: 13px; }
+  .header-side { display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; gap: 18px; }
+  .header-status { display: flex; align-items: center; gap: 9px; font-size: 13px; color: rgba(255,255,255,.9); }
+  .header-status .last-refresh { color: rgba(255,255,255,.6); margin-left: 8px; }
+  .header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .conn { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #a5b4bf; display: inline-block; flex: none; box-shadow: 0 0 0 4px rgba(255,255,255,.12); }
+  .dot.ok { background: #63e6b1; } .dot.bad { background: #ff8790; } .dot.warn { background: #ffd277; }
   .spacer { flex: 1; }
-  .last-refresh { font-size: 12px; color: #8c959f; }
-  label.toggle { font-size: 13px; color: #57606a; display: flex; align-items: center; gap: 4px; }
+  label.toggle { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .header-actions label.toggle { color: rgba(255,255,255,.72); }
   button {
-    font: inherit; font-size: 13px; padding: 5px 12px; cursor: pointer;
-    background: #f6f8fa; color: #24292f; border: 1px solid #d0d7de; border-radius: 6px;
+    font: inherit; font-size: 13px; padding: 8px 13px; cursor: pointer;
+    background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 8px;
+    transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
   }
-  button:hover { background: #eff2f5; }
-  button.primary { background: #0969da; border-color: #0969da; color: #fff; }
-  button.primary:hover { background: #0860c8; }
+  button:hover { background: var(--surface-soft); border-color: #b4c5d1; }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+  button.primary:hover { background: #0a5968; border-color: #0a5968; }
+  button.header-button { background: rgba(255,255,255,.1); color: #fff; border-color: rgba(255,255,255,.3); }
+  button.header-button:hover { background: rgba(255,255,255,.18); border-color: rgba(255,255,255,.55); }
   button:disabled { opacity: .5; cursor: not-allowed; }
 
   .card {
-    background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
-    padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.05);
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 22px; box-shadow: var(--shadow);
   }
-  .keybar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-  .keybar input {
-    font: inherit; font-size: 13px; padding: 5px 10px; width: 320px; max-width: 100%;
-    border: 1px solid #d0d7de; border-radius: 6px;
+  .credentials-dialog { width: min(460px, 92vw); padding: 24px; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 24px 70px rgba(10, 53, 71, .24); }
+  .credentials-dialog::backdrop, dialog::backdrop { background: rgba(10, 35, 49, .48); backdrop-filter: blur(3px); }
+  .dialog-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+  .dialog-top h3 { margin: 5px 0 4px; font-size: 21px; letter-spacing: -.02em; }
+  .dialog-top p { margin: 0 0 20px; color: var(--muted); font-size: 12px; }
+  .icon-button { width: 32px; height: 32px; padding: 0; border-radius: 50%; font-size: 20px; line-height: 1; color: var(--muted); }
+  .credential-field { display: flex; flex-direction: column; gap: 7px; }
+  .credential-field label { display: grid; gap: 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
+  .credential-field input, .field input, .search-box input, .device-filters select, .trend-controls select {
+    font: inherit; font-size: 13px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); outline: none;
   }
-  .keybar .hint { font-size: 12px; color: #8c959f; }
+  input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(14,104,120,.12); }
+  .credentials-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
-  nav.tabs { display: flex; gap: 4px; border-bottom: 1px solid #d0d7de; margin-bottom: 16px; }
-  .tab-btn {
-    border: none; background: none; border-radius: 6px 6px 0 0;
-    padding: 9px 18px; font-size: 14px; color: #57606a;
-  }
-  .tab-btn:hover { background: #eef1f4; }
-  .tab-btn.active {
-    color: #0969da; font-weight: 600;
-    border-bottom: 2px solid #0969da; margin-bottom: -1px;
-  }
+  nav.tabs { display: inline-flex; gap: 4px; padding: 5px; margin-bottom: 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 5px 14px rgba(23,48,66,.04); }
+  .tab-btn { border: none; background: transparent; border-radius: 8px; padding: 9px 17px; font-size: 13px; color: var(--muted); }
+  .tab-btn:hover { background: var(--surface-soft); }
+  .tab-btn.active { color: #fff; font-weight: 700; background: var(--brand); box-shadow: 0 4px 10px rgba(14,104,120,.2); }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
 
   /* ---- Tab 1 实时监控 ---- */
-  .kpis { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 16px; }
-  .kpi { padding: 12px 16px; }
-  .kpi .label { font-size: 12px; color: #57606a; }
-  .kpi .value { font-size: 28px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
-  .kpi .value.ok { color: #1a7f37; } .kpi .value.bad { color: #cf222e; } .kpi .value.warn { color: #9a6700; }
-  .kpi .extra { font-size: 12px; color: #8c959f; margin-top: 2px; }
-
-  .device-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
-  .device-card {
-    border: 1px solid #d0d7de; border-left-width: 4px; border-radius: 8px;
-    padding: 10px 12px; cursor: pointer; background: #fff;
-  }
-  .device-card:hover { border-color: #0969da; }
-  .device-card.state-ok { border-left-color: #2da44e; }
-  .device-card.state-warn { border-left-color: #d29922; background: #fffbeb; }
-  .device-card.state-bad { border-left-color: #cf222e; background: #fff1f2; }
-  .device-head { display: flex; align-items: center; gap: 6px; }
-  .device-head .name { font-weight: 600; font-size: 14px; }
-  .badge {
-    font-size: 11px; padding: 1px 7px; border-radius: 10px;
-    background: #ddf4ff; color: #0969da; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis; max-width: 90px;
-  }
-  .device-head .set-btn { margin-left: auto; font-size: 12px; padding: 2px 8px; }
-  .readings { display: flex; gap: 18px; margin: 8px 0 4px; }
-  .reading .num { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .reading .unit { font-size: 12px; color: #57606a; margin-left: 2px; }
-  .reading .num.ok { color: #1a7f37; } .reading .num.warn { color: #9a6700; } .reading .num.na { color: #8c959f; }
-  .band { font-size: 12px; color: #57606a; }
-  .band.unset { color: #8c959f; }
-  .device-time { font-size: 11px; color: #8c959f; margin-top: 6px; }
-  .card-title { font-size: 15px; margin: 0 0 12px; color: #1f2328; font-weight: 600; }
-  .card-title .muted { font-weight: 400; font-size: 12px; color: #8c959f; }
+  .kpis { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; }
+  .kpi { min-height: 132px; padding: 17px 19px; position: relative; overflow: hidden; }
+  .kpi::before { content: ""; position: absolute; left: 0; top: 20px; bottom: 20px; width: 4px; border-radius: 0 4px 4px 0; background: var(--brand); }
+  .kpi-online::before { background: var(--ok); } .kpi-offline::before { background: var(--bad); } .kpi-alert::before { background: var(--warn); }
+  .kpi .label { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; }
+  .kpi .value { margin-top: 9px; font-size: clamp(36px, 3.4vw, 46px); line-height: .95; font-weight: 750; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+  .kpi .value.ok { color: var(--ok); } .kpi .value.bad { color: var(--bad); } .kpi .value.warn { color: var(--warn); }
+  .kpi .extra { margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .header-collection { display: flex; align-items: baseline; justify-content: flex-end; gap: 9px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.18); color: rgba(255,255,255,.72); font-size: 11px; }
+  .header-collection .collection-label { color: rgba(255,255,255,.54); letter-spacing: .08em; text-transform: uppercase; }
+  .header-collection .collection-value { color: #fff; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .header-collection .collection-note { color: rgba(255,255,255,.56); }
+  .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+  .section-heading .card-title { margin: 0; }
+  .card-title { font-size: 18px; margin: 0 0 12px; color: var(--ink); font-weight: 750; letter-spacing: -.025em; }
+  .card-title .muted { font-weight: 400; font-size: 12px; color: var(--muted); letter-spacing: 0; }
+  .device-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+  .search-box { display: flex; align-items: center; gap: 7px; padding-left: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .search-box .search-icon { color: var(--muted); font-size: 14px; }
+  .search-box input { width: 145px; padding: 9px 9px 9px 0; border: none; box-shadow: none; }
+  .device-filters select { padding: 9px 28px 9px 10px; }
+  .device-shell { padding: 20px; }
+  .device-result-meta { min-height: 18px; margin: -5px 0 10px; color: var(--muted); font-size: 12px; }
+  .device-grid { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .device-card { min-width: 0; padding: 18px 18px 16px; cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--ok); border-radius: 12px; transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease; }
+  .device-card:hover { transform: translateY(-2px); border-color: #b8ccd7; box-shadow: 0 12px 22px rgba(23,48,66,.1); }
+  .device-card.state-ok { border-left-color: var(--ok); }
+  .device-card.state-warn { border-left-color: var(--warn); background: linear-gradient(180deg, #fff 0%, var(--warn-soft) 100%); }
+  .device-card.state-bad { border-left-color: var(--bad); background: linear-gradient(180deg, #fff 0%, var(--bad-soft) 100%); }
+  .device-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .device-head .name { overflow: hidden; color: var(--ink); font-size: 17px; font-weight: 750; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
+  .device-head .dot { width: 8px; height: 8px; box-shadow: none; }
+  .badge { flex: none; max-width: none; padding: 3px 8px; color: var(--brand); background: var(--brand-soft); border-radius: 6px; font-size: 10px; font-weight: 750; letter-spacing: .06em; white-space: nowrap; }
+  .readings { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 23px 0 18px; }
+  .reading .num { font-size: clamp(27px, 2.4vw, 34px); line-height: 1; font-weight: 750; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+  .reading .unit { margin-left: 3px; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: 0; }
+  .reading .caption { margin-top: 8px; color: var(--muted); font-size: 11px; }
+  .reading .num.ok { color: var(--ok); } .reading .num.warn { color: var(--warn); } .reading .num.na { color: #98a7b3; }
+  .band { padding-top: 11px; color: var(--muted); border-top: 1px solid rgba(136,157,171,.25); font-size: 11px; }
+  .band.unset { color: #98a7b3; }
+  .device-time { margin-top: 8px; color: var(--muted); font-size: 11px; }
+  .card-actions { display: flex; gap: 7px; margin-top: 16px; }
+  .card-actions button { flex: 1; padding: 7px 8px; font-size: 11px; }
+  .card-actions .view-btn { color: var(--brand); background: var(--brand-soft); border-color: transparent; }
+  .card-actions .set-btn { color: var(--ink); background: var(--surface); }
+  .empty-credentials { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 214px; padding: 26px 18px; text-align: center; }
+  .empty-credentials .empty-mark { display: grid; place-items: center; width: 42px; height: 42px; margin-bottom: 12px; color: var(--brand); background: var(--brand-soft); border-radius: 12px; font-size: 21px; }
+  .empty-credentials strong { color: var(--ink); font-size: 16px; }
+  .empty-credentials span { margin-top: 5px; color: var(--muted); font-size: 12px; }
+  .empty-credentials button { margin-top: 15px; padding: 7px 13px; color: var(--brand); background: var(--brand-soft); border-color: transparent; }
 
   /* ---- Tab 2 历史趋势 ---- */
+  .trend-shell { padding: 24px; }
   .trend-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-  .trend-controls select {
-    font: inherit; font-size: 13px; padding: 5px 8px;
-    border: 1px solid #d0d7de; border-radius: 6px; background: #fff;
-  }
-  .seg { display: inline-flex; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; }
-  .seg button { border: none; border-radius: 0; padding: 5px 14px; background: #fff; }
-  .seg button.active { background: #0969da; color: #fff; }
-  .trend-meta { font-size: 12px; color: #57606a; margin-bottom: 10px; min-height: 16px; }
-  .chart-box { position: relative; height: 260px; margin-bottom: 16px; }
-  .chart-fallback { height: 200px; }
+  .trend-controls .toggle { margin-right: -3px; font-weight: 700; color: var(--ink); }
+  .trend-controls select { min-width: 200px; }
+  .seg { display: inline-flex; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; }
+  .seg button { border: none; border-radius: 0; padding: 9px 15px; background: #fff; color: var(--muted); }
+  .seg button.active { color: #fff; background: var(--brand); }
+  .trend-meta { min-height: 18px; margin: 6px 0 14px; color: var(--muted); font-size: 12px; }
+  .chart-box { position: relative; height: 280px; padding: 15px 15px 10px 8px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 12px; background: #fbfcfd; }
+  .chart-fallback { height: 220px; }
 
   /* ---- Tab 3 设备与事件 ---- */
-  .events-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+  .events-layout { display: grid; gap: 18px; grid-template-columns: minmax(0, 1.4fr) minmax(360px, .9fr); }
   @media (max-width: 1100px) { .events-layout { grid-template-columns: 1fr; } }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eaeef2; }
-  th { background: #f6f8fa; color: #57606a; font-weight: 600; white-space: nowrap; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 12px 13px; border-bottom: 1px solid #edf1f4; }
+  tr:last-child td { border-bottom: none; }
+  th { color: var(--muted); background: var(--surface-soft); font-size: 11px; font-weight: 750; letter-spacing: .04em; white-space: nowrap; }
   td.num { font-variant-numeric: tabular-nums; }
   tbody tr.device-row { cursor: pointer; }
-  tbody tr.device-row:hover { background: #f6f8fa; }
-  tbody tr.device-row.selected { background: #ddf4ff; }
-  .ok { color: #1a7f37; } .warn { color: #9a6700; } .bad { color: #cf222e; }
-  .muted { color: #8c959f; }
-  .empty { color: #8c959f; padding: 24px; text-align: center; }
+  tbody tr.device-row:hover { background: #f5fafb; }
+  tbody tr.device-row.selected { background: var(--brand-soft); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .empty { padding: 34px 24px; color: var(--muted); text-align: center; }
+  .filter-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; margin-left: 8px; color: var(--brand); background: var(--brand-soft); border-radius: 8px; font-size: 11px; }
+  .filter-chip button { padding: 0 2px; color: var(--brand); background: transparent; border: none; font-size: 13px; }
+  .timeline { max-height: 470px; margin: 0; padding: 4px 0 4px 8px; overflow: auto; list-style: none; }
+  .timeline li { position: relative; margin-left: 9px; padding: 12px 8px 12px 20px; border-left: 2px solid #e6edf1; font-size: 13px; }
+  .timeline li::before { content: ""; position: absolute; left: -6px; top: 17px; width: 9px; height: 9px; border: 3px solid #fff; border-radius: 50%; background: #94a4af; box-shadow: 0 0 0 1px #dbe4eb; }
+  .timeline li.ev-bad::before { background: var(--bad); } .timeline li.ev-ok::before { background: var(--ok); } .timeline li.ev-warn::before { background: var(--warn); }
+  .timeline .t { margin-right: 9px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .timeline .dev { padding: 3px 7px; margin-left: 7px; color: var(--muted); background: var(--surface-soft); border-radius: 6px; font-size: 10px; }
 
-  .filter-chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    background: #ddf4ff; color: #0969da; border-radius: 12px;
-    font-size: 12px; padding: 2px 10px; margin-left: 8px;
-  }
-  .filter-chip button { border: none; background: none; color: #0969da; font-size: 13px; padding: 0 2px; cursor: pointer; }
+  dialog { width: min(480px, 92vw); padding: 24px; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 24px 70px rgba(10,53,71,.24); }
+  dialog h3 { margin: 0 0 4px; font-size: 20px; }
+  dialog .sub { margin-bottom: 18px; color: var(--muted); font-size: 12px; }
+  .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 600; }
+  .dialog-error { min-height: 18px; margin-top: 11px; color: var(--bad); font-size: 13px; }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  footer { margin-top: 22px; padding: 14px 2px 0; color: var(--muted); border-top: 1px solid var(--line); font-size: 11px; }
+  footer code { color: var(--brand); }
 
-  .timeline { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow: auto; }
-  .timeline li {
-    position: relative; padding: 8px 0 8px 20px; border-left: 2px solid #eaeef2;
-    margin-left: 8px; font-size: 13px;
+  @media (min-width: 1450px) { .device-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+  @media (max-width: 1050px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .device-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 760px) {
+    body { padding: 14px 12px 24px; }
+    header.app-header { min-height: 0; padding: 22px; flex-direction: column; }
+    .header-side { align-items: flex-start; }
+    .header-actions { justify-content: flex-start; }
+    .section-heading { align-items: flex-start; flex-direction: column; }
+    .device-filters { justify-content: flex-start; width: 100%; }
+    .search-box { flex: 1; } .search-box input { width: 100%; }
+    .device-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .events-layout { grid-template-columns: 1fr; }
+    .header-collection { justify-content: flex-start; width: 100%; }
   }
-  .timeline li::before {
-    content: ""; position: absolute; left: -6px; top: 13px;
-    width: 10px; height: 10px; border-radius: 50%;
-    background: #8c959f; border: 2px solid #fff;
+  @media (max-width: 520px) {
+    .kpis { grid-template-columns: 1fr 1fr; gap: 9px; }
+    .kpi { min-height: 118px; padding: 15px; }
+    .kpi .value { font-size: 35px; }
+    .device-grid { grid-template-columns: 1fr; }
+    nav.tabs { display: flex; width: 100%; } .tab-btn { flex: 1; padding-inline: 8px; }
+    .field-grid { grid-template-columns: 1fr; }
+    .trend-shell, .card { padding: 17px; }
+    .device-shell { padding: 17px; }
   }
-  .timeline li.ev-bad::before { background: #cf222e; }
-  .timeline li.ev-ok::before { background: #2da44e; }
-  .timeline li.ev-warn::before { background: #d29922; }
-  .timeline .t { color: #8c959f; font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
-  .timeline .dev { font-size: 11px; padding: 0 6px; border-radius: 10px; background: #f6f8fa; margin-left: 6px; color: #57606a; }
-
-  dialog {
-    border: 1px solid #d0d7de; border-radius: 8px; padding: 20px;
-    width: min(420px, 92vw); box-shadow: 0 8px 24px rgba(0,0,0,.12);
-  }
-  dialog::backdrop { background: rgba(31,35,40,.35); }
-  dialog h3 { margin: 0 0 4px; font-size: 16px; }
-  dialog .sub { font-size: 12px; color: #57606a; margin-bottom: 14px; }
-  .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #57606a; }
-  .field input {
-    font: inherit; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px;
-  }
-  .dialog-error { color: #cf222e; font-size: 13px; min-height: 18px; margin-top: 10px; }
-  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
-
-  footer { margin-top: 20px; color: #8c959f; font-size: 12px; }
 </style>
 </head>
 <body>
-<header>
-  <h1>温湿度监控 · 工业监控台</h1>
-  <div class="conn"><span class="dot" id="connDot"></span><span id="connText">未配置密钥</span></div>
-  <div class="spacer"></div>
-  <label class="toggle"><input type="checkbox" id="autoRefresh" checked>自动刷新（10 秒）</label>
-  <button id="refreshBtn">立即刷新</button>
-  <span class="last-refresh" id="lastRefresh"></span>
+<header class="app-header">
+  <div class="brand-block">
+    <div class="eyebrow">ENVIRONMENT CONTROL / WEB HMI</div>
+    <h1>温湿度监控台</h1>
+    <p>生产现场环境状态与阈值控制</p>
+  </div>
+  <div class="header-side">
+    <div class="header-status">
+      <div class="conn"><span class="dot" id="connDot"></span><span id="connText">未配置密钥</span></div>
+      <span class="last-refresh" id="lastRefresh"></span>
+    </div>
+    <div class="header-actions">
+      <label class="toggle"><input type="checkbox" id="autoRefresh" checked>自动刷新（10 秒）</label>
+      <button class="header-button" id="refreshBtn">立即刷新</button>
+      <button class="header-button" id="credentialsBtn">凭据设置</button>
+    </div>
+    <div class="header-collection">
+      <span class="collection-label">最近采集</span>
+      <strong class="collection-value" id="kpiLastSample">—</strong>
+      <span class="collection-note" id="kpiCollector">等待采集状态</span>
+    </div>
+  </div>
 </header>
 
-<section class="card keybar">
-  <input type="password" id="apiKey" placeholder="输入 HISTORY_API_KEY" autocomplete="off">
-  <button class="primary" id="saveKeyBtn">保存密钥</button>
-  <span class="hint">密钥仅保存在本页 sessionStorage，通过请求头发送，不会出现在 URL 或日志中</span>
-</section>
+<dialog class="credentials-dialog" id="credentialsDialog">
+  <div class="dialog-top">
+    <div>
+      <div class="eyebrow" style="color:var(--brand);opacity:1">SECURE ACCESS</div>
+      <h3>凭据设置</h3>
+      <p>密钥仅保存在本页 sessionStorage，通过请求头发送，不会出现在 URL 或日志中。</p>
+    </div>
+    <button class="icon-button" id="credentialsClose" type="button" aria-label="关闭">×</button>
+  </div>
+  <div class="credential-field">
+    <label for="apiKey">HISTORY_API_KEY
+      <input type="password" id="apiKey" placeholder="输入 HISTORY_API_KEY" autocomplete="off">
+    </label>
+  </div>
+  <div class="credentials-actions">
+    <button id="credentialsCancel" type="button">取消</button>
+    <button class="primary" id="saveKeyBtn" type="button">保存并连接</button>
+  </div>
+</dialog>
 
 <nav class="tabs">
   <button class="tab-btn active" data-tab="monitor">实时监控</button>
@@ -182,21 +272,35 @@
 <!-- Tab 1: 实时监控 -->
 <section class="tab-panel active" id="tab-monitor">
   <div class="kpis">
-    <div class="card kpi"><div class="label">设备</div><div class="value" id="kpiTotal">—</div><div class="extra" id="kpiTotalExtra"></div></div>
-    <div class="card kpi"><div class="label">在线</div><div class="value ok" id="kpiOnline">—</div><div class="extra" id="kpiOnlineExtra"></div></div>
-    <div class="card kpi"><div class="label">离线</div><div class="value" id="kpiOffline">—</div><div class="extra">离线设备数</div></div>
-    <div class="card kpi"><div class="label">当前告警</div><div class="value" id="kpiAlert">—</div><div class="extra">超控制区间的在线设备</div></div>
-    <div class="card kpi"><div class="label">最后采集</div><div class="value" style="font-size:16px" id="kpiLastSample">—</div><div class="extra" id="kpiCollector"></div></div>
+    <div class="card kpi kpi-total"><div class="label">设备总数</div><div class="value" id="kpiTotal">—</div><div class="extra" id="kpiTotalExtra">全部纳管</div></div>
+    <div class="card kpi kpi-online"><div class="label">在线设备</div><div class="value ok" id="kpiOnline">—</div><div class="extra" id="kpiOnlineExtra">在线率 —</div></div>
+    <div class="card kpi kpi-offline"><div class="label">离线设备</div><div class="value" id="kpiOffline">—</div><div class="extra" id="kpiOfflineExtra">运行正常</div></div>
+    <div class="card kpi kpi-alert"><div class="label">当前告警</div><div class="value" id="kpiAlert">—</div><div class="extra" id="kpiAlertExtra">无异常</div></div>
   </div>
-  <div class="card">
-    <h2 class="card-title">设备总览 <span class="muted">· 点击卡片查看历史趋势，「设定」配置控制区间</span></h2>
-    <div class="device-grid" id="deviceGrid"><div class="empty">输入密钥后加载数据</div></div>
+  <div class="card device-shell">
+    <div class="section-heading">
+      <div><h2 class="card-title">设备状态</h2><div class="muted">点击卡片或“查看趋势”进入历史数据，左侧状态条表示当前健康度</div></div>
+      <div class="device-filters">
+        <label class="search-box" for="deviceSearch"><span class="search-icon">⌕</span><input id="deviceSearch" type="search" placeholder="搜索设备" autocomplete="off"></label>
+        <select id="deviceStatusFilter" aria-label="状态筛选"><option value="all">全部状态</option><option value="online">在线</option><option value="offline">离线</option></select>
+        <select id="deviceSourceFilter" aria-label="来源筛选"><option value="all">全部来源</option></select>
+      </div>
+    </div>
+    <div class="device-result-meta" id="deviceResultMeta"></div>
+    <div class="device-grid" id="deviceGrid">
+      <div class="empty empty-credentials">
+        <div class="empty-mark" aria-hidden="true">⌁</div>
+        <strong>尚未加载监控数据</strong>
+        <span>配置访问凭据后即可查看实时设备状态</span>
+        <button id="emptyCredentialsBtn" type="button">配置凭据</button>
+      </div>
+    </div>
   </div>
 </section>
 
 <!-- Tab 2: 历史趋势 -->
 <section class="tab-panel" id="tab-trend">
-  <div class="card">
+  <div class="card trend-shell">
     <h2 class="card-title">温湿度历史趋势</h2>
     <div class="trend-controls">
       <label class="toggle" for="trendDevice">设备</label>
@@ -263,6 +367,9 @@
     trendSelection: null, // {device_id, source}
     trendWindow: "7d",
     eventsFilter: null,   // device_id 或 null（全部）
+    deviceSearch: "",
+    deviceStatusFilter: "all",
+    deviceSourceFilter: "all",
     charts: { temp: null, hum: null },
     timer: null,
     refreshing: false,
@@ -273,12 +380,18 @@
   var els = {
     connDot: $("connDot"), connText: $("connText"),
     apiKey: $("apiKey"), saveKeyBtn: $("saveKeyBtn"),
+    credentialsBtn: $("credentialsBtn"), credentialsDialog: $("credentialsDialog"),
+    credentialsClose: $("credentialsClose"), credentialsCancel: $("credentialsCancel"),
     autoRefresh: $("autoRefresh"), refreshBtn: $("refreshBtn"), lastRefresh: $("lastRefresh"),
     kpiTotal: $("kpiTotal"), kpiTotalExtra: $("kpiTotalExtra"),
     kpiOnline: $("kpiOnline"), kpiOnlineExtra: $("kpiOnlineExtra"),
-    kpiOffline: $("kpiOffline"), kpiAlert: $("kpiAlert"),
+    kpiOffline: $("kpiOffline"), kpiOfflineExtra: $("kpiOfflineExtra"),
+    kpiAlert: $("kpiAlert"), kpiAlertExtra: $("kpiAlertExtra"),
     kpiLastSample: $("kpiLastSample"), kpiCollector: $("kpiCollector"),
-    deviceGrid: $("deviceGrid"),
+    emptyCredentialsBtn: $("emptyCredentialsBtn"),
+    deviceGrid: $("deviceGrid"), deviceSearch: $("deviceSearch"),
+    deviceStatusFilter: $("deviceStatusFilter"), deviceSourceFilter: $("deviceSourceFilter"),
+    deviceResultMeta: $("deviceResultMeta"),
     trendDevice: $("trendDevice"), trendWindowSeg: $("trendWindowSeg"),
     trendMeta: $("trendMeta"), tempChartBox: $("tempChartBox"), humChartBox: $("humChartBox"),
     deviceTableWrap: $("deviceTableWrap"), eventTimeline: $("eventTimeline"),
@@ -318,6 +431,18 @@
 
   // ---- 判定与格式化 ----
   function bandOf(device) { return state.thresholds[device] || null; }
+
+  function sourceLabel(source) {
+    var labels = {
+      home_assistant: "HA",
+      modbus_rtu: "RTU",
+      modbus_tcp: "TCP",
+      rtu: "RTU",
+      tcp: "TCP",
+      modbus: "MODBUS",
+    };
+    return labels[source] || String(source || "UNKNOWN").toUpperCase();
+  }
 
   function breach(value, low, high) {
     if (value === null || value === undefined) return false;
@@ -395,14 +520,23 @@
           && (breach(it.temperature, band.temp_min, band.temp_max)
               || breach(it.humidity, band.humidity_min, band.humidity_max))) alerts++;
     });
+    var onlineRate = items.length ? Math.round(online / items.length * 100) : 0;
     els.kpiTotal.textContent = String(items.length);
     els.kpiTotalExtra.textContent = Object.keys(deviceIds).length + " 台设备";
     els.kpiOnline.textContent = String(online);
-    els.kpiOnlineExtra.textContent = "在线设备身份";
+    els.kpiOnlineExtra.textContent = items.length ? "在线率 " + onlineRate + "%" : "等待采集";
     els.kpiOffline.textContent = String(offline);
     els.kpiOffline.className = "value" + (offline ? " bad" : " ok");
+    els.kpiOfflineExtra.textContent = offline ? "需要关注" : "运行正常";
     els.kpiAlert.textContent = String(alerts);
     els.kpiAlert.className = "value" + (alerts ? " warn" : " ok");
+    els.kpiAlertExtra.textContent = alerts ? "需要关注" : "无异常";
+  }
+
+  function selectTrend(item) {
+    state.trendSelection = { device_id: item.device_id, source: item.source };
+    syncTrendControls();
+    switchTab("trend");
   }
 
   function deviceCard(item) {
@@ -423,16 +557,9 @@
     name.textContent = item.device_id;
     var badge = document.createElement("span");
     badge.className = "badge";
-    badge.textContent = item.source;
-    var setBtn = document.createElement("button");
-    setBtn.className = "set-btn";
-    setBtn.type = "button";
-    setBtn.textContent = "设定";
-    setBtn.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      openThresholdDialog(item.device_id);
-    });
-    head.append(dot, name, badge, setBtn);
+    badge.textContent = sourceLabel(item.source);
+    badge.title = item.source;
+    head.append(dot, name, badge);
 
     var readings = document.createElement("div");
     readings.className = "readings";
@@ -446,8 +573,8 @@
       unitSpan.className = "unit";
       unitSpan.textContent = unit;
       num.appendChild(unitSpan);
-      var sub = document.createElement("div");
-      sub.className = "unit";
+    var sub = document.createElement("div");
+      sub.className = "caption";
       sub.textContent = label;
       wrap.append(num, sub);
       return wrap;
@@ -471,14 +598,64 @@
     time.className = "device-time";
     time.textContent = (online ? "在线" : "离线") + " · 更新 " + fmtShort(item.last_sample_time);
 
-    card.append(head, readings, bandLine, time);
+    var actions = document.createElement("div");
+    actions.className = "card-actions";
+    var viewBtn = document.createElement("button");
+    viewBtn.className = "view-btn";
+    viewBtn.type = "button";
+    viewBtn.textContent = "查看趋势";
+    viewBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      selectTrend(item);
+    });
+    var setBtn = document.createElement("button");
+    setBtn.className = "set-btn";
+    setBtn.type = "button";
+    setBtn.textContent = "设定阈值";
+    setBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      openThresholdDialog(item.device_id);
+    });
+    actions.append(viewBtn, setBtn);
+
+    card.append(head, readings, bandLine, time, actions);
     card.addEventListener("click", function () {
       // 点卡片跳趋势页：自然串联两个 Tab
-      state.trendSelection = { device_id: item.device_id, source: item.source };
-      syncTrendControls();
-      switchTab("trend");
+      selectTrend(item);
     });
     return card;
+  }
+
+  function filteredDevices() {
+    var query = state.deviceSearch.trim().toUpperCase();
+    return state.devices.filter(function (item) {
+      var matchesQuery = !query || String(item.device_id).toUpperCase().indexOf(query) >= 0;
+      var matchesStatus = state.deviceStatusFilter === "all"
+        || item.status === state.deviceStatusFilter;
+      var matchesSource = state.deviceSourceFilter === "all"
+        || item.source === state.deviceSourceFilter;
+      return matchesQuery && matchesStatus && matchesSource;
+    });
+  }
+
+  function syncDeviceFilters() {
+    var current = state.deviceSourceFilter;
+    var sources = {};
+    state.devices.forEach(function (item) { sources[item.source] = true; });
+    els.deviceSourceFilter.textContent = "";
+    var all = document.createElement("option");
+    all.value = "all";
+    all.textContent = "全部来源";
+    els.deviceSourceFilter.appendChild(all);
+    Object.keys(sources).sort().forEach(function (source) {
+      var option = document.createElement("option");
+      option.value = source;
+      option.textContent = sourceLabel(source);
+      option.title = source;
+      els.deviceSourceFilter.appendChild(option);
+    });
+    els.deviceSourceFilter.value = sources[current] ? current : "all";
+    state.deviceSourceFilter = els.deviceSourceFilter.value;
   }
 
   function renderCards() {
@@ -490,7 +667,16 @@
       els.deviceGrid.appendChild(empty);
       return;
     }
-    state.devices.forEach(function (item) {
+    var items = filteredDevices();
+    els.deviceResultMeta.textContent = "显示 " + items.length + " / " + state.devices.length + " 个设备身份";
+    if (!items.length) {
+      var noMatch = document.createElement("div");
+      noMatch.className = "empty";
+      noMatch.textContent = "没有匹配的设备";
+      els.deviceGrid.appendChild(noMatch);
+      return;
+    }
+    items.forEach(function (item) {
       els.deviceGrid.appendChild(deviceCard(item));
     });
   }
@@ -518,7 +704,8 @@
     state.devices.forEach(function (it) {
       var option = document.createElement("option");
       option.value = trendIdentityValue(it);
-      option.textContent = it.device_id + " · " + it.source;
+      option.textContent = it.device_id + " · " + sourceLabel(it.source);
+      option.title = it.source;
       els.trendDevice.appendChild(option);
     });
     if (state.trendSelection) {
@@ -599,7 +786,7 @@
     var band = bandOf(sel.device_id);
     items.sort(function (a, b) { return (a.sample_time_ms || 0) - (b.sample_time_ms || 0); });
 
-    els.trendMeta.textContent = sel.device_id + " · " + sel.source
+    els.trendMeta.textContent = sel.device_id + " · " + sourceLabel(sel.source)
       + " · " + WINDOW_LABEL[state.trendWindow] + " · " + items.length + " 条 · "
       + "温度区间 " + bandText(band, "temp") + " · 湿度区间 " + bandText(band, "humidity")
       + " · 数据源：" + sourceNote;
@@ -629,28 +816,44 @@
       };
     }
 
-    var tempDatasets = [lineDataset("温度 (°C)", temps, "y", "#0969da")];
-    var humDatasets = [lineDataset("湿度 (%RH)", hums, "y", "#2da44e")];
+    var tempDatasets = [lineDataset("温度 (°C)", temps, "y", "#176b87")];
+    var humDatasets = [lineDataset("湿度 (%RH)", hums, "y", "#159a70")];
     if (band) {
       if (band.temp_min !== null && band.temp_min !== undefined)
-        tempDatasets.push(limitLine("温度下限", band.temp_min, "y", "#d29922"));
+        tempDatasets.push(limitLine("温度下限", band.temp_min, "y", "#c47a16"));
       if (band.temp_max !== null && band.temp_max !== undefined)
-        tempDatasets.push(limitLine("温度上限", band.temp_max, "y", "#cf222e"));
+        tempDatasets.push(limitLine("温度上限", band.temp_max, "y", "#d34e59"));
       if (band.humidity_min !== null && band.humidity_min !== undefined)
-        humDatasets.push(limitLine("湿度下限", band.humidity_min, "y", "#d29922"));
+        humDatasets.push(limitLine("湿度下限", band.humidity_min, "y", "#c47a16"));
       if (band.humidity_max !== null && band.humidity_max !== undefined)
-        humDatasets.push(limitLine("湿度上限", band.humidity_max, "y", "#cf222e"));
+        humDatasets.push(limitLine("湿度上限", band.humidity_max, "y", "#d34e59"));
     }
 
     function baseOptions(yTitle) {
       return {
-        type: "line",
-        data: { labels: labels },
         maintainAspectRatio: false,
+        responsive: true,
         interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: {
+            labels: { color: "#6b7c8d", usePointStyle: true, boxWidth: 8, padding: 18 },
+          },
+          tooltip: {
+            backgroundColor: "#0a3547", titleColor: "#fff", bodyColor: "#e8f2f4",
+            borderColor: "#2a7180", borderWidth: 1, padding: 11, cornerRadius: 8,
+            displayColors: true,
+          },
+        },
         scales: {
-          x: { ticks: { maxTicksLimit: 10, maxRotation: 0 } },
-          y: { position: "left", title: { display: true, text: yTitle } },
+          x: {
+            grid: { color: "rgba(219,228,235,.72)" },
+            ticks: { color: "#7a8a98", maxTicksLimit: 10, maxRotation: 0 },
+          },
+          y: {
+            position: "left", title: { display: true, text: yTitle, color: "#6b7c8d" },
+            grid: { color: "rgba(219,228,235,.72)" },
+            ticks: { color: "#7a8a98" },
+          },
         },
       };
     }
@@ -662,18 +865,19 @@
       chartFallback(els.humChartBox, "窗口内暂无数据");
       return;
     }
-    var tempOptions = baseOptions("°C");
-    tempOptions.data.datasets = tempDatasets;
-    state.charts.temp = new Chart(
-      els.tempChartBox.querySelector("canvas"), tempOptions,
-    );
+    state.charts.temp = new Chart(els.tempChartBox.querySelector("canvas"), {
+      type: "line",
+      data: { labels: labels, datasets: tempDatasets },
+      options: baseOptions("°C"),
+    });
     var humOptions = baseOptions("%RH");
-    humOptions.data.datasets = humDatasets;
     humOptions.scales.y.min = 0;
     humOptions.scales.y.max = 100;
-    state.charts.hum = new Chart(
-      els.humChartBox.querySelector("canvas"), humOptions,
-    );
+    state.charts.hum = new Chart(els.humChartBox.querySelector("canvas"), {
+      type: "line",
+      data: { labels: labels, datasets: humDatasets },
+      options: humOptions,
+    });
   }
 
   // ---- Tab 3: 设备清单与事件时间线 ----
@@ -702,9 +906,10 @@
       var tr = document.createElement("tr");
       tr.className = "device-row";
       if (state.eventsFilter === item.device_id) tr.classList.add("selected");
-      function cell(text, cls) {
+      function cell(text, cls, title) {
         var td = document.createElement("td");
         if (cls) td.className = cls;
+        if (title) td.title = title;
         td.textContent = text === null || text === undefined || text === "" ? "—" : String(text);
         return td;
       }
@@ -712,7 +917,7 @@
       var humCls = "num " + (online ? readingState(item.humidity, band, "humidity") : "muted");
       tr.append(
         cell(item.device_id),
-        cell(item.source),
+        cell(sourceLabel(item.source), "", item.source),
         cell(online ? "在线" : "离线", online ? "ok" : "bad"),
         cell(item.temperature, tempCls),
         cell(item.humidity, humCls),
@@ -939,6 +1144,7 @@
       els.lastRefresh.textContent = "刷新于 "
         + new Date().toLocaleTimeString("zh-CN", { hour12: false });
       renderKpis();
+      syncDeviceFilters();
       renderCards();
       renderDeviceTable();
       renderTimeline();
@@ -965,10 +1171,20 @@
   }
 
   // ---- 事件绑定 ----
+  els.credentialsBtn.addEventListener("click", function () {
+    els.credentialsDialog.showModal();
+    els.apiKey.focus();
+  });
+  els.emptyCredentialsBtn.addEventListener("click", function () {
+    els.credentialsBtn.click();
+  });
+  els.credentialsClose.addEventListener("click", function () { els.credentialsDialog.close(); });
+  els.credentialsCancel.addEventListener("click", function () { els.credentialsDialog.close(); });
   els.saveKeyBtn.addEventListener("click", function () {
     state.key = els.apiKey.value.trim();
     if (state.key) sessionStorage.setItem(KEY_STORAGE, state.key);
     else sessionStorage.removeItem(KEY_STORAGE);
+    els.credentialsDialog.close();
     refresh();
   });
   els.apiKey.addEventListener("keydown", function (ev) {
@@ -977,6 +1193,18 @@
   els.refreshBtn.addEventListener("click", refresh);
   els.autoRefresh.addEventListener("change", function () {
     setAutoRefresh(els.autoRefresh.checked);
+  });
+  els.deviceSearch.addEventListener("input", function () {
+    state.deviceSearch = els.deviceSearch.value;
+    renderCards();
+  });
+  els.deviceStatusFilter.addEventListener("change", function () {
+    state.deviceStatusFilter = els.deviceStatusFilter.value;
+    renderCards();
+  });
+  els.deviceSourceFilter.addEventListener("change", function () {
+    state.deviceSourceFilter = els.deviceSourceFilter.value;
+    renderCards();
   });
   els.dialogCancel.addEventListener("click", function () { els.dialog.close(); });
   els.dialogSave.addEventListener("click", saveThreshold);
