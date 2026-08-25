@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -44,7 +44,12 @@ class AnalyticsRouteTests(unittest.TestCase):
 
     def _seed_data(self) -> None:
         timezone = ZoneInfo("Asia/Shanghai")
-        base = datetime(2026, 8, 18, 10, 0, tzinfo=timezone)
+        # Keep fixtures inside the default seven-day analytics window while
+        # avoiding future timestamps when the test runs before 10:00.
+        self.base = (datetime.now(timezone) - timedelta(days=1)).replace(
+            hour=10, minute=0, second=0, microsecond=0,
+        )
+        base = self.base
 
         def snapshot(device: str, minute: int, temperature, humidity,
                      online: str = "在线", temp_judgment: str = "正常"):
@@ -98,8 +103,7 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertTrue(all(item["device"] == "TH-01" for item in payload["items"]))
 
     def test_query_filters_by_time_range(self) -> None:
-        timezone = ZoneInfo("Asia/Shanghai")
-        start = int(datetime(2026, 8, 18, 10, 0, tzinfo=timezone).timestamp() * 1000)
+        start = int(self.base.timestamp() * 1000)
         end = start + 20 * 60_000  # covers the 10:00 and 10:10 buckets
 
         response = self.client.get(
@@ -139,8 +143,7 @@ class AnalyticsRouteTests(unittest.TestCase):
     def test_dashboard_datasets_share_unified_device_axis(self) -> None:
         # TH-03 has temperature but no humidity; TH-04 has humidity but no
         # temperature. Both series must stay aligned on one device axis.
-        timezone = ZoneInfo("Asia/Shanghai")
-        sample_time = datetime(2026, 8, 18, 10, 0, tzinfo=timezone)
+        sample_time = self.base
         db.save_history_snapshot("TH-03", sample_time, {
             "采集时间": int(sample_time.timestamp() * 1000),
             "当前温度": 23.0, "当前湿度": None, "在线状态": "在线",
@@ -151,7 +154,8 @@ class AnalyticsRouteTests(unittest.TestCase):
         })
 
         response = self.client.get(
-            f"/dashboard?key={'k' * 32}&days=7",
+            "/dashboard",
+            headers={"Authorization": f"Bearer {'k' * 32}"},
         )
         body = response.get_data(as_text=True)
         embedded = body.partition("const data = ")[2].partition(";\n")[0]
@@ -182,7 +186,7 @@ class AnalyticsRouteTests(unittest.TestCase):
         items = response.get_json()["items"]
         self.assertEqual(len(items), 1)
         row = items[0]
-        self.assertEqual(row["local_date"], "2026-08-18")
+        self.assertEqual(row["local_date"], self.base.strftime("%Y-%m-%d"))
         self.assertEqual(row["sample_count"], 3)
         self.assertAlmostEqual(row["avg_temperature"], 25.0)
         self.assertEqual(row["min_temperature"], 24.0)
@@ -192,9 +196,10 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertEqual(row["offline_count"], 1)
 
     def test_daily_stats_accepts_iso_time_params(self) -> None:
+        start = int(self.base.timestamp() * 1000)
+        end = start + 24 * 60 * 60_000
         response = self.client.get(
-            "/history/stats/daily"
-            "?start=2026-08-18T00:00:00%2B08:00&end=2026-08-19T00:00:00%2B08:00",
+            f"/history/stats/daily?start={start}&end={end}",
             headers=self.HEADERS,
         )
 
@@ -235,14 +240,17 @@ class AnalyticsRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
 
-    def test_dashboard_requires_key(self) -> None:
+    def test_dashboard_unauthenticated_returns_login_page(self) -> None:
         response = self.client.get("/dashboard")
 
         self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.mimetype, "text/html")
+        self.assertIn("看板登录", response.get_data(as_text=True))
 
-    def test_dashboard_renders_with_valid_key(self) -> None:
+    def test_dashboard_renders_with_bearer_key(self) -> None:
         response = self.client.get(
-            "/dashboard?key=" + "k" * 32 + "&days=7",
+            "/dashboard",
+            headers={"Authorization": f"Bearer {'k' * 32}"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -254,6 +262,48 @@ class AnalyticsRouteTests(unittest.TestCase):
         # Embedded JSON must have ``<`` escaped so it cannot close the
         # script tag early.
         self.assertNotIn("</script>\"}", body)
+
+    def test_dashboard_rejects_query_string_key(self) -> None:
+        # 密钥绝不允许进 URL：会泄漏到浏览器历史、书签与网关 access log。
+        response = self.client.get(f"/dashboard?key={'k' * 32}&days=7")
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_dashboard_login_flow(self) -> None:
+        # 错误密码：401 且不建立会话
+        response = self.client.post(
+            "/dashboard/login", data={"password": "wrong"},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("密钥错误", response.get_data(as_text=True))
+
+        # 正确密码：302 跳转看板，后续携带会话 Cookie 直接访问
+        response = self.client.post(
+            "/dashboard/login", data={"password": "k" * 32},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/dashboard")
+
+        response = self.client.get("/dashboard")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("本地分析看板", response.get_data(as_text=True))
+
+        # 已登录状态再打开登录页：直接跳转看板
+        response = self.client.get("/dashboard/login")
+        self.assertEqual(response.status_code, 302)
+
+    def test_dashboard_login_unconfigured_key_returns_503(self) -> None:
+        config.HISTORY_API_KEY = ""
+
+        self.assertEqual(self.client.get("/dashboard").status_code, 503)
+        self.assertEqual(
+            self.client.get("/dashboard/login").status_code, 503,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/dashboard/login", data={"password": "x"},
+            ).status_code, 503,
+        )
 
     def test_health_includes_sqlite_stats(self) -> None:
         response = self.client.get("/health")

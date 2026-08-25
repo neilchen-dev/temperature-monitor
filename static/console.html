@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>温湿度监控 · 工业监控台</title>
+<script src="/static/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px 24px;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f4f6f9; color: #24292f;
+  }
+  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 22px; margin: 0; }
+  .conn { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #57606a; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #8c959f; display: inline-block; flex: none; }
+  .dot.ok { background: #2da44e; } .dot.bad { background: #cf222e; } .dot.warn { background: #9a6700; }
+  .spacer { flex: 1; }
+  .last-refresh { font-size: 12px; color: #8c959f; }
+  label.toggle { font-size: 13px; color: #57606a; display: flex; align-items: center; gap: 4px; }
+  button {
+    font: inherit; font-size: 13px; padding: 5px 12px; cursor: pointer;
+    background: #f6f8fa; color: #24292f; border: 1px solid #d0d7de; border-radius: 6px;
+  }
+  button:hover { background: #eff2f5; }
+  button.primary { background: #0969da; border-color: #0969da; color: #fff; }
+  button.primary:hover { background: #0860c8; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  .card {
+    background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+    padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.05);
+  }
+  .keybar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .keybar input {
+    font: inherit; font-size: 13px; padding: 5px 10px; width: 320px; max-width: 100%;
+    border: 1px solid #d0d7de; border-radius: 6px;
+  }
+  .keybar .hint { font-size: 12px; color: #8c959f; }
+
+  nav.tabs { display: flex; gap: 4px; border-bottom: 1px solid #d0d7de; margin-bottom: 16px; }
+  .tab-btn {
+    border: none; background: none; border-radius: 6px 6px 0 0;
+    padding: 9px 18px; font-size: 14px; color: #57606a;
+  }
+  .tab-btn:hover { background: #eef1f4; }
+  .tab-btn.active {
+    color: #0969da; font-weight: 600;
+    border-bottom: 2px solid #0969da; margin-bottom: -1px;
+  }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* ---- Tab 1 实时监控 ---- */
+  .kpis { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 16px; }
+  .kpi { padding: 12px 16px; }
+  .kpi .label { font-size: 12px; color: #57606a; }
+  .kpi .value { font-size: 28px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .kpi .value.ok { color: #1a7f37; } .kpi .value.bad { color: #cf222e; } .kpi .value.warn { color: #9a6700; }
+  .kpi .extra { font-size: 12px; color: #8c959f; margin-top: 2px; }
+
+  .device-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .device-card {
+    border: 1px solid #d0d7de; border-left-width: 4px; border-radius: 8px;
+    padding: 10px 12px; cursor: pointer; background: #fff;
+  }
+  .device-card:hover { border-color: #0969da; }
+  .device-card.state-ok { border-left-color: #2da44e; }
+  .device-card.state-warn { border-left-color: #d29922; background: #fffbeb; }
+  .device-card.state-bad { border-left-color: #cf222e; background: #fff1f2; }
+  .device-head { display: flex; align-items: center; gap: 6px; }
+  .device-head .name { font-weight: 600; font-size: 14px; }
+  .badge {
+    font-size: 11px; padding: 1px 7px; border-radius: 10px;
+    background: #ddf4ff; color: #0969da; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 90px;
+  }
+  .device-head .set-btn { margin-left: auto; font-size: 12px; padding: 2px 8px; }
+  .readings { display: flex; gap: 18px; margin: 8px 0 4px; }
+  .reading .num { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .reading .unit { font-size: 12px; color: #57606a; margin-left: 2px; }
+  .reading .num.ok { color: #1a7f37; } .reading .num.warn { color: #9a6700; } .reading .num.na { color: #8c959f; }
+  .band { font-size: 12px; color: #57606a; }
+  .band.unset { color: #8c959f; }
+  .device-time { font-size: 11px; color: #8c959f; margin-top: 6px; }
+  .card-title { font-size: 15px; margin: 0 0 12px; color: #1f2328; font-weight: 600; }
+  .card-title .muted { font-weight: 400; font-size: 12px; color: #8c959f; }
+
+  /* ---- Tab 2 历史趋势 ---- */
+  .trend-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .trend-controls select {
+    font: inherit; font-size: 13px; padding: 5px 8px;
+    border: 1px solid #d0d7de; border-radius: 6px; background: #fff;
+  }
+  .seg { display: inline-flex; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 5px 14px; background: #fff; }
+  .seg button.active { background: #0969da; color: #fff; }
+  .trend-meta { font-size: 12px; color: #57606a; margin-bottom: 10px; min-height: 16px; }
+  .chart-box { position: relative; height: 260px; margin-bottom: 16px; }
+  .chart-fallback { height: 200px; }
+
+  /* ---- Tab 3 设备与事件 ---- */
+  .events-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+  @media (max-width: 1100px) { .events-layout { grid-template-columns: 1fr; } }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eaeef2; }
+  th { background: #f6f8fa; color: #57606a; font-weight: 600; white-space: nowrap; }
+  td.num { font-variant-numeric: tabular-nums; }
+  tbody tr.device-row { cursor: pointer; }
+  tbody tr.device-row:hover { background: #f6f8fa; }
+  tbody tr.device-row.selected { background: #ddf4ff; }
+  .ok { color: #1a7f37; } .warn { color: #9a6700; } .bad { color: #cf222e; }
+  .muted { color: #8c959f; }
+  .empty { color: #8c959f; padding: 24px; text-align: center; }
+
+  .filter-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #ddf4ff; color: #0969da; border-radius: 12px;
+    font-size: 12px; padding: 2px 10px; margin-left: 8px;
+  }
+  .filter-chip button { border: none; background: none; color: #0969da; font-size: 13px; padding: 0 2px; cursor: pointer; }
+
+  .timeline { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow: auto; }
+  .timeline li {
+    position: relative; padding: 8px 0 8px 20px; border-left: 2px solid #eaeef2;
+    margin-left: 8px; font-size: 13px;
+  }
+  .timeline li::before {
+    content: ""; position: absolute; left: -6px; top: 13px;
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #8c959f; border: 2px solid #fff;
+  }
+  .timeline li.ev-bad::before { background: #cf222e; }
+  .timeline li.ev-ok::before { background: #2da44e; }
+  .timeline li.ev-warn::before { background: #d29922; }
+  .timeline .t { color: #8c959f; font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
+  .timeline .dev { font-size: 11px; padding: 0 6px; border-radius: 10px; background: #f6f8fa; margin-left: 6px; color: #57606a; }
+
+  dialog {
+    border: 1px solid #d0d7de; border-radius: 8px; padding: 20px;
+    width: min(420px, 92vw); box-shadow: 0 8px 24px rgba(0,0,0,.12);
+  }
+  dialog::backdrop { background: rgba(31,35,40,.35); }
+  dialog h3 { margin: 0 0 4px; font-size: 16px; }
+  dialog .sub { font-size: 12px; color: #57606a; margin-bottom: 14px; }
+  .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #57606a; }
+  .field input {
+    font: inherit; padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px;
+  }
+  .dialog-error { color: #cf222e; font-size: 13px; min-height: 18px; margin-top: 10px; }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
+  footer { margin-top: 20px; color: #8c959f; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>温湿度监控 · 工业监控台</h1>
+  <div class="conn"><span class="dot" id="connDot"></span><span id="connText">未配置密钥</span></div>
+  <div class="spacer"></div>
+  <label class="toggle"><input type="checkbox" id="autoRefresh" checked>自动刷新（10 秒）</label>
+  <button id="refreshBtn">立即刷新</button>
+  <span class="last-refresh" id="lastRefresh"></span>
+</header>
+
+<section class="card keybar">
+  <input type="password" id="apiKey" placeholder="输入 HISTORY_API_KEY" autocomplete="off">
+  <button class="primary" id="saveKeyBtn">保存密钥</button>
+  <span class="hint">密钥仅保存在本页 sessionStorage，通过请求头发送，不会出现在 URL 或日志中</span>
+</section>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="monitor">实时监控</button>
+  <button class="tab-btn" data-tab="trend">历史趋势</button>
+  <button class="tab-btn" data-tab="events">设备与事件</button>
+</nav>
+
+<!-- Tab 1: 实时监控 -->
+<section class="tab-panel active" id="tab-monitor">
+  <div class="kpis">
+    <div class="card kpi"><div class="label">设备</div><div class="value" id="kpiTotal">—</div><div class="extra" id="kpiTotalExtra"></div></div>
+    <div class="card kpi"><div class="label">在线</div><div class="value ok" id="kpiOnline">—</div><div class="extra" id="kpiOnlineExtra"></div></div>
+    <div class="card kpi"><div class="label">离线</div><div class="value" id="kpiOffline">—</div><div class="extra">离线设备数</div></div>
+    <div class="card kpi"><div class="label">当前告警</div><div class="value" id="kpiAlert">—</div><div class="extra">超控制区间的在线设备</div></div>
+    <div class="card kpi"><div class="label">最后采集</div><div class="value" style="font-size:16px" id="kpiLastSample">—</div><div class="extra" id="kpiCollector"></div></div>
+  </div>
+  <div class="card">
+    <h2 class="card-title">设备总览 <span class="muted">· 点击卡片查看历史趋势，「设定」配置控制区间</span></h2>
+    <div class="device-grid" id="deviceGrid"><div class="empty">输入密钥后加载数据</div></div>
+  </div>
+</section>
+
+<!-- Tab 2: 历史趋势 -->
+<section class="tab-panel" id="tab-trend">
+  <div class="card">
+    <h2 class="card-title">温湿度历史趋势</h2>
+    <div class="trend-controls">
+      <label class="toggle" for="trendDevice">设备</label>
+      <select id="trendDevice"></select>
+      <div class="seg" id="trendWindowSeg">
+        <button data-window="24h">24 小时</button>
+        <button data-window="7d" class="active">7 天</button>
+        <button data-window="30d">30 天</button>
+      </div>
+    </div>
+    <div class="trend-meta" id="trendMeta">选择设备后加载趋势</div>
+    <div class="chart-box" id="tempChartBox"><canvas id="tempChart"></canvas></div>
+    <div class="chart-box" id="humChartBox"><canvas id="humChart"></canvas></div>
+  </div>
+</section>
+
+<!-- Tab 3: 设备与事件 -->
+<section class="tab-panel" id="tab-events">
+  <div class="events-layout">
+    <div class="card">
+      <h2 class="card-title">设备清单 <span class="muted">· 点击行查看该设备事件</span></h2>
+      <div id="deviceTableWrap"><div class="empty">暂无设备数据</div></div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">设备事件 <span id="eventsFilterChip"></span><span class="muted" id="eventsHint">· 最近 50 条状态迁移与告警</span></h2>
+      <ul class="timeline" id="eventTimeline"><li class="muted" style="border:none;padding-left:0">暂无事件</li></ul>
+    </div>
+  </div>
+</section>
+
+<footer id="footer">数据来自本地 SQLite 镜像（飞书多维表格仍为事实源） · 接口：<code>/api/devices</code> · <code>/api/events</code> · <code>/api/thresholds</code> · <code>/history/query</code> · <code>/api/system/status</code></footer>
+
+<dialog id="thresholdDialog">
+  <h3>设定控制区间</h3>
+  <div class="sub" id="dialogDevice"></div>
+  <div class="field-grid">
+    <label class="field">温度下限 (°C)<input type="number" step="0.1" id="tempMin"></label>
+    <label class="field">温度上限 (°C)<input type="number" step="0.1" id="tempMax"></label>
+    <label class="field">湿度下限 (%RH)<input type="number" step="0.1" id="humMin"></label>
+    <label class="field">湿度上限 (%RH)<input type="number" step="0.1" id="humMax"></label>
+  </div>
+  <div class="dialog-error" id="dialogError"></div>
+  <div class="dialog-actions">
+    <button id="dialogCancel">取消</button>
+    <button class="primary" id="dialogSave">保存</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+
+(function () {
+  var REFRESH_MS = 10000;
+  var KEY_STORAGE = "console_api_key";
+  var WINDOW_MS = { "24h": 86400000, "7d": 7 * 86400000, "30d": 30 * 86400000 };
+  var WINDOW_LABEL = { "24h": "24 小时", "7d": "7 天", "30d": "30 天" };
+
+  var state = {
+    key: sessionStorage.getItem(KEY_STORAGE) || "",
+    thresholds: {},       // device -> {temp_min, temp_max, humidity_min, humidity_max}
+    devices: [],          // /api/devices items（每个 设备×数据源 一项）
+    events: [],
+    activeTab: "monitor",
+    trendSelection: null, // {device_id, source}
+    trendWindow: "7d",
+    eventsFilter: null,   // device_id 或 null（全部）
+    charts: { temp: null, hum: null },
+    timer: null,
+    refreshing: false,
+  };
+
+  function $(id) { return document.getElementById(id); }
+
+  var els = {
+    connDot: $("connDot"), connText: $("connText"),
+    apiKey: $("apiKey"), saveKeyBtn: $("saveKeyBtn"),
+    autoRefresh: $("autoRefresh"), refreshBtn: $("refreshBtn"), lastRefresh: $("lastRefresh"),
+    kpiTotal: $("kpiTotal"), kpiTotalExtra: $("kpiTotalExtra"),
+    kpiOnline: $("kpiOnline"), kpiOnlineExtra: $("kpiOnlineExtra"),
+    kpiOffline: $("kpiOffline"), kpiAlert: $("kpiAlert"),
+    kpiLastSample: $("kpiLastSample"), kpiCollector: $("kpiCollector"),
+    deviceGrid: $("deviceGrid"),
+    trendDevice: $("trendDevice"), trendWindowSeg: $("trendWindowSeg"),
+    trendMeta: $("trendMeta"), tempChartBox: $("tempChartBox"), humChartBox: $("humChartBox"),
+    deviceTableWrap: $("deviceTableWrap"), eventTimeline: $("eventTimeline"),
+    eventsFilterChip: $("eventsFilterChip"), eventsHint: $("eventsHint"),
+    footer: $("footer"),
+    dialog: $("thresholdDialog"), dialogDevice: $("dialogDevice"),
+    tempMin: $("tempMin"), tempMax: $("tempMax"), humMin: $("humMin"), humMax: $("humMax"),
+    dialogError: $("dialogError"), dialogCancel: $("dialogCancel"), dialogSave: $("dialogSave"),
+  };
+
+  function setConn(kind, text) {
+    els.connDot.className = "dot" + (kind ? " " + kind : "");
+    els.connText.textContent = text;
+  }
+
+  function apiGet(path) {
+    var headers = {};
+    if (state.key) headers["X-History-Key"] = state.key;
+    return fetch(path, { headers: headers }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { status: res.status, ok: res.ok, data: data };
+      });
+    });
+  }
+
+  function apiPut(path, body) {
+    return fetch(path, {
+      method: "PUT",
+      headers: { "X-History-Key": state.key, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { status: res.status, ok: res.ok, data: data };
+      });
+    });
+  }
+
+  // ---- 判定与格式化 ----
+  function bandOf(device) { return state.thresholds[device] || null; }
+
+  function breach(value, low, high) {
+    if (value === null || value === undefined) return false;
+    if (low !== null && low !== undefined && value < low) return true;
+    if (high !== null && high !== undefined && value > high) return true;
+    return false;
+  }
+
+  function readingState(value, band, kind) {
+    if (value === null || value === undefined) return "na";
+    if (band && breach(value, band[kind + "_min"], band[kind + "_max"])) return "warn";
+    return "ok";
+  }
+
+  // 卡片状态：红=离线，黄=在线但超限，绿=正常（未设区间按正常展示并提示未设置）
+  function cardState(item, band) {
+    if (item.status !== "online") return "bad";
+    if (!band) return "ok";
+    if (breach(item.temperature, band.temp_min, band.temp_max)
+        || breach(item.humidity, band.humidity_min, band.humidity_max)) return "warn";
+    return "ok";
+  }
+
+  function fmtValue(value, unit) {
+    if (value === null || value === undefined) return "—";
+    return String(value) + unit;
+  }
+
+  function bandText(band, kind) {
+    if (!band) return "未设置";
+    var low = band[kind + "_min"], high = band[kind + "_max"];
+    if (low === null && high === null) return "未设置";
+    return (low === null ? "−∞" : String(low))
+      + " ~ " + (high === null ? "+∞" : String(high));
+  }
+
+  // ISO 时间 "2026-08-23T23:40:21+08:00" -> "08-23 23:40:21"
+  function fmtShort(iso) {
+    if (!iso) return "—";
+    return String(iso).slice(5, 19).replace("T", " ");
+  }
+
+  // ---- Tab 切换 ----
+  function switchTab(tabId) {
+    state.activeTab = tabId;
+    document.querySelectorAll(".tab-btn").forEach(function (btn) {
+      btn.classList.toggle("active", btn.dataset.tab === tabId);
+    });
+    document.querySelectorAll(".tab-panel").forEach(function (panel) {
+      panel.classList.toggle("active", panel.id === "tab-" + tabId);
+    });
+    if (tabId === "trend") {
+      ensureTrendSelection();
+      loadTrend();
+      // 隐藏容器中初始化的图表尺寸为 0，切回时强制重算
+      if (state.charts.temp) state.charts.temp.resize();
+      if (state.charts.hum) state.charts.hum.resize();
+    }
+  }
+
+  document.querySelectorAll(".tab-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () { switchTab(btn.dataset.tab); });
+  });
+
+  // ---- Tab 1: KPI 与设备卡片 ----
+  function renderKpis() {
+    var items = state.devices;
+    var deviceIds = {};
+    items.forEach(function (it) { deviceIds[it.device_id] = true; });
+    var online = 0, offline = 0, alerts = 0;
+    items.forEach(function (it) {
+      var band = bandOf(it.device_id);
+      if (it.status === "online") online++; else offline++;
+      if (band && it.status === "online"
+          && (breach(it.temperature, band.temp_min, band.temp_max)
+              || breach(it.humidity, band.humidity_min, band.humidity_max))) alerts++;
+    });
+    els.kpiTotal.textContent = String(items.length);
+    els.kpiTotalExtra.textContent = Object.keys(deviceIds).length + " 台设备";
+    els.kpiOnline.textContent = String(online);
+    els.kpiOnlineExtra.textContent = "在线设备身份";
+    els.kpiOffline.textContent = String(offline);
+    els.kpiOffline.className = "value" + (offline ? " bad" : " ok");
+    els.kpiAlert.textContent = String(alerts);
+    els.kpiAlert.className = "value" + (alerts ? " warn" : " ok");
+  }
+
+  function deviceCard(item) {
+    var band = bandOf(item.device_id);
+    var stateCls = cardState(item, band);
+    var online = item.status === "online";
+
+    var card = document.createElement("div");
+    card.className = "device-card state-" + stateCls;
+
+    var head = document.createElement("div");
+    head.className = "device-head";
+    var dot = document.createElement("span");
+    dot.className = "dot " + (online ? "ok" : "bad");
+    dot.title = online ? "在线" : "离线";
+    var name = document.createElement("span");
+    name.className = "name";
+    name.textContent = item.device_id;
+    var badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = item.source;
+    var setBtn = document.createElement("button");
+    setBtn.className = "set-btn";
+    setBtn.type = "button";
+    setBtn.textContent = "设定";
+    setBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      openThresholdDialog(item.device_id);
+    });
+    head.append(dot, name, badge, setBtn);
+
+    var readings = document.createElement("div");
+    readings.className = "readings";
+    function reading(valueText, unit, label, cls) {
+      var wrap = document.createElement("div");
+      wrap.className = "reading";
+      var num = document.createElement("div");
+      num.className = "num " + cls;
+      num.textContent = valueText;
+      var unitSpan = document.createElement("span");
+      unitSpan.className = "unit";
+      unitSpan.textContent = unit;
+      num.appendChild(unitSpan);
+      var sub = document.createElement("div");
+      sub.className = "unit";
+      sub.textContent = label;
+      wrap.append(num, sub);
+      return wrap;
+    }
+    readings.append(
+      reading(fmtValue(item.temperature, ""), "°C", "温度",
+        online ? readingState(item.temperature, band, "temp") : "na"),
+      reading(fmtValue(item.humidity, ""), "%RH", "湿度",
+        online ? readingState(item.humidity, band, "humidity") : "na"),
+    );
+
+    var bandLine = document.createElement("div");
+    bandLine.className = "band" + (band ? "" : " unset");
+    var tempBand = document.createElement("span");
+    tempBand.textContent = "温度 " + bandText(band, "temp") + " · ";
+    var humBand = document.createElement("span");
+    humBand.textContent = "湿度 " + bandText(band, "humidity");
+    bandLine.append(tempBand, humBand);
+
+    var time = document.createElement("div");
+    time.className = "device-time";
+    time.textContent = (online ? "在线" : "离线") + " · 更新 " + fmtShort(item.last_sample_time);
+
+    card.append(head, readings, bandLine, time);
+    card.addEventListener("click", function () {
+      // 点卡片跳趋势页：自然串联两个 Tab
+      state.trendSelection = { device_id: item.device_id, source: item.source };
+      syncTrendControls();
+      switchTab("trend");
+    });
+    return card;
+  }
+
+  function renderCards() {
+    els.deviceGrid.textContent = "";
+    if (!state.devices.length) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "暂无设备数据";
+      els.deviceGrid.appendChild(empty);
+      return;
+    }
+    state.devices.forEach(function (item) {
+      els.deviceGrid.appendChild(deviceCard(item));
+    });
+  }
+
+  // ---- Tab 2: 历史趋势 ----
+  function trendIdentityValue(sel) { return sel.device_id + "|" + sel.source; }
+
+  function ensureTrendSelection() {
+    if (state.trendSelection) {
+      var stillThere = state.devices.some(function (it) {
+        return it.device_id === state.trendSelection.device_id
+          && it.source === state.trendSelection.source;
+      });
+      if (stillThere) { syncTrendControls(); return; }
+    }
+    state.trendSelection = state.devices.length
+      ? { device_id: state.devices[0].device_id, source: state.devices[0].source }
+      : null;
+    syncTrendControls();
+  }
+
+  function syncTrendControls() {
+    // 重建设备下拉，保留当前选择
+    els.trendDevice.textContent = "";
+    state.devices.forEach(function (it) {
+      var option = document.createElement("option");
+      option.value = trendIdentityValue(it);
+      option.textContent = it.device_id + " · " + it.source;
+      els.trendDevice.appendChild(option);
+    });
+    if (state.trendSelection) {
+      els.trendDevice.value = trendIdentityValue(state.trendSelection);
+    }
+    document.querySelectorAll("#trendWindowSeg button").forEach(function (btn) {
+      btn.classList.toggle("active", btn.dataset.window === state.trendWindow);
+    });
+  }
+
+  els.trendDevice.addEventListener("change", function () {
+    var parts = els.trendDevice.value.split("|");
+    state.trendSelection = { device_id: parts[0], source: parts.slice(1).join("|") };
+    loadTrend();
+  });
+
+  document.querySelectorAll("#trendWindowSeg button").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      state.trendWindow = btn.dataset.window;
+      syncTrendControls();
+      loadTrend();
+    });
+  });
+
+  function chartFallback(box, text) {
+    box.textContent = "";
+    var empty = document.createElement("div");
+    empty.className = "empty chart-fallback";
+    empty.textContent = text;
+    box.appendChild(empty);
+  }
+
+  function loadTrend() {
+    if (!state.trendSelection) {
+      els.trendMeta.textContent = "暂无设备，无法加载趋势";
+      chartFallback(els.tempChartBox, "无数据");
+      chartFallback(els.humChartBox, "无数据");
+      return;
+    }
+    var sel = state.trendSelection;
+    var end = Date.now();
+    var start = end - WINDOW_MS[state.trendWindow];
+    els.trendMeta.textContent = "加载中…";
+
+    // 主数据源：飞书业务快照（10 分钟粒度，TH 设备全覆盖，支持 30 天窗口）
+    var snapUrl = "/history/query?device=" + encodeURIComponent(sel.device_id)
+      + "&start=" + start + "&end=" + end + "&limit=10000";
+    apiGet(snapUrl).then(function (res) {
+      if (res.ok && res.data.count > 0) {
+        renderTrend(res.data.items, "业务快照（10 分钟粒度）");
+        return;
+      }
+      // 回退：本地实时采集样本（覆盖 Modbus 等无快照设备，最多 1000 条）
+      var sampleUrl = "/api/devices/" + encodeURIComponent(sel.device_id)
+        + "?source=" + encodeURIComponent(sel.source) + "&limit=1000";
+      apiGet(sampleUrl).then(function (sampleRes) {
+        if (!sampleRes.ok) {
+          els.trendMeta.textContent = "趋势加载失败："
+            + (sampleRes.data.error || ("HTTP " + sampleRes.status));
+          return;
+        }
+        var inWindow = [];
+        var samples = sampleRes.data.samples || [];
+        for (var i = 0; i < samples.length; i++) {
+          if (samples[i].sample_time_ms < start) break;  // 按时间倒序，越界即停
+          inWindow.push(samples[i]);
+        }
+        renderTrend(inWindow.reverse(), "实时采集样本（最多 1000 条）");
+      });
+    }).catch(function () {
+      els.trendMeta.textContent = "趋势加载失败：网络错误";
+    });
+  }
+
+  function renderTrend(items, sourceNote) {
+    var sel = state.trendSelection;
+    if (!sel) return;
+    var band = bandOf(sel.device_id);
+    items.sort(function (a, b) { return (a.sample_time_ms || 0) - (b.sample_time_ms || 0); });
+
+    els.trendMeta.textContent = sel.device_id + " · " + sel.source
+      + " · " + WINDOW_LABEL[state.trendWindow] + " · " + items.length + " 条 · "
+      + "温度区间 " + bandText(band, "temp") + " · 湿度区间 " + bandText(band, "humidity")
+      + " · 数据源：" + sourceNote;
+
+    if (typeof Chart === "undefined") {
+      chartFallback(els.tempChartBox, "图表脚本加载失败，无法绘制温度趋势");
+      chartFallback(els.humChartBox, "图表脚本加载失败，无法绘制湿度趋势");
+      return;
+    }
+    var labels = items.map(function (s) { return fmtShort(s.sample_time_iso); });
+    var temps = items.map(function (s) { return s.temperature; });
+    var hums = items.map(function (s) { return s.humidity; });
+
+    function lineDataset(label, data, axis, color) {
+      return {
+        label: label, data: data, yAxisID: axis,
+        borderColor: color, backgroundColor: color,
+        pointRadius: 0, borderWidth: 2, tension: 0.2, spanGaps: true,
+      };
+    }
+    function limitLine(label, value, axis, color) {
+      return {
+        label: label + " (" + value + ")",
+        data: labels.map(function () { return value; }),
+        yAxisID: axis, borderColor: color, backgroundColor: color,
+        borderDash: [6, 4], borderWidth: 1.5, pointRadius: 0,
+      };
+    }
+
+    var tempDatasets = [lineDataset("温度 (°C)", temps, "y", "#0969da")];
+    var humDatasets = [lineDataset("湿度 (%RH)", hums, "y", "#2da44e")];
+    if (band) {
+      if (band.temp_min !== null && band.temp_min !== undefined)
+        tempDatasets.push(limitLine("温度下限", band.temp_min, "y", "#d29922"));
+      if (band.temp_max !== null && band.temp_max !== undefined)
+        tempDatasets.push(limitLine("温度上限", band.temp_max, "y", "#cf222e"));
+      if (band.humidity_min !== null && band.humidity_min !== undefined)
+        humDatasets.push(limitLine("湿度下限", band.humidity_min, "y", "#d29922"));
+      if (band.humidity_max !== null && band.humidity_max !== undefined)
+        humDatasets.push(limitLine("湿度上限", band.humidity_max, "y", "#cf222e"));
+    }
+
+    function baseOptions(yTitle) {
+      return {
+        type: "line",
+        data: { labels: labels },
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        scales: {
+          x: { ticks: { maxTicksLimit: 10, maxRotation: 0 } },
+          y: { position: "left", title: { display: true, text: yTitle } },
+        },
+      };
+    }
+
+    if (state.charts.temp) { state.charts.temp.destroy(); state.charts.temp = null; }
+    if (state.charts.hum) { state.charts.hum.destroy(); state.charts.hum = null; }
+    if (!items.length) {
+      chartFallback(els.tempChartBox, "窗口内暂无数据");
+      chartFallback(els.humChartBox, "窗口内暂无数据");
+      return;
+    }
+    var tempOptions = baseOptions("°C");
+    tempOptions.data.datasets = tempDatasets;
+    state.charts.temp = new Chart(
+      els.tempChartBox.querySelector("canvas"), tempOptions,
+    );
+    var humOptions = baseOptions("%RH");
+    humOptions.data.datasets = humDatasets;
+    humOptions.scales.y.min = 0;
+    humOptions.scales.y.max = 100;
+    state.charts.hum = new Chart(
+      els.humChartBox.querySelector("canvas"), humOptions,
+    );
+  }
+
+  // ---- Tab 3: 设备清单与事件时间线 ----
+  function renderDeviceTable() {
+    els.deviceTableWrap.textContent = "";
+    if (!state.devices.length) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "暂无设备数据";
+      els.deviceTableWrap.appendChild(empty);
+      return;
+    }
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    ["设备", "来源", "状态", "温度 (°C)", "湿度 (%RH)", "最后上报"].forEach(function (title) {
+      var th = document.createElement("th");
+      th.textContent = title;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    var tbody = document.createElement("tbody");
+    state.devices.forEach(function (item) {
+      var band = bandOf(item.device_id);
+      var online = item.status === "online";
+      var tr = document.createElement("tr");
+      tr.className = "device-row";
+      if (state.eventsFilter === item.device_id) tr.classList.add("selected");
+      function cell(text, cls) {
+        var td = document.createElement("td");
+        if (cls) td.className = cls;
+        td.textContent = text === null || text === undefined || text === "" ? "—" : String(text);
+        return td;
+      }
+      var tempCls = "num " + (online ? readingState(item.temperature, band, "temp") : "muted");
+      var humCls = "num " + (online ? readingState(item.humidity, band, "humidity") : "muted");
+      tr.append(
+        cell(item.device_id),
+        cell(item.source),
+        cell(online ? "在线" : "离线", online ? "ok" : "bad"),
+        cell(item.temperature, tempCls),
+        cell(item.humidity, humCls),
+        cell(fmtShort(item.last_sample_time), "num"),
+      );
+      tr.addEventListener("click", function () {
+        state.eventsFilter = (state.eventsFilter === item.device_id) ? null : item.device_id;
+        renderDeviceTable();
+        renderTimeline();
+      });
+      tbody.appendChild(tr);
+    });
+    table.append(thead, tbody);
+    els.deviceTableWrap.appendChild(table);
+  }
+
+  // 事件的可读化描述：把 device_events 的状态迁移翻译成用户语言
+  function describeEvent(ev) {
+    var value = (ev.value !== null && ev.value !== undefined)
+      ? "（" + ev.value + "°C）" : "";
+    if (ev.event_type === "temperature_alert") {
+      if (ev.new_state === "TEMPERATURE_HIGH") return "温度超过阈值" + value;
+      if (ev.new_state === "NORMAL") return "温度恢复正常" + value;
+    }
+    if (ev.event_type === "status_change") {
+      if (ev.new_state === "OFFLINE") return "设备离线";
+      if (ev.new_state === "ONLINE") return "设备恢复在线";
+    }
+    return ev.message || ev.event_type;
+  }
+
+  function eventLevel(ev) {
+    if (ev.new_state === "TEMPERATURE_HIGH" || ev.new_state === "OFFLINE") return "ev-bad";
+    if (ev.new_state === "NORMAL" || ev.new_state === "ONLINE") return "ev-ok";
+    return "ev-warn";
+  }
+
+  function renderTimeline() {
+    els.eventTimeline.textContent = "";
+    if (state.eventsFilter) {
+      els.eventsFilterChip.textContent = "";
+      var chip = document.createElement("span");
+      chip.className = "filter-chip";
+      var label = document.createElement("span");
+      label.textContent = "筛选：" + state.eventsFilter;
+      var clear = document.createElement("button");
+      clear.type = "button";
+      clear.textContent = "✕";
+      clear.title = "清除筛选";
+      clear.addEventListener("click", function () {
+        state.eventsFilter = null;
+        renderDeviceTable();
+        renderTimeline();
+      });
+      chip.append(label, clear);
+      els.eventsFilterChip.appendChild(chip);
+    } else {
+      els.eventsFilterChip.textContent = "";
+    }
+
+    var items = state.eventsFilter
+      ? state.events.filter(function (ev) { return ev.device_id === state.eventsFilter; })
+      : state.events;
+    if (!items.length) {
+      var li = document.createElement("li");
+      li.className = "muted";
+      li.style.border = "none";
+      li.style.paddingLeft = "0";
+      li.textContent = state.eventsFilter
+        ? "该设备窗口内暂无事件" : "暂无事件";
+      els.eventTimeline.appendChild(li);
+      return;
+    }
+    items.forEach(function (ev) {
+      var li = document.createElement("li");
+      li.className = eventLevel(ev);
+      li.title = ev.message || "";
+      var time = document.createElement("span");
+      time.className = "t";
+      time.textContent = fmtShort(ev.created_at);
+      var text = document.createElement("span");
+      text.textContent = describeEvent(ev);
+      li.append(time, text);
+      if (!state.eventsFilter) {
+        var dev = document.createElement("span");
+        dev.className = "dev";
+        dev.textContent = ev.device_id;
+        li.appendChild(dev);
+      }
+      els.eventTimeline.appendChild(li);
+    });
+  }
+
+  // ---- 阈值弹窗 ----
+  function toInputValue(v) { return v === null || v === undefined ? "" : String(v); }
+
+  function openThresholdDialog(deviceId) {
+    var band = bandOf(deviceId);
+    els.dialogDevice.textContent = "设备 " + deviceId
+      + " · 留空表示不限制该边界 · 范围：温度 [-50, 100]°C，湿度 [0, 100]%RH";
+    els.tempMin.value = toInputValue(band && band.temp_min);
+    els.tempMax.value = toInputValue(band && band.temp_max);
+    els.humMin.value = toInputValue(band && band.humidity_min);
+    els.humMax.value = toInputValue(band && band.humidity_max);
+    els.dialogError.textContent = "";
+    els.dialog.dataset.device = deviceId;
+    els.dialog.showModal();
+  }
+
+  function parseBoundInput(input, low, high, name) {
+    var text = input.value.trim();
+    if (text === "") return { value: null };
+    var num = Number(text);
+    if (!isFinite(num)) return { error: name + "不是有效数字" };
+    if (num < low || num > high) return { error: name + "超出范围 [" + low + ", " + high + "]" };
+    return { value: num };
+  }
+
+  function saveThreshold() {
+    var deviceId = els.dialog.dataset.device;
+    var tempMin = parseBoundInput(els.tempMin, -50, 100, "温度下限");
+    if (tempMin.error) { els.dialogError.textContent = tempMin.error; return; }
+    var tempMax = parseBoundInput(els.tempMax, -50, 100, "温度上限");
+    if (tempMax.error) { els.dialogError.textContent = tempMax.error; return; }
+    var humMin = parseBoundInput(els.humMin, 0, 100, "湿度下限");
+    if (humMin.error) { els.dialogError.textContent = humMin.error; return; }
+    var humMax = parseBoundInput(els.humMax, 0, 100, "湿度上限");
+    if (humMax.error) { els.dialogError.textContent = humMax.error; return; }
+    if (tempMin.value !== null && tempMax.value !== null && tempMin.value >= tempMax.value) {
+      els.dialogError.textContent = "温度下限必须小于上限";
+      return;
+    }
+    if (humMin.value !== null && humMax.value !== null && humMin.value >= humMax.value) {
+      els.dialogError.textContent = "湿度下限必须小于上限";
+      return;
+    }
+
+    els.dialogSave.disabled = true;
+    apiPut("/api/thresholds/" + encodeURIComponent(deviceId), {
+      temp_min: tempMin.value,
+      temp_max: tempMax.value,
+      humidity_min: humMin.value,
+      humidity_max: humMax.value,
+    }).then(function (res) {
+      els.dialogSave.disabled = false;
+      if (res.status === 401) { els.dialogError.textContent = "鉴权失败：请检查密钥"; return; }
+      if (!res.ok) {
+        els.dialogError.textContent = res.data.error || ("保存失败：HTTP " + res.status);
+        return;
+      }
+      els.dialog.close();
+      refresh();
+    }).catch(function () {
+      els.dialogSave.disabled = false;
+      els.dialogError.textContent = "保存失败：网络错误";
+    });
+  }
+
+  // ---- 系统状态（免鉴权） ----
+  function loadSystemStatus() {
+    apiGet("/api/system/status").then(function (res) {
+      if (!res.ok) return;
+      var data = res.data || {};
+      if (data.last_sample_time_ms) {
+        els.kpiLastSample.textContent = new Date(data.last_sample_time_ms)
+          .toLocaleString("zh-CN", { hour12: false });
+      } else {
+        els.kpiLastSample.textContent = "—";
+      }
+      var modbus = data.collectors && data.collectors.modbus;
+      if (modbus && modbus.enabled) {
+        els.kpiCollector.textContent = "Modbus 采集："
+          + (modbus.running ? "运行中" : "已停止")
+          + (modbus.last_error_summary ? " · 最近有错误" : "");
+      } else {
+        els.kpiCollector.textContent = "";
+      }
+      var sqlite = data.sqlite || {};
+      if (sqlite.enabled === false) {
+        els.footer.textContent = "注意：SQLite 本地镜像未启用，数据接口不可用";
+      }
+    }).catch(function () { /* 系统状态失败不阻塞主流程 */ });
+  }
+
+  // ---- 刷新 ----
+  function authFailure() {
+    setConn("bad", "鉴权失败：请检查密钥");
+    els.apiKey.focus();
+  }
+
+  function refresh() {
+    loadSystemStatus();
+    if (!state.key) {
+      setConn("", "未配置密钥");
+      return;
+    }
+    if (state.refreshing) return;
+    state.refreshing = true;
+    Promise.all([
+      apiGet("/api/devices"),
+      apiGet("/api/events?limit=50"),
+      apiGet("/api/thresholds"),
+    ]).then(function (results) {
+      state.refreshing = false;
+      var devicesRes = results[0], eventsRes = results[1], thresholdsRes = results[2];
+      if (devicesRes.status === 401 || eventsRes.status === 401
+          || thresholdsRes.status === 401) {
+        authFailure();
+        return;
+      }
+      if (!devicesRes.ok) {
+        setConn("warn", "服务不可用（密钥未配置或本地镜像禁用）");
+        return;
+      }
+      state.devices = devicesRes.data.items || [];
+      state.events = eventsRes.ok ? (eventsRes.data.items || []) : [];
+      state.thresholds = {};
+      if (thresholdsRes.ok) {
+        (thresholdsRes.data.items || []).forEach(function (t) {
+          state.thresholds[t.device] = t;
+        });
+      }
+      setConn("ok", "已连接");
+      els.lastRefresh.textContent = "刷新于 "
+        + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      renderKpis();
+      renderCards();
+      renderDeviceTable();
+      renderTimeline();
+      if (state.activeTab === "trend") {
+        ensureTrendSelection();
+        loadTrend();
+      }
+      if (state.eventsFilter && !state.devices.some(function (it) {
+        return it.device_id === state.eventsFilter;
+      })) {
+        state.eventsFilter = null;
+        renderDeviceTable();
+        renderTimeline();
+      }
+    }).catch(function () {
+      state.refreshing = false;
+      setConn("warn", "网络错误：无法访问服务");
+    });
+  }
+
+  function setAutoRefresh(enabled) {
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    if (enabled) state.timer = setInterval(refresh, REFRESH_MS);
+  }
+
+  // ---- 事件绑定 ----
+  els.saveKeyBtn.addEventListener("click", function () {
+    state.key = els.apiKey.value.trim();
+    if (state.key) sessionStorage.setItem(KEY_STORAGE, state.key);
+    else sessionStorage.removeItem(KEY_STORAGE);
+    refresh();
+  });
+  els.apiKey.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") els.saveKeyBtn.click();
+  });
+  els.refreshBtn.addEventListener("click", refresh);
+  els.autoRefresh.addEventListener("change", function () {
+    setAutoRefresh(els.autoRefresh.checked);
+  });
+  els.dialogCancel.addEventListener("click", function () { els.dialog.close(); });
+  els.dialogSave.addEventListener("click", saveThreshold);
+
+  // ---- 启动 ----
+  if (state.key) els.apiKey.value = state.key;
+  setAutoRefresh(true);
+  refresh();
+})();
+</script>
+</body>
+</html>

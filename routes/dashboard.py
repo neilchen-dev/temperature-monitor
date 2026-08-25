@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 from datetime import datetime, timedelta
@@ -7,7 +8,15 @@ from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from flask import Blueprint, Response, request
+from flask import (
+    Blueprint,
+    Response,
+    current_app,
+    redirect,
+    request,
+    send_from_directory,
+    session,
+)
 
 import config
 from services import db
@@ -121,24 +130,121 @@ if (typeof Chart === 'undefined') {
 """
 
 
-def _auth_error():
-    if not config.HISTORY_API_KEY:
-        return "未配置 HISTORY_API_KEY，看板不可用", 503
+def dashboard_session_secret() -> str:
+    """Signing secret for browser sessions, derived from HISTORY_API_KEY.
 
-    # The dashboard is rendered server-side, so browsers pass the key in the
-    # query string (keep the URL private). Authorization: Bearer is also
-    # accepted for programmatic access where headers are available.
+    Deterministic so a restart keeps logged-in browsers logged in; rotating
+    the key invalidates every session at once.
+    """
+    material = f"dashboard-session:{config.HISTORY_API_KEY}"
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+_LOGIN_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>温湿度监控 · 看板登录</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; padding: 24px;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f4f6f9; color: #24292f;
+  }
+  .card {
+    background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+    padding: 32px; width: min(360px, 92vw);
+    box-shadow: 0 1px 2px rgba(0,0,0,.05);
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #57606a; font-size: 13px; margin-bottom: 20px; }
+  .error { color: #cf222e; font-size: 13px; min-height: 18px; margin-bottom: 8px; }
+  input {
+    font: inherit; font-size: 14px; width: 100%; padding: 8px 10px;
+    border: 1px solid #d0d7de; border-radius: 6px; margin-bottom: 12px;
+  }
+  button {
+    font: inherit; font-size: 14px; width: 100%; padding: 8px 0; cursor: pointer;
+    background: #0969da; color: #fff; border: 1px solid #0969da; border-radius: 6px;
+  }
+  .hint { color: #8c959f; font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>温湿度监控 · 看板登录</h1>
+  <div class="sub">输入 HISTORY_API_KEY 登录后访问分析看板</div>
+  <div class="error">__ERROR__</div>
+  <form method="post" action="/dashboard/login">
+    <input type="password" name="password" placeholder="HISTORY_API_KEY"
+           autocomplete="current-password" autofocus>
+    <button type="submit">登录</button>
+  </form>
+  <div class="hint">密钥只用于本次登录校验，以签名 Cookie 保存会话，不会出现在 URL 中</div>
+</div>
+</body>
+</html>
+"""
+
+
+def _render_login(error_text: str = "", status: int = 200) -> Response:
+    html = _LOGIN_PAGE_TEMPLATE.replace("__ERROR__", escape(error_text))
+    return Response(html, status=status, mimetype="text/html")
+
+
+def _service_unavailable() -> Response:
+    return Response(
+        "未配置 HISTORY_API_KEY，看板不可用", status=503, mimetype="text/plain",
+    )
+
+
+def _dashboard_auth_response() -> Response | None:
+    """None when authorized, else the login page (401) / 503 response.
+
+    Accepted credentials: a logged-in session cookie (browser) or
+    ``Authorization: Bearer`` (programmatic access). Query-string keys are
+    deliberately NOT accepted — they leak into browser history, bookmarks,
+    and gateway access logs.
+    """
+    if not config.HISTORY_API_KEY:
+        return _service_unavailable()
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         provided_key = auth_header[len("Bearer "):].strip()
-    else:
-        provided_key = request.args.get("key", "")
-    if not provided_key or not hmac.compare_digest(
-        provided_key,
-        config.HISTORY_API_KEY,
-    ):
-        return "鉴权失败：请通过 ?key=<HISTORY_API_KEY> 访问", 401
-    return None
+        if hmac.compare_digest(provided_key, config.HISTORY_API_KEY):
+            return None
+    if session.get("dashboard_ok") is True:
+        return None
+    return _render_login(
+        error_text="请先登录", status=401,
+    )
+
+
+@dashboard_bp.get("/dashboard/login")
+def dashboard_login_page():
+    if not config.HISTORY_API_KEY:
+        return _service_unavailable()
+    if session.get("dashboard_ok") is True:
+        return redirect("/dashboard")
+    return _render_login()
+
+
+@dashboard_bp.post("/dashboard/login")
+def dashboard_login_submit():
+    if not config.HISTORY_API_KEY:
+        return _service_unavailable()
+    password = request.form.get("password", "")
+    # Compare against the configured key with a timing-safe check; the key
+    # doubles as the dashboard password so no extra secret is needed.
+    if not password or not hmac.compare_digest(password, config.HISTORY_API_KEY):
+        return _render_login(error_text="密钥错误", status=401)
+    session.clear()
+    session["dashboard_ok"] = True
+    return redirect("/dashboard")
 
 
 def _render_device_table(devices: list[dict[str, Any]]) -> str:
@@ -171,12 +277,23 @@ def _render_device_table(devices: list[dict[str, Any]]) -> str:
     )
 
 
+@dashboard_bp.get("/console")
+def console():
+    """Serve the SPA shell; it embeds no data, so no key is needed here.
+
+    Every data request the page makes still goes through the X-History-Key
+    authenticated JSON APIs — the shell is as public as /health.
+    """
+    return send_from_directory(
+        current_app.static_folder, "console.html", mimetype="text/html",
+    )
+
+
 @dashboard_bp.get("/dashboard")
 def dashboard():
-    error = _auth_error()
+    error = _dashboard_auth_response()
     if error:
-        message, status_code = error
-        return Response(message, status=status_code, mimetype="text/plain")
+        return error
     if not db.is_enabled():
         return Response(
             "SQLite 本地镜像未启用或初始化失败",

@@ -9,7 +9,7 @@ from waitress import serve
 import config
 from routes.analytics import analytics_bp
 from routes.api import api_bp
-from routes.dashboard import dashboard_bp
+from routes.dashboard import dashboard_bp, dashboard_session_secret
 from routes.history import history_bp
 from routes.temperature import temperature_bp
 from services import collector, db
@@ -47,6 +47,10 @@ def create_app() -> Flask:
     db.init_db()
     flask_app = Flask(__name__)
     flask_app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
+    # 看板登录会话的签名密钥：从 HISTORY_API_KEY 派生，重启不掉线，换钥匙全员下线。
+    flask_app.secret_key = dashboard_session_secret()
+    flask_app.config["SESSION_COOKIE_HTTPONLY"] = True
+    flask_app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     flask_app.register_blueprint(temperature_bp)
     flask_app.register_blueprint(history_bp)
     flask_app.register_blueprint(analytics_bp)

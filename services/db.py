@@ -21,6 +21,10 @@ Design notes / semantics:
 - ``device_events`` stores state *transitions* only (online/offline,
   temperature threshold crossing); repeated polls in a steady state never
   insert rows.
+- ``device_thresholds`` is the only *authoritative local* table (not a
+  Feishu mirror): per-device control bands for the console. Because losing
+  a write here loses user config, ``save_device_threshold`` reports failure
+  instead of swallowing it like the mirror writers do.
 - Concurrency assumes a single process / single instance (Waitress threads
   guarded by one lock). Multi-process or multi-container deployment would
   need WAL-friendly coordination beyond the current scope.
@@ -100,6 +104,15 @@ CREATE INDEX IF NOT EXISTS idx_device_events_device_id_created
     ON device_events(device_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_device_events_created_at
     ON device_events(created_at);
+
+CREATE TABLE IF NOT EXISTS device_thresholds (
+    device TEXT PRIMARY KEY,
+    temp_min REAL,
+    temp_max REAL,
+    humidity_min REAL,
+    humidity_max REAL,
+    updated_at TEXT NOT NULL
+);
 """
 
 # 加性列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列。
@@ -749,3 +762,68 @@ def fetch_device_summary() -> dict[str, Any]:
     except sqlite3.Error:
         logger.exception("SQLite 查询设备汇总失败")
         return {"device_count": 0, "identity_count": 0, "last_sample_time_ms": None}
+
+
+def save_device_threshold(
+    device: str,
+    temp_min: float | None,
+    temp_max: float | None,
+    humidity_min: float | None,
+    humidity_max: float | None,
+) -> bool:
+    """Full-replace one device's control band; True only when persisted.
+
+    Unlike the mirror writers above, thresholds are authoritative local
+    config — a silently dropped write would make the console show a band
+    the database no longer holds, so the caller must see the failure.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return False
+
+    try:
+        with _lock:
+            connection.execute(
+                "INSERT OR REPLACE INTO device_thresholds ("
+                " device, temp_min, temp_max, humidity_min, humidity_max,"
+                " updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    device,
+                    temp_min,
+                    temp_max,
+                    humidity_min,
+                    humidity_max,
+                    _now_text(),
+                ),
+            )
+            connection.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception("SQLite 写入设备阈值失败 | device=%s", device)
+        return False
+
+
+def fetch_device_thresholds(device: str | None = None) -> list[dict[str, Any]]:
+    """All control bands ordered by device, or just one device's band."""
+    connection = _get_connection()
+    if connection is None:
+        return []
+
+    query = (
+        "SELECT device, temp_min, temp_max, humidity_min, humidity_max,"
+        " updated_at FROM device_thresholds"
+    )
+    params: list[Any] = []
+    if device:
+        query += " WHERE device = ?"
+        params.append(device)
+    query += " ORDER BY device"
+
+    try:
+        with _lock:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备阈值失败 | device=%s", device)
+        return []

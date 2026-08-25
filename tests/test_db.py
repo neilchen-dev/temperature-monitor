@@ -222,6 +222,45 @@ class SqliteMirrorTests(unittest.TestCase):
         # 补列前就存在的旧行 source 为 NULL，数据未丢
         self.assertIsNone(by_device["PLC-01"]["source"])
 
+    def test_device_threshold_round_trip_and_replace(self) -> None:
+        saved = db.save_device_threshold(
+            "TH-01", 18.0, 26.0, 40.0, 60.0,
+        )
+        self.assertTrue(saved)
+
+        items = db.fetch_device_thresholds()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["device"], "TH-01")
+        self.assertEqual(items[0]["temp_min"], 18.0)
+        self.assertEqual(items[0]["temp_max"], 26.0)
+        self.assertEqual(items[0]["humidity_min"], 40.0)
+        self.assertEqual(items[0]["humidity_max"], 60.0)
+        self.assertIsNotNone(items[0]["updated_at"])
+
+        # 全量替换语义：第二次保存覆盖第一次，不追加行
+        saved = db.save_device_threshold(
+            "TH-01", 20.0, None, None, 70.0,
+        )
+        self.assertTrue(saved)
+        items = db.fetch_device_thresholds()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["temp_min"], 20.0)
+        self.assertIsNone(items[0]["temp_max"])
+        self.assertIsNone(items[0]["humidity_min"])
+        self.assertEqual(items[0]["humidity_max"], 70.0)
+
+    def test_fetch_device_thresholds_filters_by_device(self) -> None:
+        db.save_device_threshold("TH-01", 18.0, 26.0, None, None)
+        db.save_device_threshold("PLC-01", 10.0, 50.0, None, None)
+
+        all_items = db.fetch_device_thresholds()
+        self.assertEqual({row["device"] for row in all_items}, {"TH-01", "PLC-01"})
+
+        one = db.fetch_device_thresholds("TH-01")
+        self.assertEqual([row["device"] for row in one], ["TH-01"])
+
+        self.assertEqual(db.fetch_device_thresholds("TH-99"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
