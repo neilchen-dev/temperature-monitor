@@ -22,8 +22,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com
-  IMAGE_NAME: noef-temperature/temperature-monitor
+  # Configure these as GitHub Actions repository variables. Values are intentionally
+  # not stored in the public repository.
+  REGISTRY: ${{ vars.CONTAINER_REGISTRY }}
+  IMAGE_NAME: ${{ vars.CONTAINER_IMAGE_NAME }}
 
 jobs:
   build:
@@ -50,12 +52,12 @@ jobs:
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
 
-      - name: Login to Aliyun ACR
+      - name: Login to container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -85,15 +87,15 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
           REGISTRY: ${{ env.REGISTRY }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          envs: IMAGE_TAG,ACR_USERNAME,ACR_PASSWORD,REGISTRY,DEPLOY_PATH
+          envs: IMAGE_TAG,REGISTRY_USERNAME,REGISTRY_PASSWORD,REGISTRY,DEPLOY_PATH
 
           script: |
             set -euo pipefail
@@ -138,8 +140,8 @@ jobs:
             OLD_TAG=$(grep -E '^IMAGE_TAG=' .env | tail -n 1 | cut -d= -f2 | tr -d '\r' || true)
             echo "Previous image: ${OLD_IMAGE:-none}"
 
-            echo "${ACR_PASSWORD}" | docker login "${REGISTRY}" \
-              --username "${ACR_USERNAME}" \
+            echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" \
+              --username "${REGISTRY_USERNAME}" \
               --password-stdin
 
             rollback() {

@@ -15,7 +15,9 @@ watchdog: http://[HOST]:[PORT:5000]/health
 # Modbus RTU（USB-RS485）串口访问：uart: true 会自动映射宿主机的
 # 全部 UART/串口设备，无需再逐个声明 devices。
 uart: true
-image: crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor
+# No registry-specific image is bundled here. Home Assistant builds this add-on
+# from the repository Dockerfile, so the public repository contains no private
+# registry address.
 options:
   app_id: ""
   app_secret: ""
@@ -29,7 +31,7 @@ options:
   history_cleanup_enabled: false
   history_retention_days: 90
   history_cleanup_hour: 2
-  history_table_map: '{"TH-01":"tbldiElwYsCb4gcE","TH-02":"tbljWQNUpGW9t3bm","TH-03":"tbla7CSkhXuskiER","TH-04":"tblttlcPgae1yTem","TH-05":"tblQcJG7xt0bRPlK","TH-06":"tblii2ZnHQ9kMN9P","TH-07":"tblaDZTIHvZUh2nf","TH-08":"tblY4lIhNbhcaOOS","TH-09":"tblE88Cb1hGL7Eno","TH-10":"tblA9G55kbjbA5wz","TH-11":"tblWCWdsNxh12dOc"}'
+  history_table_map: ""
   device_record_map: ""
   device_id_field: 设备编号
   device_name_map: ""

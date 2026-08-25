@@ -6,6 +6,12 @@
 
 > 本仓库中的设备编号、区域名称、业务表单和展示数据均已脱敏或使用 Demo 数据。生产环境中的客户、人员、内部区域与平台凭据不包含在公开仓库中。
 
+## 公开仓库安全说明
+
+- `.env`、Home Assistant `secrets.yaml`、私钥文件和运行数据均已加入 `.gitignore`；请把真实凭据放在本地密钥管理系统或部署平台的 Secrets 中。
+- `.env.example`、Add-on 配置和截图只保留占位符或 Demo 数据；`HISTORY_TABLE_MAP`、`DEVICE_RECORD_MAP` 等字段必须在部署时填写自己的资源 ID。
+- 如果旧版本曾经提交过真实密钥、表 ID、record ID 或私有仓库信息，仅修改当前文件不会清除 Git 历史。请立即撤销/轮换相关凭据；需要彻底清理公开历史时，再单独执行经过备份和审核的历史重写。
+
 ## 项目亮点
 
 - **IoT 数据接入**：Home Assistant 读取 Xiaomi Home 温湿度传感器状态，变化时自动上报。
@@ -49,7 +55,7 @@ main push     ──> tests.yml（自动测试）
                     ▼
                deploy.yml（workflow_run 触发）
                     ├── 构建 Docker 镜像（commit SHA + latest 双标签）
-                    ├── 推送阿里云 ACR
+                    ├── 推送到配置的容器镜像仓库
                     ▼
                SSH 登录生产服务器
                     ├── 同步 compose.yaml
@@ -63,7 +69,7 @@ main push     ──> tests.yml（自动测试）
 
 服务器上的 `data/`（SQLite 数据）、`logs/`（日志）与 `.env`（飞书等业务凭据）在部署过程中始终保留，部署脚本不会执行 `docker compose down -v`、`git clean -fdx` 或任何删除数据的操作。
 
-CD 依赖以下 GitHub Repository Secrets（只存名称于仓库文档，实际值配置在 GitHub Settings → Secrets and variables → Actions，绝不提交到 Git）：
+CD 依赖以下 GitHub Actions Secrets 和 Variables（只存名称于仓库文档，实际值配置在 GitHub Settings → Secrets and variables → Actions，绝不提交到 Git）：
 
 | Secret | 说明 |
 |---|---|
@@ -71,8 +77,15 @@ CD 依赖以下 GitHub Repository Secrets（只存名称于仓库文档，实际
 | `SERVER_USER` | SSH 登录用户（例如 `root`） |
 | `SERVER_SSH_KEY` | 专用于部署的 SSH 私钥（OpenSSH 格式） |
 | `DEPLOY_PATH` | 服务器部署目录（例如 `/root/temperature-monitor`，内含 `compose.yaml`、`.env`、`data/`、`logs/`） |
-| `ACR_USERNAME` | 阿里云容器镜像仓库用户名 |
-| `ACR_PASSWORD` | 阿里云容器镜像仓库密码 |
+| `REGISTRY_USERNAME` | 容器镜像仓库用户名 |
+| `REGISTRY_PASSWORD` | 容器镜像仓库密码 |
+
+另外配置以下 **Repository variables**，用于指定镜像仓库；具体地址不写入公开仓库：
+
+| Variable | 说明 |
+|---|---|
+| `CONTAINER_REGISTRY` | 镜像仓库域名，例如 `ghcr.io` 或企业私有仓库域名 |
+| `CONTAINER_IMAGE_NAME` | 镜像路径，例如 `your-org/temperature-monitor` |
 
 镜像标签策略：每次 main 分支提交同时推送 `<commit SHA>` 与 `latest` 两个标签；生产部署始终使用精确 SHA 标签（写入服务器 `.env` 的 `IMAGE_TAG`），具备可追踪、可回滚、可审计的能力。正式发版时可额外推送 `1.2.x` 之类的版本号标签。
 
@@ -80,7 +93,7 @@ CD 依赖以下 GitHub Repository Secrets（只存名称于仓库文档，实际
 
 部署者只需准备 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）和自己的飞书应用凭据。项目不包含任何真实凭据。
 
-1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID` 和随机生成的 `HISTORY_API_KEY`。如需保护温度上报接口，同时设置 `TEMPERATURE_API_KEY`（见下方环境变量表）。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
+1. 克隆仓库后，将 [`.env.example`](.env.example) 复制为 `.env`；先把 `IMAGE_REPOSITORY` 改成你自己的镜像地址，再填写 `APP_ID`、`APP_SECRET`、`APP_TOKEN`、`TABLE_ID` 和随机生成的 `HISTORY_API_KEY`。如需保护温度上报接口，同时设置 `TEMPERATURE_API_KEY`（见下方环境变量表）。程序默认按飞书表的“设备编号”字段自动识别 `record_id`。
 2. Windows 用户双击或在 PowerShell 中运行：
 
    ```powershell
@@ -108,11 +121,7 @@ Home Assistant Container 不使用 Add-on 内部主机名。`rest_command` 中�
 
 ## 可选：Home Assistant Add-on
 
-仅适用于 **Home Assistant OS / Supervised**；Home Assistant Container 用户可忽略本节。已配置为使用阿里云容器镜像：
-
-```text
-crpi-7apex3hoo0i4alz2.cn-hongkong.personal.cr.aliyuncs.com/noef-temperature/temperature-monitor:1.2.1
-```
+仅适用于 **Home Assistant OS / Supervised**；Home Assistant Container 用户可忽略本节。Add-on 默认根据仓库内的 Dockerfile 本地构建，不绑定任何私有镜像仓库。
 
 1. 在 Home Assistant 中打开 **设置 → Add-ons → Add-on Store → 右上角菜单 → Repositories**。
 2. 添加仓库：`https://github.com/neilchen-dev/temperature-monitor`。
@@ -207,7 +216,7 @@ docker compose pull
 docker compose up -d --remove-orphans --wait --wait-timeout 120
 ```
 
-Compose 默认直接拉取已发布的 ACR `latest` 镜像，无需在本地构建；服务器自动部署时会显式使用 `IMAGE_TAG=<commit SHA>`。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
+Compose 默认从 `.env` 中的 `IMAGE_REPOSITORY` 拉取 `latest` 镜像，无需在本地构建；服务器自动部署时会显式使用 `IMAGE_TAG=<commit SHA>`。更新容器建议执行 `docker compose pull` 后再执行 `docker compose up -d --remove-orphans --wait --wait-timeout 120`。CSV 历史与日志分别持久化到本地 `data/` 和 `logs/` 目录。停止服务请执行 `docker compose down`。凭据只能保存在 `.env` 或密钥管理服务中，切勿提交该文件。
 
 容器以非 root 用户（uid/gid 1000）运行：自动部署脚本会在启动前将宿主 `data/`、`logs/` 的属主修正为 1000；手动部署时若目录已存在且属主不是 1000，请先执行 `sudo chown -R 1000:1000 data logs`，否则容器内无法写入 SQLite 与日志。Compose 已为容器 stdout 配置 `json-file` 日志轮转（10MB × 3 个文件），应用自身文件日志另有独立的轮转配置。
 
@@ -217,6 +226,8 @@ Compose 默认直接拉取已发布的 ACR `latest` 镜像，无需在本地构�
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
+| `IMAGE_REPOSITORY` | Compose 部署时是 | `your-registry.example.com/your-namespace/temperature-monitor` | Docker 镜像完整仓库路径；请替换为自己的公开或私有仓库 |
+| `IMAGE_TAG` | 否 | `latest` | Docker 镜像标签；生产部署使用 commit SHA |
 | `APP_ID` | 是 | — | 飞书应用 ID |
 | `APP_SECRET` | 是 | — | 飞书应用密钥 |
 | `APP_TOKEN` | 是 | — | 飞书多维表格 App Token |
@@ -386,4 +397,4 @@ rest_command:
 
 若未传 `status`，后端会按在线处理。默认 `SOURCE_TEMPERATURE_UNIT=C`；如果上游发送华氏温度，请将它设置为 `F`。
 
-历史采样接口读取实时总表中的区域、温湿度、在线状态、温湿度判定、工艺、综合判定、作业状态和警报状态，再分别写入 11 张历史表。同一十分钟时间桶重复调用会被跳过。第一阶段 `HISTORY_CLEANUP_ENABLED=false` 时会在任何过期记录筛选或删除 API 调用之前直接短路；观察稳定 24～48 小时并人工确认后，才能修改配置并重启服务启用清理。
+历史采样接口读取实时总表中的区域、温湿度、在线状态、温湿度判定、工艺、综合判定、作业状态和警报状态，再按 `HISTORY_TABLE_MAP` 写入对应历史表。同一十分钟时间桶重复调用会被跳过。第一阶段 `HISTORY_CLEANUP_ENABLED=false` 时会在任何过期记录筛选或删除 API 调用之前直接短路；观察稳定 24～48 小时并人工确认后，才能修改配置并重启服务启用清理。
