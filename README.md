@@ -121,12 +121,14 @@ Home Assistant Container 不使用 Add-on 内部主机名。`rest_command` 中�
 
 ## 可选：Home Assistant Add-on
 
-仅适用于 **Home Assistant OS / Supervised**；Home Assistant Container 用户可忽略本节。Add-on 默认根据仓库内的 Dockerfile 本地构建，不绑定任何私有镜像仓库。
+仅适用于 **Home Assistant OS / Supervised**；Home Assistant Container 用户可忽略本节。Add-on 使用公开的 GitHub Container Registry 镜像 `ghcr.io/neilchen-dev/temperature-monitor`，版本标签与 [`hassio/temperature-monitor/config.yaml`](hassio/temperature-monitor/config.yaml) 中的 `version` 一致。测试通过后，`.github/workflows/publish-addon.yml` 会自动发布对应版本和 `latest` 标签；生产 Compose 仍使用独立配置的镜像仓库。
 
 1. 在 Home Assistant 中打开 **设置 → Add-ons → Add-on Store → 右上角菜单 → Repositories**。
 2. 添加仓库：`https://github.com/neilchen-dev/temperature-monitor`。
 3. 在 Add-on Store 选择 **Temperature Monitor**，点击 **Install**。
 4. 在 Add-on 的 **Configuration** 页面填写飞书凭据和至少 32 字节的 `history_api_key`；默认使用 `device_id_field`（`设备编号`）自动识别每台设备的 `record_id`，点击 **Save** 后 **Start**。
+
+首次发布后，请在 GitHub Packages 中确认 `temperature-monitor` 容器包为 **Public**；否则 Home Assistant 无法在未登录的情况下拉取镜像。后续每次版本更新都需要先修改 Add-on 的 `version` 并提交，发布 workflow 才会生成对应版本标签。
 
 如设备字段名称不是“设备编号”，将 `device_id_field` 改为你的字段名。如果 Home Assistant 上报的设备名与飞书表中的设备编号不同，使用 `device_name_map` 做名称映射，例如：
 

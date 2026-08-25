@@ -2,7 +2,7 @@ name: Build and Deploy
 
 # CI -> CD 架构：
 #   tests.yml 在 main 分支 push 后运行测试；
-#   测试成功后由 workflow_run 触发本 workflow 完成构建、推送 ACR 和生产部署。
+#   测试成功后由 workflow_run 触发本 workflow 完成镜像构建、推送和生产部署。
 #   PR 只跑测试（tests.yml），永远不会触发本 workflow 的部署。
 
 on:

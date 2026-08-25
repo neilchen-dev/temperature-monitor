@@ -1,5 +1,5 @@
 name: Temperature Monitor
-version: 1.2.1
+version: 1.2.2
 slug: temperature_monitor
 description: Receive Home Assistant temperature and humidity readings and sync them to Feishu Bitable.
 url: https://github.com/neilchen-dev/temperature-monitor
@@ -15,9 +15,9 @@ watchdog: http://[HOST]:[PORT:5000]/health
 # Modbus RTU（USB-RS485）串口访问：uart: true 会自动映射宿主机的
 # 全部 UART/串口设备，无需再逐个声明 devices。
 uart: true
-# No registry-specific image is bundled here. Home Assistant builds this add-on
-# from the repository Dockerfile, so the public repository contains no private
-# registry address.
+# Public release image. The publish workflow creates the version tag from this
+# file after the Tests workflow succeeds.
+image: ghcr.io/neilchen-dev/temperature-monitor
 options:
   app_id: ""
   app_secret: ""

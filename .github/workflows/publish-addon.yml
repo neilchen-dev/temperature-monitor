@@ -1,0 +1,68 @@
+name: Publish Home Assistant App
+
+# Build the same tested application image used by the Home Assistant App.
+# The production deployment workflow publishes to the separately configured
+# registry; this workflow publishes only the public GHCR release image.
+
+on:
+  workflow_run:
+    workflows:
+      - Tests
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-home-assistant-app
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Read Home Assistant App version
+        id: meta
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version:[[:space:]]*//p' hassio/temperature-monitor/config.yaml | head -n 1 | tr -d '[:space:]')"
+          if [ -z "${VERSION}" ]; then
+            echo "Unable to read hassio/temperature-monitor/config.yaml version" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Home Assistant App image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          provenance: false
+          sbom: false

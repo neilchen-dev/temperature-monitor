@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2
+
+- 修复 Home Assistant Add-on 无法本地构建的问题：改用 GitHub Container Registry 的公开版本镜像。
+- 新增 GHCR 发布 workflow；生产 Compose 镜像仓库仍保持独立配置。
+
 ## Unreleased
 
 IIoT 数据采集（Modbus TCP / RTU）：
