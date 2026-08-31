@@ -4,6 +4,10 @@
 
 面向生产现场环境监控场景的轻量级数字化项目：通过 **Home Assistant + Python/Flask + REST API + 飞书多维表格**，将温湿度传感器数据、设备在线状态、现场作业登记、环境点检与异常记录串成一套可追溯的监测流程。
 
+这是一个适合展示 **Python 后端、物联网数据接入、企业系统集成与可靠性工程** 能力的端到端项目。当前仓库已经从单一数据上报服务演进为包含领域模型、持久化状态、可恢复任务调度、Shadow Runtime 和自动部署回滚的工程化系统。
+
+> 当前里程碑：**Shadow Runtime v1 ready for field trial**。Shadow 模式用于现场试运行与结果比对，默认不执行 Active 自动化接管；本仓库不虚构生产吞吐量、节省成本或告警准确率等未经验证的指标。
+
 > 本仓库中的设备编号、区域名称、业务表单和展示数据均已脱敏或使用 Demo 数据。生产环境中的客户、人员、内部区域与平台凭据不包含在公开仓库中。
 
 ## 公开仓库安全说明
@@ -12,16 +16,74 @@
 - `.env.example`、Add-on 配置和截图只保留占位符或 Demo 数据；`HISTORY_TABLE_MAP`、`DEVICE_RECORD_MAP` 等字段必须在部署时填写自己的资源 ID。
 - 如果旧版本曾经提交过真实密钥、表 ID、record ID 或私有仓库信息，仅修改当前文件不会清除 Git 历史。请立即撤销/轮换相关凭据；需要彻底清理公开历史时，再单独执行经过备份和审核的历史重写。
 
+## 求职视角项目概览
+
+| 维度 | 项目体现 |
+| --- | --- |
+| 业务场景 | 生产现场温湿度、设备在线状态、环境标准、受控作业与异常事件的闭环监控 |
+| 技术栈 | Python 3.12、Flask、SQLite、Home Assistant、飞书多维表格 API、Docker、GitHub Actions、pymodbus |
+| 架构能力 | Domain / Application / Repository / Integration 分层，外部数据先适配和标准化，再进入领域判定 |
+| 可靠性能力 | 幂等写入、状态机、完整快照校验、持久化任务与运行审计、重试、健康检查和失败回滚 |
+| 安全边界 | 凭据仅从环境变量/Secrets 读取；Shadow 默认关闭设备白名单，Active 模式由启动装配层明确拒绝 |
+| 当前交付状态 | 已具备 Shadow 试运行能力；仍需由 Linux CI 完成全量测试门禁后再评估生产切换 |
+
+### 可直接用于简历的项目描述
+
+- 负责设计并实现生产现场环境监控平台，将 Home Assistant、温湿度传感器、Modbus 设备、飞书多维表格和 Flask API 接入统一数据链路。
+- 按 Domain / Application / Repository / Integration 分层重构业务逻辑，抽象设备上下文、环境标准、作业状态、报警状态机和事件模型，降低外部平台字段变化对核心规则的影响。
+- 实现持久化 Shadow Runtime：同步飞书只读数据、构建标准完整快照、执行设备级环境判定，并将任务、运行结果、操作意图和审计记录写入 SQLite，支持重启恢复与幂等处理。
+- 建立安全的自动化演进边界：`AUTOMATION_MODE=disabled` 默认关闭，`shadow` 仅做观察和比对，`active` 由 bootstrap 明确拒绝；`SHADOW_DEVICE_IDS` 为空时不处理任何设备，避免部署后误触发全量自动化。
+- 建立 GitHub Actions + Docker 部署链路，使用 commit SHA 固定镜像版本，执行 `/health` 健康检查并在启动失败时回滚；通过 Ruff、pytest 和定向领域测试形成质量门禁。
+
+### 面试可展开的工程问题
+
+| 问题 | 项目中的设计回答 |
+| --- | --- |
+| 如何避免新自动化影响现有业务？ | Shadow 只读接入外部业务数据，Active 模式被 bootstrap 拒绝，并通过设备白名单逐步放量。 |
+| 如何保证重复同步不会制造脏数据？ | 任务与运行记录持久化，事件采用幂等 active 状态，历史快照按时间桶去重，标准数据先完整校验再替换。 |
+| 外部平台不可用时怎么办？ | 适配器隔离网络访问，保留本地状态与运行审计，HTTP 层具备超时/重试，部署层使用精确镜像和失败回滚。 |
+| 如何证明部署的是哪一版？ | 镜像同时使用 commit SHA 与 `latest` 标签，生产部署写入精确 `IMAGE_TAG`，并通过 CI 的测试结果触发部署。 |
+
 ## 项目亮点
 
 - **IoT 数据接入**：Home Assistant 读取 Xiaomi Home 温湿度传感器状态，变化时自动上报。
 - **后端服务**：Flask 提供 `POST /temperature` 接口，负责设备校验、单位转换与在线状态处理。
 - **业务系统集成**：通过飞书开放 API 写入多维表格，实现现场数据实时更新与留痕。
+- **领域化业务模型**：将设备、环境标准、作业登记、异常事件和报警迁移抽象为可测试的领域对象与应用服务。
+- **持久化 Shadow Runtime**：通过只读飞书适配器、标准解析、监控引擎、报警状态机和持久化任务调度器组成长期运行链路。
+- **可恢复与可审计**：任务、运行结果、事件状态和最新观察结果写入 SQLite；重复任务、重启恢复和部分失败均有明确处理边界。
 - **状态判定**：支持由 Home Assistant 明确上报的在线/离线状态；离线上报不会覆盖最后一次有效温湿度。
 - **Web HMI 监控台**：`/console` 三页签工业监控台（本地 Chart.js，无构建步骤）——实时监控（KPI + 三色状态设备卡片）、历史趋势（24h/7天/30天 + 控制区间上下限）、设备与事件（状态迁移翻译为用户可读时间线），支持**设备级温湿度控制区间设定**（`/api/thresholds`，阈值存本地 SQLite，超限自动高亮）。
 - **定时历史快照**：Home Assistant 每十分钟调用一次 `POST /history/sample`，后端将实时总表的 11 台设备完整快照分别写入历史表，并按采集时间去重。
 - **现场闭环**：多维表格 Demo 中包含监测记录、异常事件、作业登记、区域/点检等业务对象，并通过 Dashboard 汇总关键状态。
-- **工程化运行**：Token 缓存与刷新、429/5xx/超时重试、CSV 历史记录、轮转日志、Waitress 与 Docker 部署。
+- **工程化运行**：Token 缓存与刷新、429/5xx/超时重试、CSV/SQLite 本地镜像、轮转日志、Waitress、Docker 与 CI/CD 部署。
+
+## Shadow Runtime v1
+
+Shadow Runtime 是当前项目最适合作为工程能力展示的增量模块。它在不改变现有 Home Assistant → Flask → 飞书主链路的前提下，读取飞书中的环境标准、受控作业、设备观察与异常事件，形成一条可持久化、可恢复、可审计的本地判定链路。
+
+```text
+飞书只读数据
+  ├── 环境标准 / 受控作业 / 设备观察 / 异常事件
+  ▼
+只读适配器与字段标准化
+  ▼
+SQLite 当前状态、标准快照、任务与运行审计
+  ▼
+标准解析 → 监控引擎 → 报警状态机 → Shadow 比对
+  ▼
+持久化调度器 / 健康状态 / 本地 API
+```
+
+关键安全与运行边界：
+
+- `AUTOMATION_MODE` 默认是 `disabled`；当前 bootstrap 只允许 Shadow 试运行，显式设置 `active` 会被拒绝。
+- `SHADOW_DEVICE_IDS` 默认为空；只有明确加入白名单的设备才会进入 Shadow 处理范围。
+- Shadow 使用飞书只读适配器，不会自动关闭、修改或提交飞书中的 17 条既有工作流。
+- 标准同步采用“完整读取、完整校验、再替换当前快照”的策略，避免半份配置覆盖有效标准。
+- 任务、运行、事件和最新观察状态落盘，服务重启后可以继续处理；重复执行通过唯一键和状态检查保持幂等。
+
+当前范围是 **Shadow 观察与比对**，不是生产 Active 接管版本。是否切换 Active 需要在 Linux CI 全量测试通过、现场数据验证完成并经过独立发布审核后再决定。
 
 ## 业务 Demo
 
@@ -59,6 +121,7 @@ main push     ──> tests.yml（自动测试）
                     ▼
                SSH 登录生产服务器
                     ├── 同步 compose.yaml
+                    ├── 根据仓库 Variables 更新 .env 中的 IMAGE_REPOSITORY
                     ├── 更新 .env 中的 IMAGE_TAG（保留其余配置）
                     ├── docker compose pull / up -d --wait
                     ▼
@@ -77,8 +140,8 @@ CD 依赖以下 GitHub Actions Secrets 和 Variables（只存名称于仓库文�
 | `SERVER_USER` | SSH 登录用户（例如 `root`） |
 | `SERVER_SSH_KEY` | 专用于部署的 SSH 私钥（OpenSSH 格式） |
 | `DEPLOY_PATH` | 服务器部署目录（例如 `/root/temperature-monitor`，内含 `compose.yaml`、`.env`、`data/`、`logs/`） |
-| `REGISTRY_USERNAME` | 容器镜像仓库用户名 |
-| `REGISTRY_PASSWORD` | 容器镜像仓库密码 |
+| `ACR_USERNAME` | ACR 容器镜像仓库用户名 |
+| `ACR_PASSWORD` | ACR 容器镜像仓库密码 |
 
 另外配置以下 **Repository variables**，用于指定镜像仓库；具体地址不写入公开仓库：
 
@@ -87,7 +150,9 @@ CD 依赖以下 GitHub Actions Secrets 和 Variables（只存名称于仓库文�
 | `CONTAINER_REGISTRY` | 镜像仓库域名，例如 `ghcr.io` 或企业私有仓库域名 |
 | `CONTAINER_IMAGE_NAME` | 镜像路径，例如 `your-org/temperature-monitor` |
 
-镜像标签策略：每次 main 分支提交同时推送 `<commit SHA>` 与 `latest` 两个标签；生产部署始终使用精确 SHA 标签（写入服务器 `.env` 的 `IMAGE_TAG`），具备可追踪、可回滚、可审计的能力。正式发版时可额外推送 `1.2.x` 之类的版本号标签。
+镜像标签策略：每次 main 分支提交同时推送 `<commit SHA>` 与 `latest` 两个标签；生产部署始终使用精确 SHA 标签（写入服务器 `.env` 的 `IMAGE_TAG`），具备可追踪、可回滚、可审计的能力。部署脚本会将 `CONTAINER_REGISTRY` 与 `CONTAINER_IMAGE_NAME` 组合为 `IMAGE_REPOSITORY`，再执行 Compose 拉取，避免服务器继续使用示例镜像地址。正式发版时可额外推送 `1.2.x` 之类的版本号标签。
+
+测试工作流在部署前执行 `ruff check .` 和 `python -m pytest`；只有 `Tests` 工作流成功后的 `main` 提交才会进入镜像构建与部署流程。当前 Shadow Runtime 仍建议先以试运行提交和 field trial 里程碑管理，不直接等同于 Active 生产接管版本。
 
 ## Docker Compose 部署（Home Assistant Container）
 
@@ -176,6 +241,12 @@ flowchart TD
 ```text
 homeassistant/       Home Assistant REST 命令与自动化示例
 hassio/              Home Assistant Add-on 清单与说明
+domain/              设备、标准、作业、事件、监控引擎与报警状态机
+application/         用例编排、标准/作业同步、Shadow 比对与动作审计
+integrations/        飞书只读适配器与外部记录标准化
+repositories/        SQLite 数据访问、任务/运行/事件/标准状态持久化
+runtime/             Shadow Runtime 依赖装配、启动安全校验与生命周期
+scheduler/           可恢复的本地持久化任务调度器
 routes/              HTTP 路由与响应处理
 services/            校验、飞书通信、令牌、重试、本地存储与工业采集
 static/              本地前端资源（控制台页面与 Chart.js，无外网 CDN）
@@ -185,6 +256,20 @@ app.py               Flask 应用、日志和 Waitress 启动入口
 config.py            环境变量、设备映射与运行目录配置
 Dockerfile           容器化运行配置
 ```
+
+更深入的设计说明：[`docs/project-deep-dive.md`](docs/project-deep-dive.md)、[`docs/domain-model.md`](docs/domain-model.md)、[`docs/development.md`](docs/development.md)、[`docs/feishu-mapping.md`](docs/feishu-mapping.md)。
+
+## 测试与质量门禁
+
+本地建议使用与 CI 相同的命令：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+ruff check .
+python -m pytest
+```
+
+测试覆盖 HTTP 路由、配置校验、飞书适配器、领域监控引擎、报警状态机、Shadow 比对、持久化调度器、SQLite 仓储、历史快照和 Modbus 采集等关键边界。部署 workflow 不绕过测试结果；Windows 本地环境若遇临时目录权限问题，应以 Linux CI 的完整结果作为发布前最终门禁。
 
 ## 本地运行
 
@@ -237,9 +322,9 @@ Compose 默认从 `.env` 中的 `IMAGE_REPOSITORY` 拉取 `latest` 镜像，无�
 | `AUTOMATION_MODE` | 否 | `disabled` | 新领域运行模式；本轮只允许显式使用 `shadow`，不会默认启用 `active` |
 | `SHADOW_DEVICE_IDS` | Shadow 时建议 | 空 | Shadow 设备白名单；为空时不处理任何设备 |
 | `SHADOW_DEVICE_CONTEXTS` | 否 | 空 | JSON 设备上下文覆盖；默认支持文档中的 TH-01～TH-11 区域/控制类型 |
-| `FEISHU_STANDARD_TABLE_ID` | Shadow 时是 | `tbl4S6Q0VOYjK92t` | 环境标准表，只读 |
-| `FEISHU_OPERATION_TABLE_ID` | Shadow 时是 | `tbl3xFxhxnNlv4pm` | 环境受控作业登记，只读 |
-| `FEISHU_EVENT_TABLE_ID` | Shadow 时是 | `tblc6uCFLGPZLcR6` | 环境异常事件表，只读 |
+| `FEISHU_STANDARD_TABLE_ID` | Shadow 时是 | `your_standard_table_id` | 环境标准表，只读；部署时替换为实际表 ID |
+| `FEISHU_OPERATION_TABLE_ID` | Shadow 时是 | `your_operation_table_id` | 环境受控作业登记，只读；部署时替换为实际表 ID |
+| `FEISHU_EVENT_TABLE_ID` | Shadow 时是 | `your_event_table_id` | 环境异常事件表，只读；部署时替换为实际表 ID |
 | `FEISHU_DEVICE_TABLE_ID` | Shadow 时是 | 复用 `TABLE_ID` | 设备温湿度记录主表，只读观察 |
 | `FEISHU_OBSERVATION_OPERATION_TYPE_FIELD` | 否 | `当前工艺` | 设备观察表中的当前工艺字段 |
 | `SHADOW_OPERATION_SYNC_SECONDS` | 否 | `30` | 作业登记轮询间隔；按飞书创建时间处理新旧 |
