@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Reproducible local test and lint environment.
+pytest>=8,<9
+ruff>=0.8,<1

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 from pathlib import Path
 
 
@@ -53,6 +53,18 @@ def _load_hassio_options() -> None:
         "modbus_poll_interval_seconds": "MODBUS_POLL_INTERVAL_SECONDS",
         "modbus_timeout_seconds": "MODBUS_TIMEOUT_SECONDS",
         "event_temperature_high_c": "EVENT_TEMPERATURE_HIGH_C",
+        "automation_mode": "AUTOMATION_MODE",
+        "shadow_device_ids": "SHADOW_DEVICE_IDS",
+        "shadow_device_contexts": "SHADOW_DEVICE_CONTEXTS",
+        "feishu_standard_table_id": "FEISHU_STANDARD_TABLE_ID",
+        "feishu_operation_table_id": "FEISHU_OPERATION_TABLE_ID",
+        "feishu_event_table_id": "FEISHU_EVENT_TABLE_ID",
+        "shadow_worker_id": "SHADOW_WORKER_ID",
+        "shadow_scheduler_poll_seconds": "SHADOW_SCHEDULER_POLL_SECONDS",
+        "shadow_operation_sync_seconds": "SHADOW_OPERATION_SYNC_SECONDS",
+        "shadow_standard_sync_seconds": "SHADOW_STANDARD_SYNC_SECONDS",
+        "shadow_feishu_delay_seconds": "SHADOW_FEISHU_DELAY_SECONDS",
+        "runtime_shutdown_timeout_seconds": "RUNTIME_SHUTDOWN_TIMEOUT_SECONDS",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -107,10 +119,12 @@ def _get_float(name: str, default: float) -> float:
 
 
 # 飞书凭据只从运行环境读取，默认空值方便本地启动和健康检查。
-APP_ID = os.getenv("APP_ID", "")
-APP_SECRET = os.getenv("APP_SECRET", "")
-APP_TOKEN = os.getenv("APP_TOKEN", "")
-TABLE_ID = os.getenv("TABLE_ID", "")
+# FEISHU_* 是 Shadow Runtime 的显式命名；保留旧名称以兼容现有采集链路。
+APP_ID = os.getenv("APP_ID") or os.getenv("FEISHU_APP_ID", "")
+APP_SECRET = os.getenv("APP_SECRET") or os.getenv("FEISHU_APP_SECRET", "")
+APP_TOKEN = os.getenv("APP_TOKEN") or os.getenv("FEISHU_BASE_APP_TOKEN", "")
+TABLE_ID = os.getenv("TABLE_ID") or os.getenv("FEISHU_DEVICE_TABLE_ID", "")
+FEISHU_DEVICE_TABLE_ID = TABLE_ID
 
 # 运行配置。容器中的默认路径自然对应 /app/data 与 /app/logs。
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -295,6 +309,123 @@ MODBUS_REGISTER_MAP = os.getenv("MODBUS_REGISTER_MAP", "").strip()
 # 设备事件：温度超过该摄氏度阈值时产生 NORMAL -> TEMPERATURE_HIGH 事件，
 # 回落后产生恢复事件。留空表示关闭温度阈值事件（在线/离线事件不受影响）。
 EVENT_TEMPERATURE_HIGH_C = _get_optional_float("EVENT_TEMPERATURE_HIGH_C")
+
+
+# ---- Shadow Runtime（默认不启用新领域链路）----
+# Shadow 只能显式开启；尤其不能因为配置遗漏而进入 Active。
+AUTOMATION_MODE = os.getenv("AUTOMATION_MODE", "disabled").strip().lower()
+SHADOW_DEVICE_IDS = tuple(
+    device.strip().upper()
+    for device in os.getenv("SHADOW_DEVICE_IDS", "").split(",")
+    if device.strip()
+)
+SHADOW_SCHEDULER_POLL_SECONDS = max(
+    0.1, _get_float("SHADOW_SCHEDULER_POLL_SECONDS", 1.0)
+)
+SHADOW_OPERATION_SYNC_SECONDS = max(
+    5.0, _get_float("SHADOW_OPERATION_SYNC_SECONDS", 30.0)
+)
+SHADOW_STANDARD_SYNC_SECONDS = max(
+    30.0, _get_float("SHADOW_STANDARD_SYNC_SECONDS", 300.0)
+)
+SHADOW_FEISHU_DELAY_SECONDS = max(
+    0.0, _get_float("SHADOW_FEISHU_DELAY_SECONDS", 60.0)
+)
+RUNTIME_SHUTDOWN_TIMEOUT_SECONDS = max(
+    1.0, _get_float("RUNTIME_SHUTDOWN_TIMEOUT_SECONDS", 15.0)
+)
+SHADOW_WORKER_ID = os.getenv("SHADOW_WORKER_ID", "").strip()
+
+FEISHU_STANDARD_TABLE_ID = os.getenv(
+    "FEISHU_STANDARD_TABLE_ID", "tbl4S6Q0VOYjK92t"
+).strip()
+FEISHU_OPERATION_TABLE_ID = os.getenv(
+    "FEISHU_OPERATION_TABLE_ID", "tbl3xFxhxnNlv4pm"
+).strip()
+FEISHU_EVENT_TABLE_ID = os.getenv(
+    "FEISHU_EVENT_TABLE_ID", "tblc6uCFLGPZLcR6"
+).strip()
+FEISHU_OPERATION_DEVICE_FIELD = os.getenv(
+    "FEISHU_OPERATION_DEVICE_FIELD", "监测点"
+).strip()
+FEISHU_OPERATION_AREA_FIELD = os.getenv(
+    "FEISHU_OPERATION_AREA_FIELD", "区域"
+).strip()
+FEISHU_OPERATION_ACTION_FIELD = os.getenv(
+    "FEISHU_OPERATION_ACTION_FIELD", "状态变更"
+).strip()
+FEISHU_OPERATION_TYPE_FIELD = os.getenv(
+    "FEISHU_OPERATION_TYPE_FIELD", "当前工艺"
+).strip()
+FEISHU_OPERATION_WORK_ORDER_FIELD = os.getenv(
+    "FEISHU_OPERATION_WORK_ORDER_FIELD", "工单号"
+).strip()
+FEISHU_OBSERVATION_ALARM_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_ALARM_FIELD", "警报状态"
+).strip()
+FEISHU_OBSERVATION_OPERATION_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_OPERATION_FIELD", "当前作业状态"
+).strip()
+FEISHU_OBSERVATION_OPERATION_TYPE_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_OPERATION_TYPE_FIELD", "当前工艺"
+).strip()
+FEISHU_OBSERVATION_OVERALL_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_OVERALL_FIELD", "当前判定状态"
+).strip()
+FEISHU_OBSERVATION_TEMP_STATUS_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_TEMP_STATUS_FIELD", "温度判定"
+).strip()
+FEISHU_OBSERVATION_HUMIDITY_STATUS_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_HUMIDITY_STATUS_FIELD", "湿度判定"
+).strip()
+FEISHU_OBSERVATION_DATA_QUALITY_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_DATA_QUALITY_FIELD", "在线状态"
+).strip()
+FEISHU_OBSERVATION_STANDARD_ID_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_STANDARD_ID_FIELD", "当前标准编号"
+).strip()
+FEISHU_OBSERVATION_STANDARD_REVISION_FIELD = os.getenv(
+    "FEISHU_OBSERVATION_STANDARD_REVISION_FIELD", "当前标准版本"
+).strip()
+FEISHU_EVENT_DEVICE_FIELD = os.getenv(
+    "FEISHU_EVENT_DEVICE_FIELD", "监测点"
+).strip()
+FEISHU_EVENT_STATUS_FIELD = os.getenv(
+    "FEISHU_EVENT_STATUS_FIELD", "事件状态"
+).strip()
+
+
+def _get_shadow_contexts() -> dict[str, dict[str, str]]:
+    """Parse optional device context overrides for the Shadow whitelist."""
+    raw_value = os.getenv("SHADOW_DEVICE_CONTEXTS", "").strip()
+    if not raw_value:
+        return {}
+    try:
+        mapping = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("SHADOW_DEVICE_CONTEXTS 必须是有效的 JSON 对象") from exc
+    if not isinstance(mapping, dict):
+        raise ValueError("SHADOW_DEVICE_CONTEXTS 必须是 JSON 对象")
+
+    contexts: dict[str, dict[str, str]] = {}
+    for device, raw_context in mapping.items():
+        normalized_device = str(device).strip().upper()
+        if not normalized_device or not isinstance(raw_context, dict):
+            raise ValueError(
+                "SHADOW_DEVICE_CONTEXTS 的每个设备值必须是非空 JSON 对象"
+            )
+        area = str(raw_context.get("area", "")).strip()
+        control_type = str(raw_context.get("control_type", "")).strip()
+        if not area:
+            raise ValueError(f"SHADOW_DEVICE_CONTEXTS 缺少区域: {normalized_device}")
+        contexts[normalized_device] = {
+            "area": area,
+            "control_type": control_type,
+        }
+    return contexts
+
+
+SHADOW_DEVICE_CONTEXTS = _get_shadow_contexts()
 
 
 def ensure_runtime_directories() -> None:

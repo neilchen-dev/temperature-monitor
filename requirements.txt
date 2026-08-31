@@ -6,3 +6,6 @@ waitress>=3.0,<4
 pymodbus>=3.15,<3.16
 # pymodbus 的 serial 支持是可选 extra，不会随包自动安装；RTU 需要
 pyserial>=3.5,<4
+# Windows has no bundled IANA timezone database; the application and tests
+# use ZoneInfo for the configured site timezone.
+tzdata>=2024.1

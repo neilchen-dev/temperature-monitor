@@ -18,8 +18,11 @@ import logging
 import math
 import time
 from datetime import datetime
+import threading
+from collections.abc import Callable
 from typing import Any
 
+from domain.models import DataQualityStatus, MonitorSample
 from services import db
 from services.events import evaluate_transitions
 
@@ -33,6 +36,46 @@ KNOWN_SOURCES = {SOURCE_HOME_ASSISTANT, SOURCE_MODBUS}
 # Unified statuses stored in device_samples.status / used by event states.
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
+
+SampleListener = Callable[[MonitorSample], None]
+_sample_listeners: list[SampleListener] = []
+_sample_listener_lock = threading.RLock()
+
+
+def register_sample_listener(listener: SampleListener) -> None:
+    """Register a non-blocking extension hook for normalized samples.
+
+    The existing persistence and Feishu write path remains the caller's
+    responsibility.  Runtime listeners are invoked only after that legacy
+    path has accepted the sample, and listener failures are isolated.
+    """
+    if not callable(listener):
+        raise TypeError("listener must be callable")
+    with _sample_listener_lock:
+        if listener not in _sample_listeners:
+            _sample_listeners.append(listener)
+
+
+def unregister_sample_listener(listener: SampleListener) -> None:
+    with _sample_listener_lock:
+        try:
+            _sample_listeners.remove(listener)
+        except ValueError:
+            pass
+
+
+def _notify_sample_listeners(sample: MonitorSample) -> None:
+    with _sample_listener_lock:
+        listeners = tuple(_sample_listeners)
+    for listener in listeners:
+        try:
+            listener(sample)
+        except Exception:  # noqa: BLE001 - extensions must not break acquisition
+            logger.exception(
+                "采样扩展处理失败 | device=%s | sample_time=%s",
+                sample.device_id,
+                sample.sample_time.isoformat(),
+            )
 
 
 def normalize_status(value: Any) -> str | None:
@@ -156,6 +199,20 @@ def record_sample(
                     source=normalized_source,
                 )
 
+        _notify_sample_listeners(
+            MonitorSample(
+                device_id=normalized_device,
+                sample_time=datetime.fromtimestamp(now_ms / 1000).astimezone(),
+                temperature=current["temperature"],
+                humidity=current["humidity"],
+                online_status=normalized_status,
+                data_quality=(
+                    DataQualityStatus.OFFLINE
+                    if normalized_status == STATUS_OFFLINE
+                    else None
+                ),
+            )
+        )
         if transitions:
             logger.info(
                 "设备状态变化 | device=%s | events=%s",

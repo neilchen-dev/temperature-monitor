@@ -13,6 +13,7 @@ from routes.dashboard import dashboard_bp, dashboard_session_secret
 from routes.history import history_bp
 from routes.temperature import temperature_bp
 from services import collector, db
+from runtime.bootstrap import build_runtime
 
 
 def configure_logging() -> logging.Logger:
@@ -66,6 +67,13 @@ def run_server() -> None:
     logger = logging.getLogger("temperature_monitor")
     # 后台采集线程只在生产入口启动一次；create_app 保持无副作用，
     # 测试与多次调用不会重复启动。多 worker 部署见 .env.example 注释。
+    runtime = None
+    try:
+        runtime = build_runtime()
+        runtime.start()
+    except Exception:  # noqa: BLE001 - legacy service must remain available
+        logger.exception("Shadow Runtime 装配失败，旧采集/历史链路继续运行")
+
     collector.start_collectors()
     logger.info(
         "温湿度监控服务启动 | 设备数量=%s | HA温度源单位=%s | "
@@ -85,7 +93,10 @@ def run_server() -> None:
         )
     finally:
         # Waitress 正常退出/被中断时停掉采集线程，保证应用级优雅关闭。
+        if runtime is not None:
+            runtime.stop()
         collector.stop_collectors()
+        db.close()
 
 
 if __name__ == "__main__":

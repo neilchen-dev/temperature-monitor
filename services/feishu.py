@@ -34,9 +34,11 @@ def _resource_lock(key: str) -> threading.RLock:
         return lock
 
 
-def _validate_bitable_config() -> None:
-    if not config.APP_TOKEN or not config.TABLE_ID:
-        raise RuntimeError("缺少飞书环境变量 APP_TOKEN 或 TABLE_ID")
+def _validate_bitable_config(*, require_default_table: bool = False) -> None:
+    if not config.APP_TOKEN:
+        raise RuntimeError("缺少飞书环境变量 APP_TOKEN 或 FEISHU_BASE_APP_TOKEN")
+    if require_default_table and not config.TABLE_ID:
+        raise RuntimeError("缺少飞书环境变量 TABLE_ID 或 FEISHU_DEVICE_TABLE_ID")
 
 
 def normalize_field_value(value: Any) -> str:
@@ -145,6 +147,48 @@ def _require_success(result: dict[str, Any], operation: str) -> dict[str, Any]:
     return result
 
 
+def list_bitable_records(
+    table_id: str,
+    *,
+    field_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Read all records from an explicitly configured Base table.
+
+    This is intentionally a read-only primitive for the integration layer.
+    It uses the same token, retry, and pagination handling as the existing
+    Feishu service but does not expose any create/update/delete operation.
+    """
+    _validate_bitable_config()
+    base_url = _bitable_table_url(table_id, "/records/search")
+    page_token: str | None = None
+    records: list[dict[str, Any]] = []
+    body: dict[str, Any] = {}
+    if field_names:
+        body["field_names"] = list(field_names)
+
+    while True:
+        query = {"page_size": "500"}
+        if page_token:
+            query["page_token"] = page_token
+        result = _require_success(
+            _request_bitable_json(
+                "POST",
+                f"{base_url}?{urlencode(query)}",
+                operation="读取 Base 记录",
+                json_data=body,
+                lock_key=f"table:{table_id}:read",
+            ),
+            "读取 Base 记录",
+        )
+        data = result.get("data", {})
+        records.extend(data.get("items", []))
+        if not data.get("has_more"):
+            return records
+        page_token = str(data.get("page_token", "")).strip()
+        if not page_token:
+            raise RuntimeError("飞书 Base 记录分页响应缺少 page_token")
+
+
 def resolve_record_id(device: str, configured_record_id: str | None = None) -> str:
     """Return a mapped record ID or discover it from the Bitable device field."""
     if configured_record_id:
@@ -164,7 +208,7 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
                 f"请检查字段 {config.DEVICE_ID_FIELD} 或 DEVICE_RECORD_MAP"
             )
 
-    _validate_bitable_config()
+    _validate_bitable_config(require_default_table=True)
     base_url = _bitable_table_url(config.TABLE_ID, "/records")
     page_token: str | None = None
     matching_record_ids: list[str] = []
@@ -229,7 +273,7 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
 
 
 def update_feishu_fields(record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-    _validate_bitable_config()
+    _validate_bitable_config(require_default_table=True)
     return _request_bitable_json(
         "PUT",
         _bitable_table_url(config.TABLE_ID, f"/records/{record_id}"),
@@ -241,7 +285,7 @@ def update_feishu_fields(record_id: str, fields: dict[str, Any]) -> dict[str, An
 
 def list_realtime_snapshots(field_names: list[str]) -> list[dict[str, Any]]:
     """Read all current records with the minimum fields needed for a snapshot."""
-    _validate_bitable_config()
+    _validate_bitable_config(require_default_table=True)
     base_url = _bitable_table_url(config.TABLE_ID, "/records/search")
     page_token: str | None = None
     records: list[dict[str, Any]] = []

@@ -234,6 +234,18 @@ Compose 默认从 `.env` 中的 `IMAGE_REPOSITORY` 拉取 `latest` 镜像，无�
 | `APP_SECRET` | 是 | — | 飞书应用密钥 |
 | `APP_TOKEN` | 是 | — | 飞书多维表格 App Token |
 | `TABLE_ID` | 是 | — | 飞书数据表 ID |
+| `AUTOMATION_MODE` | 否 | `disabled` | 新领域运行模式；本轮只允许显式使用 `shadow`，不会默认启用 `active` |
+| `SHADOW_DEVICE_IDS` | Shadow 时建议 | 空 | Shadow 设备白名单；为空时不处理任何设备 |
+| `SHADOW_DEVICE_CONTEXTS` | 否 | 空 | JSON 设备上下文覆盖；默认支持文档中的 TH-01～TH-11 区域/控制类型 |
+| `FEISHU_STANDARD_TABLE_ID` | Shadow 时是 | `tbl4S6Q0VOYjK92t` | 环境标准表，只读 |
+| `FEISHU_OPERATION_TABLE_ID` | Shadow 时是 | `tbl3xFxhxnNlv4pm` | 环境受控作业登记，只读 |
+| `FEISHU_EVENT_TABLE_ID` | Shadow 时是 | `tblc6uCFLGPZLcR6` | 环境异常事件表，只读 |
+| `FEISHU_DEVICE_TABLE_ID` | Shadow 时是 | 复用 `TABLE_ID` | 设备温湿度记录主表，只读观察 |
+| `FEISHU_OBSERVATION_OPERATION_TYPE_FIELD` | 否 | `当前工艺` | 设备观察表中的当前工艺字段 |
+| `SHADOW_OPERATION_SYNC_SECONDS` | 否 | `30` | 作业登记轮询间隔；按飞书创建时间处理新旧 |
+| `SHADOW_STANDARD_SYNC_SECONDS` | 否 | `300` | 标准完整快照轮询间隔 |
+| `SHADOW_FEISHU_DELAY_SECONDS` | 否 | `60` | Shadow 延迟窗口，含 60 秒 |
+| `SHADOW_SCHEDULER_POLL_SECONDS` | 否 | `1` | 本地持久化任务轮询间隔 |
 | `HISTORY_API_KEY` | 使用历史采样时是 | — | `POST /history/sample` 的共享密钥，至少 32 字节 |
 | `HISTORY_DEVICES` | 否 | `TH-01,…,TH-11` | 参与历史采样的设备列表（逗号分隔）；覆盖时 `HISTORY_TABLE_MAP` 必须与之一致 |
 | `TEMPERATURE_API_KEY` | 否 | 空 | `POST /temperature` 的可选共享密钥；设置后请求必须携带 `X-Temperature-Key`（或 `X-History-Key`）头，留空则不鉴权以兼容旧配置。生产环境建议设置 |

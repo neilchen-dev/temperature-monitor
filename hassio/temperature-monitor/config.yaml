@@ -23,6 +23,18 @@ options:
   app_secret: ""
   app_token: ""
   table_id: ""
+  automation_mode: disabled
+  shadow_device_ids: ""
+  shadow_device_contexts: ""
+  feishu_standard_table_id: tbl4S6Q0VOYjK92t
+  feishu_operation_table_id: tbl3xFxhxnNlv4pm
+  feishu_event_table_id: tblc6uCFLGPZLcR6
+  shadow_worker_id: ""
+  shadow_scheduler_poll_seconds: 1
+  shadow_operation_sync_seconds: 30
+  shadow_standard_sync_seconds: 300
+  shadow_feishu_delay_seconds: 60
+  runtime_shutdown_timeout_seconds: 15
   history_api_key: ""
   temperature_api_key: ""
   history_devices: ""
@@ -58,6 +70,18 @@ schema:
   app_secret: password
   app_token: password
   table_id: str
+  automation_mode: list(disabled|shadow|active)
+  shadow_device_ids: str
+  shadow_device_contexts: str
+  feishu_standard_table_id: str
+  feishu_operation_table_id: str
+  feishu_event_table_id: str
+  shadow_worker_id: str
+  shadow_scheduler_poll_seconds: int(1,60)
+  shadow_operation_sync_seconds: int(5,86400)
+  shadow_standard_sync_seconds: int(30,86400)
+  shadow_feishu_delay_seconds: int(0,3600)
+  runtime_shutdown_timeout_seconds: int(1,300)
   history_api_key: password
   temperature_api_key: password
   history_devices: str
