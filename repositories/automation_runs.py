@@ -36,6 +36,8 @@ CREATE INDEX IF NOT EXISTS idx_automation_runs_device_time
     ON automation_runs(device_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_automation_runs_diff
     ON automation_runs(matched, difference_type);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_type_time
+    ON automation_runs(action_type, created_at);
 """
 
 
@@ -136,3 +138,13 @@ class SQLiteAutomationRunRepository:
         )
         self.connection.commit()
         return run_id
+
+
+def purge_automation_runs(connection: sqlite3.Connection, cutoff: datetime) -> int:
+    """Delete comparison/action runs created before ``cutoff``; return count."""
+    cursor = connection.execute(
+        "DELETE FROM automation_runs WHERE created_at < ?",
+        (cutoff.isoformat(),),
+    )
+    connection.commit()
+    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0

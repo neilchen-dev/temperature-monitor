@@ -65,12 +65,15 @@ def _load_hassio_options() -> None:
         "feishu_operation_interval_table_id": "FEISHU_OPERATION_INTERVAL_TABLE_ID",
         "feishu_inspection_table_id": "FEISHU_INSPECTION_TABLE_ID",
         "feishu_write_enabled": "FEISHU_WRITE_ENABLED",
+        "active_cutover_ack": "ACTIVE_CUTOVER_ACK",
         "shadow_worker_id": "SHADOW_WORKER_ID",
         "shadow_scheduler_poll_seconds": "SHADOW_SCHEDULER_POLL_SECONDS",
         "shadow_operation_sync_seconds": "SHADOW_OPERATION_SYNC_SECONDS",
         "shadow_standard_sync_seconds": "SHADOW_STANDARD_SYNC_SECONDS",
         "shadow_feishu_delay_seconds": "SHADOW_FEISHU_DELAY_SECONDS",
         "runtime_shutdown_timeout_seconds": "RUNTIME_SHUTDOWN_TIMEOUT_SECONDS",
+        "automation_run_retention_days": "AUTOMATION_RUN_RETENTION_DAYS",
+        "device_model_stale_seconds": "DEVICE_MODEL_STALE_SECONDS",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -340,6 +343,21 @@ SHADOW_FEISHU_DELAY_SECONDS = max(
 RUNTIME_SHUTDOWN_TIMEOUT_SECONDS = max(
     1.0, _get_float("RUNTIME_SHUTDOWN_TIMEOUT_SECONDS", 15.0)
 )
+# automation_runs / automation_tasks 只保留最近 N 天；0 表示禁用清理。
+# SHADOW_COMPARE 每个采样一条 run，长跑会无限增长，必须给上限。
+AUTOMATION_RUN_RETENTION_DAYS = max(
+    0, _get_int("AUTOMATION_RUN_RETENTION_DAYS", 30)
+)
+# 统一设备模型断流判定阈值（秒）：/temperature 仍有上报但统一样本超过该
+# 时间没有成功落库时，/api/system/status 标记 degraded。
+DEVICE_MODEL_STALE_SECONDS = max(
+    60, _get_int("DEVICE_MODEL_STALE_SECONDS", 300)
+)
+# Active 切换三开关确认：AUTOMATION_MODE=active + FEISHU_WRITE_ENABLED=true
+# + ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足
+# 才允许 Active 写回；确认字符串不匹配时 Runtime 降级为 disabled。
+ACTIVE_CUTOVER_ACK_EXPECTED = "I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS"
+ACTIVE_CUTOVER_ACK = os.getenv("ACTIVE_CUTOVER_ACK", "").strip()
 SHADOW_WORKER_ID = os.getenv("SHADOW_WORKER_ID", "").strip()
 
 FEISHU_STANDARD_TABLE_ID = os.getenv(

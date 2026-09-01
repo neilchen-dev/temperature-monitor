@@ -26,12 +26,110 @@ from domain.models import DataQualityStatus, MonitorSample
 from services import db
 from services.events import evaluate_transitions
 
+import config
+
 
 logger = logging.getLogger("temperature_monitor")
 
 SOURCE_HOME_ASSISTANT = "home_assistant"
 SOURCE_MODBUS = "modbus"
 KNOWN_SOURCES = {SOURCE_HOME_ASSISTANT, SOURCE_MODBUS}
+
+# 统一设备模型运行健康（进程内计数，供 /api/system/status 暴露）。
+# record_sample 保持旁路隔离（异常吞掉、旧采集链路不受影响），但断流
+# 不再不可见：错误次数、最后错误、最后成功时间、/temperature 存活时间
+# 都在这里累积，degraded 判定结合 db 镜像的最新落库时间。
+_device_model_stats: dict[str, Any] = {
+    "error_count": 0,
+    "last_error": None,
+    "last_error_time": None,
+    "last_success_time": None,
+    "last_temperature_request_time": None,
+}
+_device_model_stats_lock = threading.Lock()
+
+
+def note_temperature_request(device: str) -> None:
+    """Record that /temperature received a report (degraded detection input)."""
+    with _device_model_stats_lock:
+        _device_model_stats["last_temperature_request_time"] = time.time()
+
+
+def _note_record_success() -> None:
+    with _device_model_stats_lock:
+        _device_model_stats["last_success_time"] = time.time()
+
+
+def _note_record_error(exc: BaseException) -> None:
+    with _device_model_stats_lock:
+        _device_model_stats["error_count"] += 1
+        _device_model_stats["last_error"] = f"{type(exc).__name__}: {exc}"
+        _device_model_stats["last_error_time"] = time.time()
+
+
+def _reset_device_model_stats() -> None:
+    """Test/diagnostic helper: clear in-memory health counters."""
+    with _device_model_stats_lock:
+        _device_model_stats.update(
+            {
+                "error_count": 0,
+                "last_error": None,
+                "last_error_time": None,
+                "last_success_time": None,
+                "last_temperature_request_time": None,
+            }
+        )
+
+
+def _iso_local_timestamp(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value).astimezone().isoformat(timespec="seconds")
+
+
+def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
+    """Unified-device-model health snapshot for /api/system/status.
+
+    degraded = /temperature 仍在收到上报，但统一样本超过阈值没有成功落库。
+    覆盖两类断流：record_sample 自身异常（显式计数），以及 SQLite 镜像
+    静默写失败（通过 device_samples 最新落库时间间接判断）。
+    """
+    current = time.time() if now is None else now
+    with _device_model_stats_lock:
+        stats = dict(_device_model_stats)
+    try:
+        last_persisted_ms = db.fetch_device_summary().get("last_sample_time_ms")
+    except Exception:  # noqa: BLE001 - health endpoint must never raise
+        logger.exception("读取统一设备模型健康快照失败")
+        last_persisted_ms = None
+    degraded_reasons: list[str] = []
+    request_time = stats.get("last_temperature_request_time")
+    if (
+        request_time is not None
+        and current - request_time <= config.DEVICE_MODEL_STALE_SECONDS
+    ):
+        if last_persisted_ms is None:
+            degraded_reasons.append(
+                "temperature reports active but no unified sample persisted"
+            )
+        elif current - last_persisted_ms / 1000.0 > config.DEVICE_MODEL_STALE_SECONDS:
+            degraded_reasons.append(
+                "temperature reports active but unified samples are stale"
+            )
+    return {
+        "device_sample_error_count": stats.get("error_count", 0),
+        "device_sample_last_error": stats.get("last_error"),
+        "device_sample_last_error_time": _iso_local_timestamp(
+            stats.get("last_error_time")
+        ),
+        "last_successful_sample_time": _iso_local_timestamp(
+            stats.get("last_success_time")
+        ),
+        "last_persisted_sample_time_ms": last_persisted_ms,
+        "stale_threshold_seconds": config.DEVICE_MODEL_STALE_SECONDS,
+        "degraded": bool(degraded_reasons),
+        "degraded_reasons": degraded_reasons,
+    }
 
 # Unified statuses stored in device_samples.status / used by event states.
 STATUS_ONLINE = "online"
@@ -219,7 +317,11 @@ def record_sample(
                 normalized_device,
                 ", ".join(f"{e['old_state']}->{e['new_state']}" for e in transitions),
             )
+        _note_record_success()
         return transitions
-    except Exception:
+    except Exception as exc:
+        # 旁路隔离不变：旧采集链路继续可用。但断流不再静默——计数与
+        # 最后错误暴露在 /api/system/status 的 device_model 段。
+        _note_record_error(exc)
         logger.exception("统一设备样本入库失败 | device=%s | source=%s", device, source)
         return []

@@ -22,6 +22,8 @@ import requests
 
 from flask import Blueprint, jsonify, request
 
+from runtime.bootstrap import runtime_status, shadow_summary_snapshot
+
 import config
 from integrations.feishu_records import FeishuBitableRecordSource
 from integrations.feishu_writers import (
@@ -31,7 +33,7 @@ from integrations.feishu_writers import (
     FeishuOperationRecordWriter,
     FeishuWriteError,
 )
-from services import db
+from services import db, devices
 from services.collector import get_collector_status
 
 
@@ -466,9 +468,31 @@ def system_status():
         "service": "temperature-monitor",
         "sqlite": db.get_stats(),
         "collectors": get_collector_status(),
+        "runtime": runtime_status(),
+        # 统一设备模型健康：record_sample 错误计数/最后错误/最后成功时间，
+        # 以及“/temperature 仍有上报但统一样本断流”的 degraded 判定。
+        "device_model": devices.get_device_model_health(),
         # device_count = 不同设备编号数；identity_count = (设备, 数据源)
         # 身份对数量，与 /api/devices 的 count 一致。
         "device_count": summary.get("device_count", 0),
         "identity_count": summary.get("identity_count", 0),
         "last_sample_time_ms": last_sample_ms,
     }), 200
+
+
+@api_bp.get("/api/shadow/summary")
+def shadow_summary_route():
+    """Recent Shadow comparison aggregates for production verification.
+
+    Requires HISTORY_API_KEY like other read endpoints; exposes counts only
+    (never record payloads or credentials).
+    """
+    auth_error = _auth_error()
+    if auth_error:
+        return auth_error
+    hours = request.args.get("hours", default=24, type=int)
+    if hours is None:
+        hours = 24
+    hours = max(1, min(hours, 24 * 30))
+    summary = shadow_summary_snapshot(hours=hours)
+    return jsonify({"status": "success", "summary": summary}), 200

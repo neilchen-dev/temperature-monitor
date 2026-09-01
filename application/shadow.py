@@ -45,6 +45,9 @@ class ObservedAutomationState:
     humidity_status: str | None = None
     active_event_ids: tuple[str, ...] = ()
     operation_type: str | None = None
+    # 已写恢复时间但仍未人工关闭的飞书事件数（“待人工闭环”）。
+    # 它们不是当前活动报警，而是报警生命周期的收尾尾巴。
+    pending_closure_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -201,25 +204,48 @@ def _event_difference(
     details: dict[str, Any],
 ) -> str | None:
     observed_count = observed.active_event_count
+    pending_count = observed.pending_closure_count
     if observed_count is not None and observed_count > 1:
         details["active_event_count"] = {
             "expected": expected.active_event_count,
             "observed": observed_count,
         }
         return "EVENT_DUPLICATED"
-    if expected.event_exists and (
-        observed_count == 0 or (observed_count is None and not observed.event_exists)
-    ):
-        details["event_exists"] = {"expected": True, "observed": False}
-        if observed_count is not None:
-            details["active_event_count"] = {"expected": ">=1", "observed": observed_count}
-        return "EVENT_MISSING"
-    if not expected.event_exists and (
-        (observed_count is not None and observed_count > 0) or observed.event_exists
-    ):
-        details["event_exists"] = {"expected": False, "observed": True}
-        return "EVENT_DUPLICATED"
-    return None
+    if expected.event_exists:
+        has_observed_alarm = (observed_count is not None and observed_count > 0) or (
+            observed_count is None and observed.event_exists
+        )
+        if not has_observed_alarm:
+            # 飞书工作流在 START_RECOVERY 时就会写“恢复时间”，但事件保持
+            # 打开等人工闭环。因此 RECOVERY 投影下“只有已恢复的打开事件”
+            # 属于设计内的中间态，不算 EVENT_MISSING。
+            recovered_tail_satisfies = (
+                expected.alarm_state == AlarmLifecycleState.RECOVERY.value
+                and pending_count is not None
+                and pending_count > 0
+            )
+            if not recovered_tail_satisfies:
+                details["event_exists"] = {"expected": True, "observed": False}
+                if observed_count is not None:
+                    details["active_event_count"] = {
+                        "expected": ">=1",
+                        "observed": observed_count,
+                    }
+                return "EVENT_MISSING"
+        return None
+    has_observed_alarm = (observed_count is not None and observed_count > 0) or (
+        observed_count is None and observed.event_exists
+    )
+    if not has_observed_alarm:
+        return None
+    if observed_count == 0 and pending_count is not None and pending_count > 0:
+        # CLOSE_ALARM_EVENT 有意不关闭飞书事件（人工闭环边界）。Python 已
+        # 回到 NORMAL 时，只剩余“已写恢复时间、等人工关闭”的事件是设计内
+        # 的终态，不是重复报警。
+        details["pending_closure_count"] = {"expected": 0, "observed": pending_count}
+        return None
+    details["event_exists"] = {"expected": False, "observed": True}
+    return "EVENT_DUPLICATED"
 
 
 def _canonical_differences(
@@ -337,6 +363,31 @@ class ShadowComparisonService:
             )
         return diff
 
+    def record_failure(
+        self,
+        *,
+        device_id: str,
+        sample_time: datetime,
+        expected: Mapping[str, Any],
+        error: str,
+        created_at: datetime,
+    ) -> None:
+        """Persist a failed observation attempt so it is visible in automation_runs."""
+        if self.recorder is None:
+            return
+        self.recorder.record_comparison(
+            device_id=device_id,
+            sample_time=sample_time,
+            expected=dict(expected),
+            observed={"error": error},
+            diff=AutomationDiff(
+                matched=False,
+                difference_type=("OBSERVATION_ERROR",),
+                details={"error": error},
+            ),
+            created_at=created_at,
+        )
+
 
 def _state_dict(state: ExpectedAutomationState | ObservedAutomationState) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -355,8 +406,9 @@ def _state_dict(state: ExpectedAutomationState | ObservedAutomationState) -> dic
         "temperature_status",
         "humidity_status",
         "operation_type",
+        "pending_closure_count",
     ):
-        value = getattr(state, field_name)
+        value = getattr(state, field_name, None)
         if value is not None:
             result[field_name] = value
     if state.active_event_ids:

@@ -48,6 +48,9 @@ def temperature():
         return jsonify({"status": "error", "error": "缺少 device"}), 400
     # 兼容旧 HA 配置：没有 status 时仍按在线数据处理。
     status_value = data.get("status", "在线")
+    # /temperature 存活打点：与统一模型健康联动，识别“上报仍在、
+    # 统一样本断流”的 degraded 状态（见 devices.get_device_model_health）。
+    devices.note_temperature_request(device)
 
     try:
         bitable_device = config.DEVICE_NAME_MAP.get(device, device)
@@ -85,7 +88,9 @@ def temperature():
     success = feishu_code == 0
 
     save_history(
-        device,
+        # 历史镜像同样使用映射后的设备编号，和 device_samples/飞书保持同一
+        # 设备身份；否则 DEVICE_NAME_MAP 非恒等映射时 /api 与历史表各说各话。
+        bitable_device,
         temperature_c,
         humidity,
         final_status,

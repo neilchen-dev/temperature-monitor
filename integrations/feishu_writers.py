@@ -10,15 +10,52 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import uuid
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
+import config
 from domain.models import MonitorResult, MonitorSample
 from domain.operation import OperationAction, OperationObservation
 
 from .feishu_records import FeishuRawRecord
+
+
+_business_tz_cache: ZoneInfo | None = None
+
+
+def _business_timezone() -> ZoneInfo:
+    global _business_tz_cache
+    if _business_tz_cache is None:
+        _business_tz_cache = ZoneInfo(config.HISTORY_TIMEZONE)
+    return _business_tz_cache
+
+
+def _event_time_matches(value: Any, expected: datetime) -> bool:
+    """Compare a Feishu datetime cell against an expected business instant.
+
+    Feishu returns datetime cells as millisecond timestamps (aware UTC) while
+    callers usually hold business-local datetimes; the comparison normalizes
+    both sides to instants before matching. Unparseable cells never match.
+    """
+    if value is None or value == "":
+        return False
+    try:
+        parsed = _parse_datetime(value)
+    except (FeishuWriteError, ValueError, TypeError):
+        return False
+    if parsed is None:
+        return False
+    reference = expected
+    if parsed.tzinfo is None and reference.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=_business_timezone())
+    elif reference.tzinfo is None and parsed.tzinfo is not None:
+        reference = reference.replace(tzinfo=_business_timezone())
+    if parsed.tzinfo is None or reference.tzinfo is None:
+        return parsed == reference
+    return parsed.astimezone(timezone.utc) == reference.astimezone(timezone.utc)
 
 
 class FeishuWriteError(RuntimeError):
@@ -121,12 +158,16 @@ class FeishuOperationRecordWriter:
         interval_table_id: str,
         device_table_id: str,
         fields: FeishuOperationWriteFieldMap | None = None,
+        source: FeishuEventSource | None = None,
     ) -> None:
         self.writer = writer
         self.operation_table_id = _required_id(operation_table_id, "operation_table_id")
         self.interval_table_id = _required_id(interval_table_id, "interval_table_id")
         self.device_table_id = _required_id(device_table_id, "device_table_id")
         self.fields = fields or FeishuOperationWriteFieldMap()
+        # 只读 source 用于应用层幂等：同一 (设备, 动作, 状态记录时间) 的
+        # 重复登记在写之前先查表复用 record_id，不依赖本地 SQLite 去重。
+        self.source = source
 
     def create_registration(
         self,
@@ -140,6 +181,21 @@ class FeishuOperationRecordWriter:
         status_recorded_at: datetime | None = None,
         idempotency_key: str | None = None,
     ) -> Mapping[str, Any]:
+        action_text = _action_text(action)
+        if status_recorded_at is not None:
+            existing = self._find_registration_by_business_key(
+                device_id=device_id,
+                action_text=action_text,
+                recorded_at=status_recorded_at,
+            )
+            if existing is not None:
+                # 同一逻辑登记已存在（上次调用超时但远端已写入等场景）：
+                # 复用既有 record_id，不再创建第二条记录。
+                return {
+                    "existing": True,
+                    "idempotent": True,
+                    "record_id": existing.record_id,
+                }
         fields = self._registration_fields(
             device_id=device_id,
             area=area,
@@ -152,7 +208,7 @@ class FeishuOperationRecordWriter:
         if status_recorded_at is not None:
             fields[self.fields.state_recorded_at] = _datetime_cell(status_recorded_at)
         token = idempotency_key or (
-            f"PROC:{_device_id(device_id)}:{_action_text(action)}:"
+            f"PROC:{_device_id(device_id)}:{action_text}:"
             f"{_datetime_cell(status_recorded_at)}"
             if status_recorded_at is not None
             else f"PROC:{uuid.uuid4()}"
@@ -162,6 +218,31 @@ class FeishuOperationRecordWriter:
             fields,
             client_token=token,
         )
+
+    def _find_registration_by_business_key(
+        self,
+        *,
+        device_id: str,
+        action_text: str,
+        recorded_at: datetime,
+    ) -> FeishuRawRecord | None:
+        """Business key: (监测点, 状态变更, 状态记录时间)."""
+        if self.source is None:
+            return None
+        normalized_device = _device_id(device_id)
+        for record in self.source.read_records(self.operation_table_id):
+            if (
+                _field_text(record.fields.get(self.fields.device_id)).upper()
+                != normalized_device
+            ):
+                continue
+            if _field_text(record.fields.get(self.fields.action)) != action_text:
+                continue
+            if _event_time_matches(
+                record.fields.get(self.fields.state_recorded_at), recorded_at
+            ):
+                return record
+        return None
 
     def update_registration_snapshot(
         self,
@@ -428,6 +509,16 @@ class FeishuEnvironmentEventWriter:
         allow_existing: bool = False,
     ) -> Mapping[str, Any]:
         normalized_device = _device_id(device_id)
+        # 业务幂等键 = (监测点, 开始时间)。飞书 API 超时但实际已写入时，
+        # 重试会在这里找到既有记录并复用 record_id——包括事件已被人工
+        # 提前关闭的情况（active 检查对已关闭记录不可见，会误判可创建）。
+        existing_by_key = self._find_event_by_business_key(normalized_device, start_time)
+        if existing_by_key is not None:
+            return {
+                "existing": True,
+                "idempotent": True,
+                "record_id": existing_by_key.record_id,
+            }
         active = self._active_events(normalized_device)
         if len(active) > 1:
             raise FeishuWriteError(
@@ -655,6 +746,22 @@ class FeishuEnvironmentEventWriter:
             not in self.closed_statuses
         )
 
+    def _find_event_by_business_key(
+        self,
+        device_id: str,
+        start_time: datetime,
+    ) -> FeishuRawRecord | None:
+        """Business key: (监测点, 开始时间); status-agnostic by design."""
+        for record in self.source.read_records(self.event_table_id):
+            if (
+                _field_text(record.fields.get(self.fields.device_id)).upper()
+                != device_id
+            ):
+                continue
+            if _event_time_matches(record.fields.get(self.fields.start_time), start_time):
+                return record
+        return None
+
     def _single_active_event(self, device_id: str) -> FeishuRawRecord:
         records = self._active_events(device_id)
         if len(records) != 1:
@@ -708,12 +815,15 @@ class FeishuInspectionRecordWriter:
         device_table_id: str,
         fields: FeishuInspectionWriteFieldMap | None = None,
         device_recent_inspection_field: str = "最近仓库点检时间",
+        source: FeishuEventSource | None = None,
     ) -> None:
         self.writer = writer
         self.inspection_table_id = _required_id(inspection_table_id, "inspection_table_id")
         self.device_table_id = _required_id(device_table_id, "device_table_id")
         self.fields = fields or FeishuInspectionWriteFieldMap()
         self.device_recent_inspection_field = device_recent_inspection_field
+        # 只读 source 用于应用层幂等（区域 + 状态记录时间）。
+        self.source = source
 
     def create_snapshot(
         self,
@@ -737,6 +847,14 @@ class FeishuInspectionRecordWriter:
         state_recorded_at: datetime | None = None,
         idempotency_key: str | None = None,
     ) -> Mapping[str, Any]:
+        existing = self._find_snapshot_by_business_key(area, inspected_at)
+        if existing is not None:
+            # 同一 (仓库区域, 状态记录时间) 的点检已存在：复用，不重复创建。
+            return {
+                "existing": True,
+                "idempotent": True,
+                "record_id": existing.record_id,
+            }
         fields = self.snapshot_fields(
             area=area,
             inspected_at=inspected_at,
@@ -762,6 +880,24 @@ class FeishuInspectionRecordWriter:
             fields,
             client_token=token,
         )
+
+    def _find_snapshot_by_business_key(
+        self,
+        area: str,
+        inspected_at: datetime,
+    ) -> FeishuRawRecord | None:
+        """Business key: (仓库区域, 状态记录时间)."""
+        if self.source is None:
+            return None
+        normalized_area = area.strip()
+        for record in self.source.read_records(self.inspection_table_id):
+            if _field_text(record.fields.get(self.fields.area)) != normalized_area:
+                continue
+            if _event_time_matches(
+                record.fields.get(self.fields.state_recorded_at), inspected_at
+            ):
+                return record
+        return None
 
     def update_snapshot(
         self,
@@ -967,9 +1103,13 @@ def _interval_status_text(value: Any) -> str:
 def _datetime_cell(value: datetime) -> str:
     if not isinstance(value, datetime):
         raise TypeError("时间字段必须是 datetime")
-    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S") if value.tzinfo else value.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    if not value.tzinfo:
+        # 已经是“业务墙上时间”的 naive 值按原样输出。
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    # 容器时区通常是 UTC；直接 astimezone() 会把事件时间写成 UTC 墙钟，
+    # 飞书按租户时区解析后整体偏移 8 小时。统一换算到业务时区
+    # （HISTORY_TIMEZONE，默认 Asia/Shanghai）再输出。
+    return value.astimezone(_business_timezone()).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _snapshot_online_text(snapshot: MonitorSample | MonitorResult) -> str | None:

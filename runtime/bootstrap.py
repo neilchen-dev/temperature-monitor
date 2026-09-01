@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 import os
 from typing import Any, Callable
 
@@ -43,9 +44,13 @@ from repositories import (
     SQLiteStandardResolver,
     connect,
 )
+from repositories.sqlite import verify_runtime_schema
 from scheduler.worker import TaskScheduler
 
 from .shadow_runner import ShadowRuntime
+
+
+logger = logging.getLogger("temperature_monitor")
 
 
 class RuntimeBootstrapError(ValueError):
@@ -98,6 +103,66 @@ class RuntimeComponents:
         return getattr(self.runtime, name)
 
 
+# 最近一次 build_runtime 的结果，供 /api/system/status 只读暴露运行时健康。
+# 测试会反复 build/stop，这里只保存引用，不持有额外资源。
+_last_components: Any = None
+
+
+def _active_write_allowed(mode: str) -> bool:
+    """Active 写回三开关：mode=active + FEISHU_WRITE_ENABLED + CUTOVER ACK。"""
+    return (
+        mode == AutomationMode.ACTIVE.value
+        and config.FEISHU_WRITE_ENABLED
+        and config.ACTIVE_CUTOVER_ACK == config.ACTIVE_CUTOVER_ACK_EXPECTED
+    )
+
+
+def active_block_reason() -> str | None:
+    """Why Active writes are blocked; None when not attempting Active mode."""
+    if str(config.AUTOMATION_MODE).strip().lower() != AutomationMode.ACTIVE.value:
+        return None
+    reasons: list[str] = []
+    if not config.FEISHU_WRITE_ENABLED:
+        reasons.append("FEISHU_WRITE_ENABLED=true is required")
+    if config.ACTIVE_CUTOVER_ACK != config.ACTIVE_CUTOVER_ACK_EXPECTED:
+        reasons.append(
+            f"ACTIVE_CUTOVER_ACK={config.ACTIVE_CUTOVER_ACK_EXPECTED} is required "
+            "(legacy Feishu automation workflows must be disabled by hand first)"
+        )
+    return "; ".join(reasons) if reasons else None
+
+
+def runtime_status() -> dict[str, Any]:
+    """Return the live Shadow Runtime status for observability endpoints."""
+    if _last_components is None:
+        return {"available": False, "reason": "runtime not built"}
+    try:
+        status = _last_components.status()
+    except Exception:  # noqa: BLE001 - status endpoint must never raise
+        return {"available": False, "reason": "runtime status unavailable"}
+    block = active_block_reason()
+    if block is not None:
+        status["active_block_reason"] = block
+    return status
+
+
+def shadow_summary_snapshot(*, hours: int = 24) -> dict[str, Any]:
+    """Read-only Shadow aggregates for /api/shadow/summary."""
+    if _last_components is None:
+        return {
+            "available": False,
+            "reason": "runtime not built",
+            "hours": hours,
+        }
+    try:
+        summary = _last_components.shadow_summary(hours=hours)
+    except Exception:  # noqa: BLE001 - summary endpoint must never raise
+        logger.exception("Shadow summary 聚合失败")
+        return {"available": False, "reason": "shadow summary unavailable", "hours": hours}
+    summary["available"] = True
+    return summary
+
+
 def build_runtime(
     *,
     connection: Any | None = None,
@@ -121,6 +186,15 @@ def build_runtime(
     operation_repository = SQLiteOperationRepository(runtime_connection)
     latest_sample_repository = SQLiteLatestSampleRepository(runtime_connection)
     run_repository = SQLiteAutomationRunRepository(runtime_connection)
+    # 半旧 schema 拒绝启动：各仓储构造时会做增量迁移/建表，此处校验迁移后
+    # 仍缺关键列时显式报错，绝不静默运行在残缺 schema 上（旧采集链路不受
+    # 影响——build_runtime 的调用方会捕获并记录，legacy 继续可用）。
+    schema_missing = verify_runtime_schema(runtime_connection)
+    if schema_missing:
+        raise RuntimeBootstrapError(
+            "SQLite schema incomplete; refusing to start Shadow Runtime: "
+            + "; ".join(schema_missing)
+        )
 
     source = record_source or FeishuBitableRecordSource()
     standard_table_id = config.FEISHU_STANDARD_TABLE_ID or "__missing_standard_table__"
@@ -152,6 +226,7 @@ def build_runtime(
         operation_table_id=operation_table_id,
         interval_table_id=config.FEISHU_OPERATION_INTERVAL_TABLE_ID,
         device_table_id=device_table_id,
+        source=source,
     )
     event_writer = FeishuEnvironmentEventWriter(
         writer=record_writer,
@@ -164,6 +239,7 @@ def build_runtime(
         writer=record_writer,
         inspection_table_id=config.FEISHU_INSPECTION_TABLE_ID,
         device_table_id=device_table_id,
+        source=source,
     )
     observation_source = FeishuBitableObservationSource(
         source=source,
@@ -186,6 +262,7 @@ def build_runtime(
             standard_id=config.FEISHU_OBSERVATION_STANDARD_ID_FIELD or None,
             standard_revision=config.FEISHU_OBSERVATION_STANDARD_REVISION_FIELD or None,
             active_event_count="__active_event_count",
+            pending_closure_count="__pending_closure_count",
             observed_at="__observed_at",
             data_quality=config.FEISHU_OBSERVATION_DATA_QUALITY_FIELD,
             temperature_status=config.FEISHU_OBSERVATION_TEMP_STATUS_FIELD,
@@ -196,8 +273,7 @@ def build_runtime(
 
     effective_mode = (
         mode
-        if mode == AutomationMode.SHADOW.value
-        or (mode == AutomationMode.ACTIVE.value and config.FEISHU_WRITE_ENABLED)
+        if mode == AutomationMode.SHADOW.value or _active_write_allowed(mode)
         else AutomationMode.DISABLED.value
     )
     action_executor = ActionExecutor(
@@ -243,9 +319,10 @@ def build_runtime(
     missing = _missing_configuration()
     reason_parts = [part for part in (mode_error, device_error, *missing) if part]
     if mode == AutomationMode.ACTIVE.value:
-        if not config.FEISHU_WRITE_ENABLED:
+        active_block = active_block_reason()
+        if active_block:
             reason_parts.append(
-                "Active mode requires FEISHU_WRITE_ENABLED=true; no Feishu writes are enabled"
+                f"Active mode blocked: {active_block}; no Feishu writes are enabled"
             )
     if not config.SQLITE_ENABLED:
         reason_parts.append("SQLITE_ENABLED=false，Shadow 无法持久化内部状态")
@@ -274,9 +351,7 @@ def build_runtime(
         available=available,
         unavailable_reason="; ".join(reason_parts) if reason_parts else None,
         feishu_readonly_available=not missing,
-        feishu_write_enabled=(
-            mode == AutomationMode.ACTIVE.value and config.FEISHU_WRITE_ENABLED
-        ),
+        feishu_write_enabled=_active_write_allowed(mode),
         devices=devices,
         monitor_service=monitor_service,
         standard_sync=StandardSyncService(
@@ -300,6 +375,8 @@ def build_runtime(
         shutdown_timeout=config.RUNTIME_SHUTDOWN_TIMEOUT_SECONDS,
     )
     runtime_holder["runtime"] = runtime
+    global _last_components
+    _last_components = runtime
     return RuntimeComponents(
         runtime=runtime,
         connection=runtime_connection,

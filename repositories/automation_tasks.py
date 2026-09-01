@@ -344,3 +344,25 @@ class SQLiteAutomationTaskRepository:
             attempt_count=row["attempt_count"],
             last_error=row["last_error"],
         )
+
+
+def purge_finished_automation_tasks(
+    connection: sqlite3.Connection,
+    cutoff: datetime,
+) -> int:
+    """Delete terminal tasks finished before ``cutoff``; return count.
+
+    SHADOW_COMPARE 每个采样建一条任务（dedupe=device+sample_time），不加
+    清理会无限增长。只删 SUCCEEDED/FAILED/CANCELLED，运行中的不动。
+    """
+    cursor = connection.execute(
+        """
+        DELETE FROM automation_tasks
+        WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+          AND finished_at IS NOT NULL
+          AND finished_at < ?
+        """,
+        (_datetime_text(cutoff),),
+    )
+    connection.commit()
+    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0

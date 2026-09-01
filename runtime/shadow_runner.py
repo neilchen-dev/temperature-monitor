@@ -15,6 +15,7 @@ import sqlite3
 import threading
 from typing import Any, Callable, Mapping
 
+import config
 from application.monitor_service import MonitorApplicationService, MonitorHandlingResult
 from application.operation_sync import OperationObservationService
 from application.shadow import (
@@ -25,13 +26,23 @@ from application.shadow import (
 from application.standard_sync import StandardSyncService
 from domain.models import DeviceContext, MonitorSample
 from integrations.feishu_operation import FeishuOperationAdapter
-from repositories.automation_tasks import SQLiteAutomationTaskRepository
+from repositories.automation_runs import purge_automation_runs
+from repositories.automation_tasks import (
+    SQLiteAutomationTaskRepository,
+    purge_finished_automation_tasks,
+)
 from repositories.environment_events import SQLiteEnvironmentEventRepository
 from repositories.runtime_state import SQLiteLatestSampleRepository
 from scheduler.worker import TaskScheduler
 
 
 logger = logging.getLogger("temperature_monitor")
+
+# SHADOW_COMPARE 观察失败时的重试上限：1 次原始执行 + 最多 2 次重试。
+# 没有上限时，永久性错误（如设备不在飞书设备表中）会无限生成
+# SHADOW_RETRY 任务，automation_tasks 无限膨胀。
+_SHADOW_COMPARE_MAX_ATTEMPTS = 3
+_PURGE_INTERVAL = timedelta(hours=1)
 
 
 @dataclass(frozen=True)
@@ -134,6 +145,9 @@ class ShadowRuntime:
         self._last_shadow_compare_time: datetime | None = None
         self._last_shadow_diff: str | None = None
         self._enabled_standard_count = 0
+        self._skipped_device_log: set[str] = set()
+        self._last_purge_time: datetime | None = None
+        self._last_operation_sync_time: datetime | None = None
 
     def start(self) -> None:
         """Start local scheduling; Feishu sync and observation are background work."""
@@ -209,7 +223,17 @@ class ShadowRuntime:
             # domain-agnostic TaskScheduler implementation.
             while not stop_event.is_set():
                 with self._execution_lock:
-                    self.scheduler.run_once()
+                    self._maybe_purge()
+                    try:
+                        self.scheduler.run_once()
+                    except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
+                        # run_once 已捕获 handler 异常；走到这里的是
+                        # claim/commit/lease 等基础层错误。以前会直接炸掉
+                        # 整个调度线程（VERIFY_ALARM/RECOVERY、SYNC、COMPARE
+                        # 全部停摆且无告警），现在记录后继续下一个 tick。
+                        logger.exception(
+                            "Shadow scheduler tick failed; continuing next poll"
+                        )
                 if stop_event.wait(self.scheduler.poll_interval):
                     return
         finally:
@@ -217,6 +241,32 @@ class ShadowRuntime:
                 if self._closed:
                     self._scheduler_thread = None
                     self._close_connection()
+
+    def _maybe_purge(self) -> None:
+        """Bound automation_runs/automation_tasks growth (hourly, best-effort)."""
+        retention_days = config.AUTOMATION_RUN_RETENTION_DAYS
+        if retention_days <= 0:
+            return
+        now = self.now_provider()
+        if (
+            self._last_purge_time is not None
+            and now - self._last_purge_time < _PURGE_INTERVAL
+        ):
+            return
+        self._last_purge_time = now
+        cutoff = now - timedelta(days=retention_days)
+        try:
+            purged_runs = purge_automation_runs(self.connection, cutoff)
+            purged_tasks = purge_finished_automation_tasks(self.connection, cutoff)
+            if purged_runs or purged_tasks:
+                logger.info(
+                    "automation history purged | runs=%s | tasks=%s | retention_days=%s",
+                    purged_runs,
+                    purged_tasks,
+                    retention_days,
+                )
+        except sqlite3.Error:
+            logger.exception("automation history purge failed; retry next hour")
 
     def _close_connection(self) -> None:
         try:
@@ -227,7 +277,20 @@ class ShadowRuntime:
     def handle_sample(self, sample: MonitorSample) -> MonitorHandlingResult | None:
         """Route one normalized acquisition sample into the Shadow pipeline."""
         device_id = sample.device_id.strip().upper()
-        if not self._accepting_samples or device_id not in self.devices:
+        if not self._accepting_samples:
+            return None
+        if device_id not in self.devices:
+            # 这里是"只有 TH-10 有 SHADOW_COMPARE"的直接根因路径：
+            # 白名单外的设备直接丢弃。每台设备只提示一次，日志包含
+            # device_id、reason 与当前已配置设备，便于线上排查盲区。
+            if device_id not in self._skipped_device_log:
+                self._skipped_device_log.add(device_id)
+                logger.info(
+                    "sample ignored | device=%s | reason=not_configured_in_shadow_whitelist "
+                    "| configured_devices=%s | remediation=add device to SHADOW_DEVICE_IDS",
+                    device_id,
+                    ",".join(sorted(self.devices)) or "none",
+                )
             return None
         normalized_sample = (
             sample
@@ -286,6 +349,75 @@ class ShadowRuntime:
             status["scheduler"] = {"running": scheduler_running}
             return status
 
+    def shadow_summary(self, *, hours: int = 24, now: datetime | None = None) -> dict[str, Any]:
+        """Aggregate recent SHADOW_COMPARE outcomes for production checks.
+
+        Read-only view over automation_runs; never mutates business state.
+        """
+        current = now or self.now_provider()
+        cutoff_text = (current - timedelta(hours=hours)).isoformat()
+        rows = self.connection.execute(
+            """
+            SELECT device_id, matched, difference_type, created_at
+            FROM automation_runs
+            WHERE action_type = 'SHADOW_COMPARE' AND created_at >= ?
+            """,
+            (cutoff_text,),
+        ).fetchall()
+        total = len(rows)
+        matched = sum(1 for row in rows if row["matched"] == 1)
+        observation_errors = sum(
+            1 for row in rows if row["difference_type"] == "OBSERVATION_ERROR"
+        )
+        mismatch = total - matched - observation_errors
+        by_difference_type: dict[str, int] = {}
+        by_device: dict[str, dict[str, int]] = {}
+        last_compare_time: str | None = None
+        for row in rows:
+            key = row["difference_type"] or "MATCH"
+            by_difference_type[key] = by_difference_type.get(key, 0) + 1
+            device_stats = by_device.setdefault(
+                row["device_id"],
+                {"total": 0, "matched": 0, "mismatch": 0, "observation_error": 0},
+            )
+            device_stats["total"] += 1
+            if row["matched"] == 1:
+                device_stats["matched"] += 1
+            elif row["difference_type"] == "OBSERVATION_ERROR":
+                device_stats["observation_error"] += 1
+            else:
+                device_stats["mismatch"] += 1
+            if last_compare_time is None or row["created_at"] > last_compare_time:
+                last_compare_time = row["created_at"]
+        standard_age = (
+            (current - self._last_standard_sync_time).total_seconds()
+            if self._last_standard_sync_time is not None
+            else None
+        )
+        operation_age = (
+            (current - self._last_operation_sync_time).total_seconds()
+            if self._last_operation_sync_time is not None
+            else None
+        )
+        return {
+            "hours": hours,
+            "total_compare": total,
+            "matched": matched,
+            "mismatch": mismatch,
+            "observation_error_count": observation_errors,
+            "match_rate": round(matched / total, 4) if total else None,
+            "by_difference_type": by_difference_type,
+            "by_device": by_device,
+            "last_compare_time": last_compare_time,
+            "devices_with_no_compare": sorted(set(self.devices) - set(by_device)),
+            "scheduler_running": bool(
+                self._scheduler_thread is not None
+                and self._scheduler_thread.is_alive()
+            ),
+            "standard_sync_age_seconds": standard_age,
+            "operation_sync_age_seconds": operation_age,
+        }
+
     # The following methods are handlers for TaskScheduler.  They deliberately
     # contain orchestration only; business decisions stay in existing services.
     def handle_verify_alarm(self, task: Any) -> None:
@@ -311,19 +443,38 @@ class ShadowRuntime:
                     expected.alarm_state,
                     self._last_shadow_diff,
                 )
-        except Exception:
+        except Exception as exc:
             # Keep a durable retry task for temporary read failures while the
             # original task records its failed attempt and error context.
-            retry_at = self.now_provider() + timedelta(seconds=30)
-            self.task_repository.create_or_get(
-                task_type="SHADOW_COMPARE",
-                entity_type="DEVICE",
-                entity_id=expected.device_id,
-                due_at=retry_at,
-                payload=dict(task.payload),
-                dedupe_key=f"SHADOW_RETRY:{task.task_id}:{task.attempt_count}",
-                created_at=self.now_provider(),
-            )
+            # 注意：重试是"新任务"，attempt_count 会归零，所以累计次数必须
+            # 放在 payload 里传递，否则上限永远不会触发。
+            compare_attempt = int(task.payload.get("compare_attempt", 0)) + 1
+            if compare_attempt < _SHADOW_COMPARE_MAX_ATTEMPTS:
+                retry_at = self.now_provider() + timedelta(seconds=30)
+                retry_payload = dict(task.payload)
+                retry_payload["compare_attempt"] = compare_attempt
+                self.task_repository.create_or_get(
+                    task_type="SHADOW_COMPARE",
+                    entity_type="DEVICE",
+                    entity_id=expected.device_id,
+                    due_at=retry_at,
+                    payload=retry_payload,
+                    dedupe_key=f"SHADOW_RETRY:{task.task_id}:{compare_attempt}",
+                    created_at=self.now_provider(),
+                )
+            # 失败的比对以前不会出现在 automation_runs（run 行只在成功路径
+            # 里记录），导致"设备没有 SHADOW_COMPARE"无法与"比对一直失败"
+            # 区分开。这里把失败也落一条 run，供线上排查。
+            try:
+                self.shadow_comparison.record_failure(
+                    device_id=expected.device_id,
+                    sample_time=datetime.fromisoformat(task.payload["sample_time"]),
+                    expected=_expected_payload(expected),
+                    error=f"{type(exc).__name__}: {exc}",
+                    created_at=self.now_provider(),
+                )
+            except Exception:  # noqa: BLE001 - observability must not mask the cause
+                logger.exception("failed to record shadow compare failure run")
             raise
 
     def handle_standard_sync(self, task: Any) -> None:
@@ -362,6 +513,7 @@ class ShadowRuntime:
                     len(observations),
                     accepted,
                 )
+                self._last_operation_sync_time = self.now_provider()
             except Exception:
                 logger.exception("Shadow 作业状态同步失败，保留上一版状态")
             finally:

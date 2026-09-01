@@ -31,6 +31,7 @@ class FeishuObservationFieldMap:
     humidity_status: str | None = None
     active_event_ids: str | None = None
     operation_type: str | None = None
+    pending_closure_count: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,8 @@ class FeishuObservationTableFieldMap:
     # used by an earlier draft and would make closed records look active.
     event_status: str = "处理状态"
     closed_statuses: tuple[str, ...] = ("关闭", "已关闭", "CLOSED")
+    # 已写恢复时间的打开事件 = 已物理恢复、等待人工闭环，不是当前活动报警。
+    event_recovery_time: str = "恢复时间"
 
 
 class FeishuBitableObservationSource:
@@ -78,17 +81,28 @@ class FeishuBitableObservationSource:
                 f"found {len(matches)}"
             )
         device_record = matches[0]
-        active_events = tuple(
+        open_events = tuple(
             record
             for record in self.source.read_records(self.event_table_id)
             if _field_text(record.fields, self.fields.event_device_id).upper()
             == normalized_device
             and not self._is_closed(record.fields.get(self.fields.event_status))
         )
+        active_events = tuple(
+            record
+            for record in open_events
+            if not self._has_recovery_time(record.fields)
+        )
+        pending_closure_events = tuple(
+            record
+            for record in open_events
+            if self._has_recovery_time(record.fields)
+        )
         raw = dict(device_record.fields)
-        raw["__event_exists"] = bool(active_events)
+        raw["__event_exists"] = bool(open_events)
         raw["__active_event_count"] = len(active_events)
         raw["__active_event_ids"] = [record.record_id for record in active_events]
+        raw["__pending_closure_count"] = len(pending_closure_events)
         raw["__observed_at"] = _record_time(device_record.updated_at) or _record_time(
             device_record.created_at
         )
@@ -99,6 +113,9 @@ class FeishuBitableObservationSource:
         return normalized_value in {
             status.strip().lower() for status in self.fields.closed_statuses
         }
+
+    def _has_recovery_time(self, fields: Mapping[str, Any]) -> bool:
+        return _field_text(fields.get(self.fields.event_recovery_time)) != ""
 
 
 class FeishuObservationAdapter:
@@ -126,6 +143,9 @@ class FeishuObservationAdapter:
             standard_revision=_optional_text(raw, self.fields.standard_revision),
             active_event_count=_optional_int(
                 raw, self.fields.active_event_count
+            ),
+            pending_closure_count=_optional_int(
+                raw, self.fields.pending_closure_count
             ),
             observed_at=_optional_datetime(raw, self.fields.observed_at),
             applicability=_applicability(raw, self.fields.applicability),
@@ -243,6 +263,12 @@ def _optional_int(raw: Mapping[str, Any], field_name: str | None) -> int | None:
     value = raw.get(field_name)
     if value is None or value == "":
         return None
+    # 整数值（尤其是 0）必须直接转换：_text() 会把 0 当 falsy 归一成空串，
+    # int("") 抛 ValueError，导致“无打开事件”的设备 observe 必然失败。
+    if isinstance(value, bool):
+        raise ValueError(f"Feishu observation field is not an integer: {field_name}")
+    if isinstance(value, (int, float)):
+        return int(value)
     try:
         return int(_text(value))
     except (TypeError, ValueError) as exc:
