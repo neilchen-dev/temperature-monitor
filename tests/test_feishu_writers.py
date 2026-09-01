@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import config
 from domain.models import (
     DataQualityStatus,
     MonitorResult,
@@ -240,9 +242,13 @@ class FeishuInspectionWriterTests(unittest.TestCase):
 
         _, fields, token = recording.created[-1]
         self.assertEqual(token, "inspection-1")
+        # 写回时间按业务时区（HISTORY_TIMEZONE）输出，不能用系统本地时区：
+        # 容器/CI 的本地时区是 UTC，断言会整体偏移。
         self.assertEqual(
             fields["状态记录时间"],
-            _sample().sample_time.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            _sample()
+            .sample_time.astimezone(ZoneInfo(config.HISTORY_TIMEZONE))
+            .strftime("%Y-%m-%d %H:%M:%S"),
         )
         self.assertEqual(fields["当时环境判定"], "超限")
         self.assertEqual(fields["监测系统状态"], "离线/数据异常")

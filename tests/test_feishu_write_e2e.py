@@ -3,6 +3,9 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+import config
 
 from application.action_executor import ActionExecutor
 from application.actions import ApplicationActionMapper
@@ -242,10 +245,12 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         sample(base_time + timedelta(minutes=6), 37)
         self.assertEqual(store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 37.0)
         sample(base_time + timedelta(minutes=7), 25)
+        # 写回时间按业务时区（HISTORY_TIMEZONE）输出，不能用系统本地时区：
+        # 容器/CI 的本地时区是 UTC，断言会整体偏移 8 小时。
         self.assertEqual(
             store.read_records("tbl-event")[0].fields["恢复时间"],
             (base_time + timedelta(minutes=7))
-            .astimezone()
+            .astimezone(ZoneInfo(config.HISTORY_TIMEZONE))
             .strftime("%Y-%m-%d %H:%M:%S"),
         )
         sample(base_time + timedelta(minutes=8), 25)
