@@ -2,8 +2,8 @@
 
 The runner is an application boundary: it receives normalized samples from the
 existing acquisition path, persists Python-owned projections, and queues all
-network observation work on the generic durable scheduler.  No method here has
-permission to call a Feishu write API.
+network observation work on the generic durable scheduler.  Feishu writes are
+available only through explicitly injected Active-mode handlers.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ class RuntimeStatus:
     reason: str | None
     worker_id: str
     feishu_readonly_available: bool
+    feishu_write_enabled: bool
     configured_shadow_devices: tuple[str, ...]
     scheduler_running: bool
     last_standard_sync_time: datetime | None
@@ -58,6 +59,7 @@ class RuntimeStatus:
             "reason": self.reason,
             "worker_id": self.worker_id,
             "feishu_readonly_available": self.feishu_readonly_available,
+            "feishu_write_enabled": self.feishu_write_enabled,
             "configured_shadow_devices": list(self.configured_shadow_devices),
             "scheduler_running": self.scheduler_running,
             "last_standard_sync_time": _iso(self.last_standard_sync_time),
@@ -78,6 +80,7 @@ class ShadowRuntime:
         available: bool,
         unavailable_reason: str | None,
         feishu_readonly_available: bool,
+        feishu_write_enabled: bool,
         devices: Mapping[str, DeviceContext],
         monitor_service: MonitorApplicationService,
         standard_sync: StandardSyncService,
@@ -100,6 +103,7 @@ class ShadowRuntime:
         self.available = available
         self.unavailable_reason = unavailable_reason
         self.feishu_readonly_available = feishu_readonly_available
+        self.feishu_write_enabled = feishu_write_enabled
         self.devices = {key.strip().upper(): value for key, value in devices.items()}
         self.monitor_service = monitor_service
         self.standard_sync = standard_sync
@@ -270,6 +274,7 @@ class ShadowRuntime:
                 reason=self.unavailable_reason,
                 worker_id=self.worker_id,
                 feishu_readonly_available=self.feishu_readonly_available,
+                feishu_write_enabled=self.feishu_write_enabled,
                 configured_shadow_devices=tuple(self.devices),
                 scheduler_running=scheduler_running,
                 last_standard_sync_time=self._last_standard_sync_time,

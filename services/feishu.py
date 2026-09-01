@@ -154,9 +154,8 @@ def list_bitable_records(
 ) -> list[dict[str, Any]]:
     """Read all records from an explicitly configured Base table.
 
-    This is intentionally a read-only primitive for the integration layer.
-    It uses the same token, retry, and pagination handling as the existing
-    Feishu service but does not expose any create/update/delete operation.
+    This is the read primitive for the integration layer.  It uses the same
+    token, retry, and pagination handling as the write primitives below.
     """
     _validate_bitable_config()
     base_url = _bitable_table_url(table_id, "/records/search")
@@ -273,13 +272,71 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
 
 
 def update_feishu_fields(record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-    _validate_bitable_config(require_default_table=True)
-    return _request_bitable_json(
-        "PUT",
-        _bitable_table_url(config.TABLE_ID, f"/records/{record_id}"),
-        operation="更新记录",
-        json_data={"fields": fields},
-        lock_key=f"record:{record_id}",
+    return update_bitable_record(
+        config.TABLE_ID,
+        record_id,
+        fields,
+    )
+
+
+def create_bitable_record(
+    table_id: str,
+    fields: dict[str, Any],
+    *,
+    client_token: str | None = None,
+) -> dict[str, Any]:
+    """Create one Base record with an optional caller-owned idempotency token."""
+    _validate_bitable_config()
+    normalized_table_id = str(table_id).strip()
+    if not normalized_table_id:
+        raise ValueError("table_id 不能为空")
+    if not isinstance(fields, dict):
+        raise TypeError("fields 必须是 JSON object")
+    normalized_token = str(client_token or uuid.uuid4()).strip()
+    if not normalized_token:
+        raise ValueError("client_token 不能为空")
+    if len(normalized_token) > 50:
+        raise ValueError("client_token 长度不能超过 50 个字符")
+    query = urlencode({"client_token": normalized_token})
+    return _require_success(
+        _request_bitable_json(
+            "POST",
+            f"{_bitable_table_url(normalized_table_id, '/records')}?{query}",
+            operation="新增 Base 记录",
+            json_data={"fields": dict(fields)},
+            lock_key=f"table:{normalized_table_id}",
+        ),
+        "新增 Base 记录",
+    )
+
+
+def update_bitable_record(
+    table_id: str,
+    record_id: str,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    """Update one Base record in an explicitly configured table."""
+    _validate_bitable_config()
+    normalized_table_id = str(table_id).strip()
+    normalized_record_id = str(record_id).strip()
+    if not normalized_table_id:
+        raise ValueError("table_id 不能为空")
+    if not normalized_record_id:
+        raise ValueError("record_id 不能为空")
+    if not isinstance(fields, dict):
+        raise TypeError("fields 必须是 JSON object")
+    return _require_success(
+        _request_bitable_json(
+            "PUT",
+            _bitable_table_url(
+                normalized_table_id,
+                f"/records/{normalized_record_id}",
+            ),
+            operation="更新 Base 记录",
+            json_data={"fields": dict(fields)},
+            lock_key=f"record:{normalized_record_id}",
+        ),
+        "更新 Base 记录",
     )
 
 

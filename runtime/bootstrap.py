@@ -15,7 +15,7 @@ from application.operation_sync import OperationObservationService
 from application.shadow import ShadowComparisonService
 from application.standard_sync import StandardSyncService
 from domain.alarm_state_machine import AlarmStateMachine
-from domain.models import ControlType, DeviceContext
+from domain.models import AlarmActionType, ControlType, DeviceContext
 from integrations.feishu_observation import (
     FeishuBitableObservationSource,
     FeishuObservationAdapter,
@@ -26,6 +26,12 @@ from integrations.feishu_operation import FeishuOperationAdapter, FeishuOperatio
 from integrations.feishu_records import FeishuBitableRecordSource
 from integrations.feishu_standard import FeishuStandardAdapter
 from integrations.feishu_standard_config import FEISHU_STANDARD_FIELD_MAP
+from integrations.feishu_writers import (
+    FeishuBitableRecordWriter,
+    FeishuEnvironmentEventWriter,
+    FeishuInspectionRecordWriter,
+    FeishuOperationRecordWriter,
+)
 from repositories import (
     SQLiteAlarmStateRepository,
     SQLiteAutomationRunRepository,
@@ -72,6 +78,9 @@ class RuntimeComponents:
     standard_repository: SQLiteStandardRepository
     operation_repository: SQLiteOperationRepository
     latest_sample_repository: SQLiteLatestSampleRepository
+    operation_writer: FeishuOperationRecordWriter
+    event_writer: FeishuEnvironmentEventWriter
+    inspection_writer: FeishuInspectionRecordWriter
 
     def start(self) -> None:
         self.runtime.start()
@@ -132,7 +141,29 @@ def build_runtime(
             action=config.FEISHU_OPERATION_ACTION_FIELD,
             operation_type=config.FEISHU_OPERATION_TYPE_FIELD,
             work_order=config.FEISHU_OPERATION_WORK_ORDER_FIELD,
+            validation=config.FEISHU_OPERATION_VALIDATION_FIELD or None,
+            valid_values=(config.FEISHU_OPERATION_VALIDATION_VALUE,),
+            allowed_device_ids=frozenset(config.FEISHU_OPERATION_ALLOWED_DEVICES),
         ),
+    )
+    record_writer = FeishuBitableRecordWriter()
+    operation_writer = FeishuOperationRecordWriter(
+        writer=record_writer,
+        operation_table_id=operation_table_id,
+        interval_table_id=config.FEISHU_OPERATION_INTERVAL_TABLE_ID,
+        device_table_id=device_table_id,
+    )
+    event_writer = FeishuEnvironmentEventWriter(
+        writer=record_writer,
+        source=source,
+        event_table_id=event_table_id,
+        device_table_id=device_table_id,
+        device_id_field=config.DEVICE_ID_FIELD,
+    )
+    inspection_writer = FeishuInspectionRecordWriter(
+        writer=record_writer,
+        inspection_table_id=config.FEISHU_INSPECTION_TABLE_ID,
+        device_table_id=device_table_id,
     )
     observation_source = FeishuBitableObservationSource(
         source=source,
@@ -152,8 +183,8 @@ def build_runtime(
             operation_type=config.FEISHU_OBSERVATION_OPERATION_TYPE_FIELD,
             event_exists="__event_exists",
             overall_status=config.FEISHU_OBSERVATION_OVERALL_FIELD,
-            standard_id=config.FEISHU_OBSERVATION_STANDARD_ID_FIELD,
-            standard_revision=config.FEISHU_OBSERVATION_STANDARD_REVISION_FIELD,
+            standard_id=config.FEISHU_OBSERVATION_STANDARD_ID_FIELD or None,
+            standard_revision=config.FEISHU_OBSERVATION_STANDARD_REVISION_FIELD or None,
             active_event_count="__active_event_count",
             observed_at="__observed_at",
             data_quality=config.FEISHU_OBSERVATION_DATA_QUALITY_FIELD,
@@ -163,8 +194,30 @@ def build_runtime(
         ),
     )
 
-    effective_mode = mode if mode == AutomationMode.SHADOW.value else AutomationMode.DISABLED.value
-    action_executor = ActionExecutor(mode=effective_mode, recorder=run_repository)
+    effective_mode = (
+        mode
+        if mode == AutomationMode.SHADOW.value
+        or (mode == AutomationMode.ACTIVE.value and config.FEISHU_WRITE_ENABLED)
+        else AutomationMode.DISABLED.value
+    )
+    action_executor = ActionExecutor(
+        mode=effective_mode,
+        handlers={
+            # Verification tasks are already persisted by the application
+            # service; Active mode should audit them as successful local work,
+            # not treat them as missing Feishu handlers.
+            AlarmActionType.CREATE_VERIFY_TASK: lambda action: None,
+            AlarmActionType.CANCEL_VERIFY_TASK: lambda action: None,
+            AlarmActionType.COMPLETE_VERIFY_TASK: lambda action: None,
+        },
+        context_handlers={
+            AlarmActionType.CREATE_ALARM_EVENT: event_writer.handle_alarm_action,
+            AlarmActionType.UPDATE_ALARM_EVENT: event_writer.handle_alarm_action,
+            AlarmActionType.START_RECOVERY: event_writer.handle_alarm_action,
+            AlarmActionType.CLOSE_ALARM_EVENT: event_writer.handle_alarm_action,
+        },
+        recorder=run_repository,
+    )
     operation_state_provider = operation_repository
     monitor_service = MonitorApplicationService(
         operation_state_provider=operation_state_provider,
@@ -190,12 +243,16 @@ def build_runtime(
     missing = _missing_configuration()
     reason_parts = [part for part in (mode_error, device_error, *missing) if part]
     if mode == AutomationMode.ACTIVE.value:
-        reason_parts.append(
-            "Active mode is intentionally refused by this bootstrap; use AUTOMATION_MODE=shadow"
-        )
+        if not config.FEISHU_WRITE_ENABLED:
+            reason_parts.append(
+                "Active mode requires FEISHU_WRITE_ENABLED=true; no Feishu writes are enabled"
+            )
     if not config.SQLITE_ENABLED:
         reason_parts.append("SQLITE_ENABLED=false，Shadow 无法持久化内部状态")
-    available = mode == AutomationMode.SHADOW.value and not reason_parts
+    available = mode in {
+        AutomationMode.SHADOW.value,
+        AutomationMode.ACTIVE.value,
+    } and not reason_parts
     worker_id = config.SHADOW_WORKER_ID or f"shadow-{os.getpid()}"
 
     runtime_holder: dict[str, ShadowRuntime] = {}
@@ -217,6 +274,9 @@ def build_runtime(
         available=available,
         unavailable_reason="; ".join(reason_parts) if reason_parts else None,
         feishu_readonly_available=not missing,
+        feishu_write_enabled=(
+            mode == AutomationMode.ACTIVE.value and config.FEISHU_WRITE_ENABLED
+        ),
         devices=devices,
         monitor_service=monitor_service,
         standard_sync=StandardSyncService(
@@ -248,6 +308,9 @@ def build_runtime(
         standard_repository=standard_repository,
         operation_repository=operation_repository,
         latest_sample_repository=latest_sample_repository,
+        operation_writer=operation_writer,
+        event_writer=event_writer,
+        inspection_writer=inspection_writer,
     )
 
 
@@ -267,6 +330,10 @@ def _missing_configuration() -> tuple[str, ...]:
         missing.append("缺少 FEISHU_OPERATION_TABLE_ID")
     if not config.FEISHU_EVENT_TABLE_ID:
         missing.append("缺少 FEISHU_EVENT_TABLE_ID")
+    if not config.FEISHU_OPERATION_INTERVAL_TABLE_ID:
+        missing.append("缺少 FEISHU_OPERATION_INTERVAL_TABLE_ID")
+    if not config.FEISHU_INSPECTION_TABLE_ID:
+        missing.append("缺少 FEISHU_INSPECTION_TABLE_ID")
     return tuple(missing)
 
 

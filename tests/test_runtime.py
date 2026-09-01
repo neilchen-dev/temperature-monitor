@@ -117,7 +117,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(components.status()["scheduler_running"])
         components.stop()
 
-    def test_active_mode_is_refused_by_shadow_bootstrap(self) -> None:
+    def test_active_mode_requires_explicit_feishu_write_enable(self) -> None:
         config.AUTOMATION_MODE = "active"
         components = build_runtime(
             connection=sqlite3.connect(":memory:", check_same_thread=False),
@@ -125,7 +125,7 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertFalse(components.status()["available"])
         self.assertEqual(components.runtime.monitor_service.action_executor.mode.value, "disabled")
-        self.assertIn("Active mode is intentionally refused", components.status()["reason"])
+        self.assertIn("FEISHU_WRITE_ENABLED=true", components.status()["reason"])
         components.start()
         self.assertFalse(components.status()["scheduler_running"])
         components.stop()

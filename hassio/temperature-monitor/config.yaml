@@ -29,6 +29,12 @@ options:
   feishu_standard_table_id: tbl4S6Q0VOYjK92t
   feishu_operation_table_id: tbl3xFxhxnNlv4pm
   feishu_event_table_id: tblc6uCFLGPZLcR6
+  feishu_operation_validation_field: 登记组合校验
+  feishu_operation_validation_value: 有效
+  feishu_operation_allowed_devices: TH-03,TH-04,TH-05,TH-07
+  feishu_operation_interval_table_id: tblZ9JHVhDCSqfhp
+  feishu_inspection_table_id: tblwkQNdeEan8LKf
+  feishu_write_enabled: false
   shadow_worker_id: ""
   shadow_scheduler_poll_seconds: 1
   shadow_operation_sync_seconds: 30
@@ -76,6 +82,12 @@ schema:
   feishu_standard_table_id: str
   feishu_operation_table_id: str
   feishu_event_table_id: str
+  feishu_operation_validation_field: str
+  feishu_operation_validation_value: str
+  feishu_operation_allowed_devices: str
+  feishu_operation_interval_table_id: str
+  feishu_inspection_table_id: str
+  feishu_write_enabled: bool
   shadow_worker_id: str
   shadow_scheduler_poll_seconds: int(1,60)
   shadow_operation_sync_seconds: int(5,86400)

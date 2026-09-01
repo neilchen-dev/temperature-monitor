@@ -79,9 +79,9 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 - Domain 层负责环境标准解析、监控结果、作业上下文和报警状态机，不依赖 Flask、SQLite 或飞书。
 - Application 层编排样本处理、标准/作业同步、任务和动作审计。
-- Runtime 层通过飞书只读适配器读取标准、作业、设备观察和异常事件，使用持久化调度器执行 Shadow 比对。
+- Runtime 层通过飞书适配器读取标准、作业、设备观察和异常事件；默认只读，Active 开启后由集中写入适配器处理异常事件。
 - 标准快照在完整读取和校验后再替换；任务、运行记录、事件和最新观察状态落盘，支持重启恢复和幂等处理。
-- Shadow 只记录“应该发生什么”和“实际观察到什么”的差异，不修改既有飞书工作流。
+- Shadow 只记录“应该发生什么”和“实际观察到什么”的差异，不修改既有飞书工作流；写入由独立开关保护。
 
 ### History and local analytics
 
@@ -111,7 +111,7 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 3. 同一份数据镜像到 SQLite，并更新统一设备状态与状态迁移事件。
 4. 每个整十分钟，Home Assistant 调用 `/history/sample`；服务读取实时表，为配置的监测点生成历史快照。
 5. Modbus collector 按轮询周期读取设备，直接进入统一设备模型和本地查询链路。
-6. Shadow Runtime 读取飞书只读数据，经过领域判定后持久化预期状态、运行结果和比对差异。
+6. Shadow Runtime 读取飞书业务数据，经过领域判定后持久化预期状态、运行结果和比对差异；写入仍由独立开关保护。
 
 | Endpoint | Purpose | Auth |
 | --- | --- | --- |
@@ -126,6 +126,10 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 | `GET /api/devices` | 查询统一设备状态 | `X-History-Key` |
 | `GET /api/events` | 查询设备事件 | `X-History-Key` |
 | `GET /api/thresholds` / `PUT /api/thresholds/<device_id>` | 查询或写入设备控制区间 | `X-History-Key` |
+| `POST /api/operations` | 写入一条作业登记 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
+| `POST /api/environment-events` | 写入一条环境异常事件 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
+| `PATCH /api/environment-events/<record_id>` | 填写闭环资料并关闭环境异常 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
+| `POST /api/inspections` | 写入一条仓库点检记录 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
 | `GET /api/system/status` | 采集器和运行摘要 | 无 |
 
 程序化访问查询 API 时使用 `X-History-Key`，也可以使用 `Authorization: Bearer <HISTORY_API_KEY>`。密钥不会通过 URL 传递。
@@ -136,7 +140,7 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 - **`disabled`**：默认模式，不执行自动化动作；Home Assistant、历史同步和基础监控链路仍可运行；
 - **`shadow`**：只读读取飞书业务状态，计算预期监控结果并与观察状态比对，持久化任务、运行记录和差异，不调用外部动作 handler；
-- **`active`**：动作执行器保留该模式用于未来扩展，但当前 bootstrap 会主动拒绝 Active 接管，避免部署后静默修改现场业务。
+- **`active`**：启用 Python 的异常事件自动写入；作业登记和仓库点检可通过受保护 API 写入。必须同时设置 `FEISHU_WRITE_ENABLED=true`，否则自动降级为 disabled；恢复只回写 `恢复时间`，异常关闭仍要求人工填写闭环资料。
 
 此外，工业采集与本地镜像可以独立开关：
 
@@ -215,10 +219,12 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `APP_ID` / `APP_SECRET` | — | 飞书应用凭据 |
 | `APP_TOKEN` / `TABLE_ID` | — | 飞书多维表格 App Token 和实时数据表 ID |
 | `HISTORY_API_KEY` | — | 历史采样、查询 API 和控制台数据请求共享密钥，至少 32 字节 |
-| `AUTOMATION_MODE` | `disabled` | 自动化运行模式：`disabled`、`shadow` 或 `active`；当前 bootstrap 拒绝 `active` |
+| `AUTOMATION_MODE` | `disabled` | 自动化运行模式：`disabled`、`shadow` 或 `active`；Active 还要求 `FEISHU_WRITE_ENABLED=true` |
 | `SHADOW_DEVICE_IDS` | 空 | Shadow 处理的设备白名单；为空时不处理设备 |
 | `SHADOW_DEVICE_CONTEXTS` | 空 | 设备上下文 JSON，可覆盖区域和控制类型 |
 | `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID |
+| `FEISHU_OPERATION_INTERVAL_TABLE_ID` / `FEISHU_INSPECTION_TABLE_ID` | 当前台账表 ID | 作业区间和仓库点检写入目标表 |
+| `FEISHU_WRITE_ENABLED` | `false` | 飞书写入总开关；只有与 `AUTOMATION_MODE=active` 同时启用才生效 |
 | `SHADOW_*_SECONDS` | 见 `.env.example` | Shadow 调度、作业同步、标准同步和飞书延迟窗口 |
 | `TEMPERATURE_API_KEY` | 空 | 可选的温度上报接口共享密钥 |
 | `HISTORY_DEVICES` | `TH-01,…,TH-11` | 历史采样设备列表；覆盖时必须同步配置 `HISTORY_TABLE_MAP` |

@@ -16,11 +16,21 @@ control bands in the local SQLite mirror (never pushed to Feishu) for the
 
 from __future__ import annotations
 
+from datetime import datetime
 import hmac
+import requests
 
 from flask import Blueprint, jsonify, request
 
 import config
+from integrations.feishu_records import FeishuBitableRecordSource
+from integrations.feishu_writers import (
+    FeishuBitableRecordWriter,
+    FeishuEnvironmentEventWriter,
+    FeishuInspectionRecordWriter,
+    FeishuOperationRecordWriter,
+    FeishuWriteError,
+)
 from services import db
 from services.collector import get_collector_status
 
@@ -60,6 +70,44 @@ def _mirror_disabled_error():
         "status": "error",
         "error": "SQLite 本地镜像未启用或初始化失败",
     }), 503
+
+
+def _feishu_write_disabled_error():
+    if config.FEISHU_WRITE_ENABLED and str(config.AUTOMATION_MODE).lower() == "active":
+        return None
+    return jsonify({
+        "status": "error",
+        "error": "飞书写入未启用；请同时设置 FEISHU_WRITE_ENABLED=true 和 AUTOMATION_MODE=active",
+    }), 503
+
+
+def _json_payload() -> tuple[dict | None, tuple]:
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return None, (jsonify({"status": "error", "error": "请求体必须是 JSON 对象"}), 400)
+    return payload, ()
+
+
+def _api_datetime(payload: dict, field_name: str) -> datetime:
+    value = payload.get(field_name)
+    if value in (None, ""):
+        raise ValueError(f"缺少 {field_name}")
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} 必须是 ISO 时间字符串")
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 不是有效的 ISO 时间") from exc
+
+
+def _writer_error_response(exc: Exception):
+    if isinstance(exc, FeishuWriteError):
+        return jsonify({"status": "error", "error": str(exc)}), 409
+    if isinstance(exc, ValueError):
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    if isinstance(exc, (RuntimeError, requests.exceptions.RequestException)):
+        return jsonify({"status": "error", "error": str(exc)}), 502
+    raise exc
 
 
 def _serialize_device_state(row: dict) -> dict:
@@ -152,6 +200,168 @@ def list_events():
         "device": device_id,
         "items": items,
     }), 200
+
+
+@api_bp.post("/api/operations")
+def create_operation_registration():
+    """Create one validated operation registration in the Feishu source table."""
+    error = _auth_error() or _feishu_write_disabled_error()
+    if error:
+        return error
+    payload, payload_error = _json_payload()
+    if payload_error:
+        return payload_error
+    assert payload is not None
+    try:
+        writer = FeishuOperationRecordWriter(
+            writer=FeishuBitableRecordWriter(),
+            operation_table_id=config.FEISHU_OPERATION_TABLE_ID,
+            interval_table_id=config.FEISHU_OPERATION_INTERVAL_TABLE_ID,
+            device_table_id=config.FEISHU_DEVICE_TABLE_ID,
+        )
+        result = writer.create_registration(
+            device_id=str(payload.get("device_id", "")),
+            area=str(payload.get("area", "")),
+            action=str(payload.get("action", "")),
+            operation_type=(
+                str(payload["operation_type"]).strip()
+                if payload.get("operation_type") not in (None, "")
+                else None
+            ),
+            work_order=(
+                str(payload["work_order"]).strip()
+                if payload.get("work_order") not in (None, "")
+                else None
+            ),
+            status_recorded_at=(
+                _api_datetime(payload, "status_recorded_at")
+                if payload.get("status_recorded_at") not in (None, "")
+                else None
+            ),
+            idempotency_key=(
+                str(payload["idempotency_key"]).strip()
+                if payload.get("idempotency_key") not in (None, "")
+                else None
+            ),
+        )
+        return jsonify({"status": "success", "feishu": result}), 201
+    except Exception as exc:  # noqa: BLE001 - translate adapter errors to API responses
+        return _writer_error_response(exc)
+
+
+@api_bp.post("/api/environment-events")
+def create_environment_event():
+    """Create one ENV event after enforcing the single-active-event rule."""
+    error = _auth_error() or _feishu_write_disabled_error()
+    if error:
+        return error
+    payload, payload_error = _json_payload()
+    if payload_error:
+        return payload_error
+    assert payload is not None
+    try:
+        writer = FeishuEnvironmentEventWriter(
+            writer=FeishuBitableRecordWriter(),
+            source=FeishuBitableRecordSource(),
+            event_table_id=config.FEISHU_EVENT_TABLE_ID,
+            device_table_id=config.FEISHU_DEVICE_TABLE_ID,
+            device_id_field=config.DEVICE_ID_FIELD,
+        )
+        result = writer.create_event(
+            device_id=str(payload.get("device_id", "")),
+            area=str(payload.get("area", "")),
+            start_time=_api_datetime(payload, "start_time"),
+            temperature=payload.get("temperature"),
+            humidity=payload.get("humidity"),
+            temperature_status=payload.get("temperature_status"),
+            humidity_status=payload.get("humidity_status"),
+            owner=payload.get("owner"),
+            control_requirement=payload.get("control_requirement"),
+            idempotency_key=payload.get("idempotency_key"),
+        )
+        return jsonify({"status": "success", "feishu": result}), 201
+    except Exception as exc:  # noqa: BLE001 - translate adapter errors to API responses
+        return _writer_error_response(exc)
+
+
+@api_bp.patch("/api/environment-events/<record_id>")
+def close_environment_event(record_id: str):
+    """Close an ENV event only after the required manual closure fields exist."""
+    error = _auth_error() or _feishu_write_disabled_error()
+    if error:
+        return error
+    payload, payload_error = _json_payload()
+    if payload_error:
+        return payload_error
+    assert payload is not None
+    try:
+        writer = FeishuEnvironmentEventWriter(
+            writer=FeishuBitableRecordWriter(),
+            source=FeishuBitableRecordSource(),
+            event_table_id=config.FEISHU_EVENT_TABLE_ID,
+            device_table_id=config.FEISHU_DEVICE_TABLE_ID,
+            device_id_field=config.DEVICE_ID_FIELD,
+        )
+        result = writer.close_event(
+            record_id=record_id,
+            closed_at=_api_datetime(payload, "closed_at"),
+            cause=str(payload.get("cause", "")),
+            measure=str(payload.get("measure", "")),
+            product_impact=str(payload.get("product_impact", "")),
+            recovered_at=(
+                _api_datetime(payload, "recovered_at")
+                if payload.get("recovered_at") not in (None, "")
+                else None
+            ),
+        )
+        return jsonify({"status": "success", "feishu": result}), 200
+    except Exception as exc:  # noqa: BLE001 - translate adapter errors to API responses
+        return _writer_error_response(exc)
+
+
+@api_bp.post("/api/inspections")
+def create_inspection_record():
+    """Create one warehouse inspection record with safe link/number handling."""
+    error = _auth_error() or _feishu_write_disabled_error()
+    if error:
+        return error
+    payload, payload_error = _json_payload()
+    if payload_error:
+        return payload_error
+    assert payload is not None
+    try:
+        writer = FeishuInspectionRecordWriter(
+            writer=FeishuBitableRecordWriter(),
+            inspection_table_id=config.FEISHU_INSPECTION_TABLE_ID,
+            device_table_id=config.FEISHU_DEVICE_TABLE_ID,
+        )
+        result = writer.create_snapshot(
+            area=str(payload.get("area", "")),
+            inspected_at=_api_datetime(payload, "inspected_at"),
+            inspector=payload.get("inspector"),
+            temperature=payload.get("temperature"),
+            humidity=payload.get("humidity"),
+            online_status=payload.get("online_status"),
+            environment_status=payload.get("environment_status"),
+            temperature_status=payload.get("temperature_status"),
+            humidity_status=payload.get("humidity_status"),
+            alarm_status=payload.get("alarm_status"),
+            monitoring_system_status=payload.get("monitoring_system_status"),
+            site_storage_status=payload.get("site_storage_status"),
+            abnormal_alarm_number=payload.get("abnormal_alarm_number"),
+            abnormal_handling=payload.get("abnormal_handling"),
+            system_abnormal_description=payload.get("system_abnormal_description"),
+            parent_record_id=payload.get("parent_record_id"),
+            state_recorded_at=(
+                _api_datetime(payload, "state_recorded_at")
+                if payload.get("state_recorded_at") not in (None, "")
+                else None
+            ),
+            idempotency_key=payload.get("idempotency_key"),
+        )
+        return jsonify({"status": "success", "feishu": result}), 201
+    except Exception as exc:  # noqa: BLE001 - translate adapter errors to API responses
+        return _writer_error_response(exc)
 
 
 def _parse_threshold_bound(

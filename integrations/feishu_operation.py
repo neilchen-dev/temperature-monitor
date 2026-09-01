@@ -29,6 +29,9 @@ class FeishuOperationFieldMap:
     operation_type: str | None = None
     work_order: str | None = None
     source_created_at: str | None = None
+    validation: str | None = None
+    valid_values: tuple[str, ...] = ("有效",)
+    allowed_device_ids: frozenset[str] = frozenset()
 
 
 class FeishuOperationAdapter:
@@ -52,10 +55,28 @@ class FeishuOperationAdapter:
         *,
         observed_at: datetime | None = None,
     ) -> tuple[OperationObservation, ...]:
-        return tuple(
-            self.normalize_record(record, observed_at=observed_at)
-            for record in self.source.read_records(self.table_id)
-        )
+        observations: list[OperationObservation] = []
+        for record in self.source.read_records(self.table_id):
+            if not self._is_workflow_eligible(record):
+                continue
+            observations.append(self.normalize_record(record, observed_at=observed_at))
+        return tuple(observations)
+
+    def _is_workflow_eligible(self, record: FeishuRawRecord) -> bool:
+        """Apply the same gate as the four Feishu operation workflows.
+
+        Invalid registrations remain in Feishu for the reminder workflow, but
+        must not change the Python operation state.
+        """
+        fields = self.fields
+        if fields.allowed_device_ids:
+            raw_device = _optional_text(record.fields, fields.device_id)
+            if raw_device is None or raw_device.upper() not in fields.allowed_device_ids:
+                return False
+        if fields.validation is None:
+            return True
+        validation = _optional_text(record.fields, fields.validation)
+        return validation in {value.strip() for value in fields.valid_values}
 
     def normalize_record(
         self,

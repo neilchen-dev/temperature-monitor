@@ -228,7 +228,14 @@ def _canonical_differences(
     details: dict[str, Any],
 ) -> list[str]:
     differences: list[str] = []
-    if (
+    # The current Feishu device table exposes the resolved limits and formula
+    # results, but has no standard-id/revision columns.  Do not turn that
+    # known schema limitation into a false mismatch.  If a deployment opts in
+    # to those observation fields, the comparison remains strict.
+    observed_standard_is_available = (
+        observed.standard_id is not None or observed.standard_revision is not None
+    )
+    if observed_standard_is_available and (
         expected.standard_id != observed.standard_id
         or expected.standard_revision != observed.standard_revision
     ):

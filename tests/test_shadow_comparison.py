@@ -77,6 +77,28 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertFalse(diff.matched)
         self.assertEqual(diff.difference_type, ("ALARM_STATE", "EVENT_EXISTS"))
 
+    def test_missing_feishu_standard_columns_are_not_a_standard_mismatch(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-10",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            overall_status="NORMAL",
+            standard_id="ENV-LEGACY-TH-10",
+            standard_revision="LEGACY-2026-08-31",
+        )
+        observed = ObservedAutomationState(
+            "TH-10",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            overall_status="NORMAL",
+        )
+
+        diff = compare_states(expected, observed)
+
+        self.assertTrue(diff.matched)
+
     def test_operation_type_difference_is_operation_mismatch(self) -> None:
         expected = ExpectedAutomationState(
             "TH-03", "NORMAL", "OPERATING", False, operation_type="工艺A"

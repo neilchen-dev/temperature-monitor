@@ -86,6 +86,28 @@ class ActionExecutorTests(unittest.TestCase):
         self.assertEqual(executions[0].status, ActionExecutionStatus.FAILED)
         self.assertIn("no handler", executions[0].error or "")
 
+    def test_active_context_handler_receives_runtime_context(self) -> None:
+        received: list[dict[str, object]] = []
+
+        def context_handler(action, context) -> None:
+            self.assertEqual(action.action_type, AlarmActionType.CREATE_VERIFY_TASK)
+            received.append(dict(context))
+
+        executor = ActionExecutor(
+            mode="active",
+            context_handlers={
+                AlarmActionType.CREATE_VERIFY_TASK: context_handler,
+            },
+        )
+        executions = executor.execute(
+            (self.action,),
+            context={"sample_time": "2026-08-28T13:00:00"},
+            created_at=self.created_at,
+        )
+
+        self.assertEqual(executions[0].status, ActionExecutionStatus.SUCCEEDED)
+        self.assertEqual(received, [{"sample_time": "2026-08-28T13:00:00"}])
+
 
 if __name__ == "__main__":
     unittest.main()

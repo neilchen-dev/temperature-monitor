@@ -59,6 +59,12 @@ def _load_hassio_options() -> None:
         "feishu_standard_table_id": "FEISHU_STANDARD_TABLE_ID",
         "feishu_operation_table_id": "FEISHU_OPERATION_TABLE_ID",
         "feishu_event_table_id": "FEISHU_EVENT_TABLE_ID",
+        "feishu_operation_validation_field": "FEISHU_OPERATION_VALIDATION_FIELD",
+        "feishu_operation_validation_value": "FEISHU_OPERATION_VALIDATION_VALUE",
+        "feishu_operation_allowed_devices": "FEISHU_OPERATION_ALLOWED_DEVICES",
+        "feishu_operation_interval_table_id": "FEISHU_OPERATION_INTERVAL_TABLE_ID",
+        "feishu_inspection_table_id": "FEISHU_INSPECTION_TABLE_ID",
+        "feishu_write_enabled": "FEISHU_WRITE_ENABLED",
         "shadow_worker_id": "SHADOW_WORKER_ID",
         "shadow_scheduler_poll_seconds": "SHADOW_SCHEDULER_POLL_SECONDS",
         "shadow_operation_sync_seconds": "SHADOW_OPERATION_SYNC_SECONDS",
@@ -360,6 +366,26 @@ FEISHU_OPERATION_TYPE_FIELD = os.getenv(
 FEISHU_OPERATION_WORK_ORDER_FIELD = os.getenv(
     "FEISHU_OPERATION_WORK_ORDER_FIELD", "工单号"
 ).strip()
+FEISHU_OPERATION_VALIDATION_FIELD = os.getenv(
+    "FEISHU_OPERATION_VALIDATION_FIELD", "登记组合校验"
+).strip()
+FEISHU_OPERATION_VALIDATION_VALUE = os.getenv(
+    "FEISHU_OPERATION_VALIDATION_VALUE", "有效"
+).strip()
+FEISHU_OPERATION_ALLOWED_DEVICES = tuple(
+    device.strip().upper()
+    for device in os.getenv(
+        "FEISHU_OPERATION_ALLOWED_DEVICES", "TH-03,TH-04,TH-05,TH-07"
+    ).split(",")
+    if device.strip()
+)
+FEISHU_OPERATION_INTERVAL_TABLE_ID = os.getenv(
+    "FEISHU_OPERATION_INTERVAL_TABLE_ID", "tblZ9JHVhDCSqfhp"
+).strip()
+FEISHU_INSPECTION_TABLE_ID = os.getenv(
+    "FEISHU_INSPECTION_TABLE_ID", "tblwkQNdeEan8LKf"
+).strip()
+FEISHU_WRITE_ENABLED = _get_bool("FEISHU_WRITE_ENABLED", False)
 FEISHU_OBSERVATION_ALARM_FIELD = os.getenv(
     "FEISHU_OBSERVATION_ALARM_FIELD", "警报状态"
 ).strip()
@@ -382,16 +408,16 @@ FEISHU_OBSERVATION_DATA_QUALITY_FIELD = os.getenv(
     "FEISHU_OBSERVATION_DATA_QUALITY_FIELD", "在线状态"
 ).strip()
 FEISHU_OBSERVATION_STANDARD_ID_FIELD = os.getenv(
-    "FEISHU_OBSERVATION_STANDARD_ID_FIELD", "当前标准编号"
+    "FEISHU_OBSERVATION_STANDARD_ID_FIELD", ""
 ).strip()
 FEISHU_OBSERVATION_STANDARD_REVISION_FIELD = os.getenv(
-    "FEISHU_OBSERVATION_STANDARD_REVISION_FIELD", "当前标准版本"
+    "FEISHU_OBSERVATION_STANDARD_REVISION_FIELD", ""
 ).strip()
 FEISHU_EVENT_DEVICE_FIELD = os.getenv(
     "FEISHU_EVENT_DEVICE_FIELD", "监测点"
 ).strip()
 FEISHU_EVENT_STATUS_FIELD = os.getenv(
-    "FEISHU_EVENT_STATUS_FIELD", "事件状态"
+    "FEISHU_EVENT_STATUS_FIELD", "处理状态"
 ).strip()
 
 

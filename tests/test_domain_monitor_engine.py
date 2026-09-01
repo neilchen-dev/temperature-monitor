@@ -55,6 +55,16 @@ class MonitorEngineTests(unittest.TestCase):
         self.assertEqual(result.overall_status, OverallStatus.VIOLATION)
         self.assertEqual(result.reasons, ("temperature_above_upper_limit",))
 
+    def test_temperature_rounding_matches_feishu_one_decimal_round(self) -> None:
+        result = evaluate_monitor_state(
+            device=self.device,
+            sample=MonitorSample("TH-03", self.sample_time, 26.05, 50.0),
+            standard=self.standard,
+        )
+
+        self.assertEqual(result.temperature_status, TemperatureStatus.HIGH)
+        self.assertEqual(result.overall_status, OverallStatus.VIOLATION)
+
     def test_missing_applicable_measurement_is_unknown(self) -> None:
         result = evaluate_monitor_state(
             device=self.device,

@@ -39,7 +39,9 @@ class FeishuObservationTableFieldMap:
 
     device_id: str = "设备编号"
     event_device_id: str = "监测点"
-    event_status: str = "事件状态"
+    # The current ENV table calls this field ``处理状态``.  ``事件状态`` was
+    # used by an earlier draft and would make closed records look active.
+    event_status: str = "处理状态"
     closed_statuses: tuple[str, ...] = ("关闭", "已关闭", "CLOSED")
 
 
@@ -154,7 +156,9 @@ def _overall_status(value: Any) -> str | None:
     aliases = {
         "正常": "NORMAL",
         "超限": "VIOLATION",
-        "待工艺标准": "NO_STANDARD",
+        # OverallStatus intentionally has no NO_STANDARD member.  The
+        # separate applicability field carries that information.
+        "待工艺标准": "UNKNOWN",
         "仅监测": "UNKNOWN",
         "设备离线": "UNKNOWN",
         "数据异常": "UNKNOWN",

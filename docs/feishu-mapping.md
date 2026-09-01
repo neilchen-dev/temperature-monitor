@@ -1,6 +1,6 @@
 # 飞书现行业务语义与 Python 映射契约
 
-> 状态：现状审计基线 + 第一版规则冻结，不是飞书写入方案。
+> 状态：现状审计基线 + 第一版规则冻结 + Python 写入适配器契约。
 > 审计时间：2026-08-28（Asia/Singapore）
 > `rule_version=1.0`；`decision_date=2026-08-28`
 > 数据来源：[NoEE 温湿度监测台账](https://qjvasb3rm2.feishu.cn/wiki/PKKJwvD8ei7zL3k3Dbkcj2S8nhc?table=tblc6uCFLGPZLcR6&view=vewo6x1Acl)
@@ -21,6 +21,7 @@
 3. 飞书公式字段是当前业务表现的一部分，但不应直接当成 Python 的领域真相。Python 应复刻其可观察语义，并把原始值、规则版本和计算结果分别保存。
 4. **规则已冻结为 5 分钟**。主表字段说明、责任人说明仍写 10 分钟，属于待清理的旧说明，不再作为 Python 实现依据。
 5. 当前 `环境异常事件表` 已观察到 TH-10 有两条同时未关闭事件，说明现有“警报状态防重复”没有形成可靠的业务唯一约束。Shadow 阶段必须把它记录为 `EVENT_DUPLICATED`，不能默认飞书现状正确。
+6. Python 已加入作业登记、环境异常事件和仓库点检三类新增写入适配器；默认关闭，只有 `AUTOMATION_MODE=active` 且 `FEISHU_WRITE_ENABLED=true` 才允许这些适配器写入。
 
 ## 1. 飞书表清单
 
@@ -214,8 +215,8 @@
 - 新标准表已建立，Resolver 规则冻结为：有效期、启用、区域匹配、设备精确匹配、作业类型精确匹配、优先级和冲突报错。同一区域允许多个监测点分别绑定不同标准。
 
 `FeishuStandardAdapter` 只负责按显式字段映射读取和规范化；实际 HTTP source 为
-`FeishuBitableRecordSource`，复用项目现有 tenant token、重试和分页服务，只实现读取，
-不包含飞书写入路径。`integrations/feishu_standard_config.py` 固定了本表 table_id 和字段映射。
+`FeishuBitableRecordSource`，复用项目现有 tenant token、重试和分页服务。标准表本身
+不包含写入路径；作业、异常、点检写入集中在 `integrations/feishu_writers.py`。
 
 ### 3.5 建议的标准同步契约
 
@@ -255,6 +256,19 @@
 - 已冻结：按飞书记录创建时间判断新旧；当前工作流没有实现该保护，旧的结束登记理论上可能覆盖新的开始状态，Python Adapter/Application gate 必须拒绝这种覆盖并记审计。
 - `设备温湿度记录.更新时间` 被超限流程用作连续超限开始时间，但并未形成通用的版本校验或 watermark。
 - **建议**：Python 入口强制带 `source_record_id`、`source_created_at`、`source_updated_at`，按设备/区域保存最后接受的版本；时间倒退时只记录审计，不覆盖当前状态。
+
+### 4.4 Python 写入适配器
+
+`integrations/feishu_writers.py` 以当前台账字段为唯一写入映射，底层使用带资源锁、Token 刷新和退避重试的 Base API 原语：
+
+| 能力 | 写入表 | 关键行为 |
+|---|---|---|
+| 作业登记 | `环境受控作业登记（试验）` | 只接受 TH-03/04/05/07 与固定区域组合；动作映射为 `开始作业`、`工艺切换`、`结束作业`；支持 client token 幂等 |
+| 作业区间 / 主表上下文 | `受控作业区间记录（试验）` / `设备温湿度记录` | 写入开始/结束快照，区间状态只使用 `作业中`、`已结束`、`工艺切换结束`；不覆盖公式字段 |
+| 环境异常 | `环境异常事件表` | 创建前读取并强制同设备最多一条未关闭事件；写入责任人、控制要求、异常类型、峰值；恢复只写 `恢复时间` |
+| 仓库点检 | `仓库环境点检记录` | 写入快照和现场状态；`点检时间`、`点检人`由飞书系统生成；`异常/报警编号`按真实数字字段处理，不写 `ENV-...` 文本 |
+
+运行时 Active 会执行异常事件的创建、峰值更新和恢复时间回写；关闭仍保留人工闭环边界。作业登记和点检记录通过受保护 API 写入：`POST /api/operations`、`POST /api/inspections`；异常关闭使用 `PATCH /api/environment-events/<record_id>`。三类写入都要求 `X-History-Key`。
 
 ## 5. 17 条工作流规则摘要
 
@@ -547,10 +561,10 @@ Python 的 expected 由 `StandardResolver + monitor_engine + AlarmStateMachine` 
 2. **不关闭 17 条飞书工作流**。先 Shadow；#16/#17 按冻结的 5/1 分钟规则比对，#3 仍保持停用。
 3. **不把人工闭环表单全部迁走**。闭环反馈、原因、措施、产品影响仍适合先保留在飞书；Python 只做规范化读取和 Shadow。
 4. **不先迁移提醒消息的用户体验**。点检提醒、6 小时提醒、24 小时提醒、资料完整性提醒可以继续由飞书发出，Python 先记录 expected action。
-5. **不启用点检异常建事件工作流的 Python 替代品**，直到 `异常/报警编号` 的类型问题、区域责任人配置和事件唯一键确定。
+5. **不自动替代点检异常建事件工作流**。当前 Python 点检写入已支持快照，但 `异常/报警编号` 的数字类型与 ENV 编号、区域责任人和历史重复事件仍需业务治理。
 6. **不把飞书公式字段直接写成 Python 权威状态**。保留原始输入、Python 结果和飞书观察值，三者分开审计。
 7. **不使用进程内 `sleep()` 实现 Delay**。所有延迟复核必须进入持久化任务表，具备 `due_at`、lease、重试和幂等键。
-8. **不在没有完整生产 Adapter 接线前接受所有作业登记回写**。新旧规则已冻结为记录创建时间，旧记录只审计、不覆盖当前状态。
+8. **不直接接管全部作业工作流**。当前 Python 已能创建作业登记并在 Active 中处理异常事件，但主表/区间表的全量生产替代仍需端到端验证；旧记录只审计、不覆盖当前状态。
 
 ## 已冻结规则与仍未实现项
 
@@ -565,14 +579,14 @@ Python 的 expected 由 `StandardResolver + monitor_engine + AlarmStateMachine` 
 7. 同一设备同时最多一个未关闭 ENV 事件；Python/SQLite 用数据库约束保证。
 8. Shadow 状态更新延迟阈值为 60 秒，≤60 秒记 `FEISHU_DELAY`，>60 秒才记真实 mismatch。
 9. `EVENT_DUPLICATED` 与 `EVENT_MISSING` 优先于普通 `ALARM_STATE_MISMATCH`。
-10. 本轮不修改飞书事件、工作流和正式业务状态。
+10. 本轮不修改既有飞书事件、工作流和正式业务状态；代码已提供受开关保护的写入能力，默认不执行。
 
 仍未实现或需要未来配置的项：
 
 - 新标准表中历史迁移记录对应的正式标准编号、版本、生效时间和来源文件条款；当前 11 条记录已启用供试运行观察，正式来源仍需确认。
 - 设备运行期区域切换历史、标准来源文件的具体条款内容。
-- 点检表 `异常/报警编号` 的文本/数字兼容处理和历史重复事件的业务处置。
-- 真实飞书 API source wiring、完整 Shadow 采集链路和通知迁移。
+- 点检表 `异常/报警编号` 的业务关联方式和历史重复事件的业务处置。
+- 作业主表/区间表的全量生产接管、通知迁移和端到端 Active 证据。
 
 ## 建议的下一步
 
@@ -582,4 +596,5 @@ Python 的 expected 由 `StandardResolver + monitor_engine + AlarmStateMachine` 
 2. 用 `StandardSyncService` 从只读 source 同步到 SQLite，并验证冲突拒绝和旧版本保留。
 3. 接入 `FeishuOperationAdapter` 的只读 source，并将旧记录接入审计。
 4. 用 `FeishuObservationAdapter` 读取主表/事件表，运行 Shadow。
-5. 解释和治理 TH-10 历史重复事件，再评估第一批工作流迁移。
+5. 在测试 Base 验证 `POST /api/operations`、`POST /api/inspections` 和事件闭环 API，再解释和治理 TH-10 历史重复事件。
+6. 仅在验证完成后，以 `FEISHU_WRITE_ENABLED=true` 开启 Active，并分批评估工作流迁移。

@@ -14,6 +14,11 @@ from integrations.feishu_operation import (
 )
 from integrations.feishu_records import FeishuRawRecord
 from integrations.feishu_records import FeishuBitableRecordSource
+from integrations.feishu_observation import (
+    FeishuBitableObservationSource,
+    FeishuObservationAdapter,
+    FeishuObservationFieldMap,
+)
 from integrations.feishu_standard import (
     FeishuStandardAdapter,
     FeishuStandardFieldMap,
@@ -183,6 +188,129 @@ class FeishuOperationAdapterTests(unittest.TestCase):
             actions,
             [OperationAction.START, OperationAction.SWITCH, OperationAction.END],
         )
+
+    def test_invalid_registration_and_unrelated_device_are_ignored(self) -> None:
+        created_at = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
+        adapter = FeishuOperationAdapter(
+            source=_Source(
+                (
+                    FeishuRawRecord(
+                        record_id="invalid",
+                        fields={
+                            "device": "TH-03",
+                            "area": "精密装配间",
+                            "action": "开始作业",
+                            "validity": "组合错误",
+                        },
+                        created_at=created_at,
+                    ),
+                    FeishuRawRecord(
+                        record_id="unrelated",
+                        fields={
+                            "device": "TH-10",
+                            "area": "PE仓库",
+                            "action": "开始作业",
+                            "validity": "有效",
+                        },
+                        created_at=created_at,
+                    ),
+                    FeishuRawRecord(
+                        record_id="valid",
+                        fields={
+                            "device": "TH-03",
+                            "area": "精密装配间",
+                            "action": "开始作业",
+                            "validity": "有效",
+                        },
+                        created_at=created_at,
+                    ),
+                )
+            ),
+            table_id="operation-registration",
+            fields=FeishuOperationFieldMap(
+                device_id="device",
+                area_id="area",
+                action="action",
+                validation="validity",
+                allowed_device_ids=frozenset({"TH-03", "TH-04", "TH-05", "TH-07"}),
+            ),
+        )
+
+        observations = adapter.fetch_observations(observed_at=created_at)
+
+        self.assertEqual([item.source_record_id for item in observations], ["valid"])
+
+
+class FeishuObservationAdapterTests(unittest.TestCase):
+    def test_current_event_status_field_excludes_closed_events(self) -> None:
+        timestamp = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+        class _ObservationSource:
+            def read_records(self, table_id: str):
+                if table_id == "devices":
+                    return (
+                        FeishuRawRecord(
+                            record_id="device-10",
+                            fields={
+                                "设备编号": "TH-10",
+                                "警报状态": "未触发",
+                                "当前作业状态": "N/A",
+                                "当前判定状态": "正常",
+                                "在线状态": "在线",
+                            },
+                            updated_at=timestamp,
+                        ),
+                    )
+                return (
+                    FeishuRawRecord(
+                        record_id="closed-event",
+                        fields={"监测点": "TH-10", "处理状态": "关闭"},
+                    ),
+                    FeishuRawRecord(
+                        record_id="open-event",
+                        fields={"监测点": "TH-10", "处理状态": "待处理"},
+                    ),
+                )
+
+        source = FeishuBitableObservationSource(
+            source=_ObservationSource(),
+            device_table_id="devices",
+            event_table_id="events",
+        )
+        observed = FeishuObservationAdapter(
+            source=source,
+            fields=FeishuObservationFieldMap(
+                alarm_state="警报状态",
+                operation_state="当前作业状态",
+                overall_status="当前判定状态",
+                event_exists="__event_exists",
+                active_event_count="__active_event_count",
+            ),
+        ).observe("TH-10")
+
+        self.assertTrue(observed.event_exists)
+        self.assertEqual(observed.active_event_count, 1)
+
+    def test_no_standard_observation_maps_to_unknown_overall(self) -> None:
+        class _Source:
+            def read(self, device_id: str):
+                return {
+                    "overall": "待工艺标准",
+                    "operation": "作业中",
+                    "event": False,
+                }
+
+        observed = FeishuObservationAdapter(
+            source=_Source(),
+            fields=FeishuObservationFieldMap(
+                alarm_state="alarm",
+                operation_state="operation",
+                overall_status="overall",
+                event_exists="event",
+            ),
+        ).observe("TH-03")
+
+        self.assertEqual(observed.overall_status, "UNKNOWN")
 
 
 class _OperationStore:

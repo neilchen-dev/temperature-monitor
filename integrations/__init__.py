@@ -22,6 +22,17 @@ from .feishu_standard import (
     FeishuStandardSource,
     StandardSourceRecord,
 )
+from .feishu_writers import (
+    FeishuBitableRecordWriter,
+    FeishuEnvironmentEventWriter,
+    FeishuEventWriteFieldMap,
+    FeishuOperationRecordWriter,
+    FeishuOperationWriteFieldMap,
+    FeishuInspectionRecordWriter,
+    FeishuInspectionWriteFieldMap,
+    FeishuRecordWriter,
+    FeishuWriteError,
+)
 
 __all__ = [
     "FeishuObservationAdapter",
@@ -41,4 +52,13 @@ __all__ = [
     "FeishuStandardFieldMap",
     "FeishuStandardSource",
     "StandardSourceRecord",
+    "FeishuBitableRecordWriter",
+    "FeishuEnvironmentEventWriter",
+    "FeishuEventWriteFieldMap",
+    "FeishuOperationRecordWriter",
+    "FeishuOperationWriteFieldMap",
+    "FeishuInspectionRecordWriter",
+    "FeishuInspectionWriteFieldMap",
+    "FeishuRecordWriter",
+    "FeishuWriteError",
 ]

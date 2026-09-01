@@ -159,7 +159,9 @@ class MonitorApplicationService:
         executions = self.action_executor.execute(
             actions,
             context={
+                "created_at": evaluated_at.isoformat(),
                 "sample_time": sample.sample_time.isoformat(),
+                "sample": _sample_dict(sample),
                 "python_monitor_result": _monitor_result_dict(monitor_result),
                 "python_alarm_transition": _transition_dict(transition),
                 "operation_state": _operation_state_dict(operation_state),
@@ -185,9 +187,9 @@ class MonitorApplicationService:
     ) -> StateTransition:
         """Project domain actions into Python-owned durable state.
 
-        This is intentionally the only runtime-side effect path.  It knows
-        about SQLite repositories, but no Feishu client and no Feishu write
-        operation can enter this method.
+        This is the Python-owned projection path.  It knows about SQLite
+        repositories only; Feishu writes remain behind ActionExecutor's
+        explicitly injected Active handlers.
         """
         next_state = transition.next
         previous_task_id = transition.previous.pending_task_id
@@ -343,6 +345,22 @@ def _transition_dict(transition: StateTransition) -> dict[str, Any]:
         "to": _enum_value(transition.next.state),
         "reason": transition.reason,
         "actions": [action.action_type.value for action in transition.actions],
+        "violation_started_at": (
+            transition.next.violation_started_at.isoformat()
+            if transition.next.violation_started_at
+            else None
+        ),
+        "alarm_started_at": (
+            transition.next.alarm_started_at.isoformat()
+            if transition.next.alarm_started_at
+            else None
+        ),
+        "recovery_started_at": (
+            transition.next.recovery_started_at.isoformat()
+            if transition.next.recovery_started_at
+            else None
+        ),
+        "active_alarm_id": transition.next.active_alarm_id,
     }
 
 
@@ -359,3 +377,15 @@ def _operation_state_dict(state: OperationState) -> dict[str, Any]:
 
 def _enum_value(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
+
+
+def _sample_dict(sample: MonitorSample) -> dict[str, Any]:
+    quality = sample.data_quality
+    return {
+        "device_id": sample.device_id,
+        "sample_time": sample.sample_time.isoformat(),
+        "temperature": sample.temperature,
+        "humidity": sample.humidity,
+        "online_status": sample.online_status,
+        "data_quality": _enum_value(quality) if quality is not None else None,
+    }

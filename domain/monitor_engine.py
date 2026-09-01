@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .models import (
     ApplicabilityStatus,
@@ -41,12 +42,22 @@ def _evaluate_dimension(
     if not _numeric(value):
         return TemperatureStatus.UNKNOWN, (f"{name}_missing_or_invalid",)
 
-    numeric_value = float(value)
+    numeric_value = _feishu_round_one_decimal(float(value))
     if lower is not None and numeric_value < lower:
         return TemperatureStatus.LOW, (f"{name}_below_lower_limit",)
     if upper is not None and numeric_value > upper:
         return TemperatureStatus.HIGH, (f"{name}_above_upper_limit",)
     return TemperatureStatus.NORMAL, ()
+
+
+def _feishu_round_one_decimal(value: float) -> float:
+    """Match the Feishu formulas' ROUND(VALUE(field), 1) behavior."""
+    try:
+        return float(
+            Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+        )
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"cannot round environmental value: {value!r}") from exc
 
 
 def _quality_from_sample(

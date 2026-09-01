@@ -38,6 +38,9 @@ class ActionExecution:
 
 
 ActionHandler = Callable[[AlarmAction | ApplicationAction], None]
+ContextActionHandler = Callable[
+    [AlarmAction | ApplicationAction, Mapping[str, Any]], None
+]
 
 
 class ActionRunRecorder(Protocol):
@@ -55,12 +58,19 @@ class ActionExecutor:
         *,
         mode: AutomationMode | str,
         handlers: Mapping[AlarmActionType | str, ActionHandler] | None = None,
+        context_handlers: Mapping[
+            AlarmActionType | str, ContextActionHandler
+        ] | None = None,
         recorder: ActionRunRecorder | None = None,
     ) -> None:
         self.mode = AutomationMode(mode)
         self.handlers = {
             AlarmActionType(action_type): handler
             for action_type, handler in (handlers or {}).items()
+        }
+        self.context_handlers = {
+            AlarmActionType(action_type): handler
+            for action_type, handler in (context_handlers or {}).items()
         }
         self.recorder = recorder
 
@@ -116,8 +126,9 @@ class ActionExecutor:
                 created_at=created_at,
             )
 
+        context_handler = self.context_handlers.get(action.action_type)
         handler = self.handlers.get(action.action_type)
-        if handler is None:
+        if context_handler is None and handler is None:
             return ActionExecution(
                 action=action,
                 mode=self.mode,
@@ -127,7 +138,10 @@ class ActionExecutor:
                 created_at=created_at,
             )
         try:
-            handler(action)
+            if context_handler is not None:
+                context_handler(action, context)
+            else:
+                handler(action)  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001 - audit the adapter failure
             return ActionExecution(
                 action=action,
