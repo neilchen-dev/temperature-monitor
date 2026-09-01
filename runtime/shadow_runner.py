@@ -148,6 +148,7 @@ class ShadowRuntime:
         self._skipped_device_log: set[str] = set()
         self._last_purge_time: datetime | None = None
         self._last_operation_sync_time: datetime | None = None
+        self._last_expected_state: dict[str, ExpectedAutomationState] = {}
 
     def start(self) -> None:
         """Start local scheduling; Feishu sync and observation are background work."""
@@ -558,6 +559,12 @@ class ShadowRuntime:
         *,
         sample_time: datetime,
     ) -> None:
+        previous = self._last_expected_state.get(expected.device_id)
+        if previous is not None:
+            expected = replace(
+                expected,
+                previous_state=_expected_comparison_values(previous),
+            )
         created_at = self.now_provider()
         self.task_repository.create_or_get(
             task_type="SHADOW_COMPARE",
@@ -571,6 +578,7 @@ class ShadowRuntime:
             dedupe_key=f"SHADOW_COMPARE:{expected.device_id}:{sample_time.isoformat()}",
             created_at=created_at,
         )
+        self._last_expected_state[expected.device_id] = expected
 
     def _schedule_periodic(self, task_type: str, due_at: datetime) -> None:
         entity_id = "standards" if task_type == "SYNC_STANDARD" else "operations"
@@ -606,6 +614,25 @@ def _expected_payload(expected: ExpectedAutomationState) -> dict[str, Any]:
         "humidity_status": expected.humidity_status,
         "active_event_ids": list(expected.active_event_ids),
         "operation_type": expected.operation_type,
+        "previous_state": (
+            dict(expected.previous_state) if expected.previous_state is not None else None
+        ),
+    }
+
+
+def _expected_comparison_values(expected: ExpectedAutomationState) -> dict[str, Any]:
+    return {
+        "alarm_state": expected.alarm_state,
+        "operation_state": expected.operation_state,
+        "event_exists": expected.event_exists,
+        "overall_status": expected.overall_status,
+        "standard_id": expected.standard_id,
+        "standard_revision": expected.standard_revision,
+        "applicability": expected.applicability,
+        "data_quality": expected.data_quality,
+        "temperature_status": expected.temperature_status,
+        "humidity_status": expected.humidity_status,
+        "operation_type": expected.operation_type,
     }
 
 
@@ -627,4 +654,5 @@ def _expected_from_payload(payload: Mapping[str, Any]) -> ExpectedAutomationStat
         humidity_status=payload.get("humidity_status"),
         active_event_ids=tuple(payload.get("active_event_ids") or ()),
         operation_type=payload.get("operation_type"),
+        previous_state=payload.get("previous_state"),
     )

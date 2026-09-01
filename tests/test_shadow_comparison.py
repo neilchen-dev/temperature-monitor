@@ -237,6 +237,193 @@ class ShadowComparisonTests(unittest.TestCase):
             ("ALARM_STATE_MISMATCH",),
         )
 
+    def test_humidity_high_expected_normal_observed_is_delay_when_previous_matches(self) -> None:
+        expected_at = datetime(2026, 9, 1, 9, 45, 40)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            expected_at=expected_at,
+            humidity_status="HIGH",
+            previous_state={"humidity_status": "NORMAL"},
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            observed_at=expected_at + timedelta(seconds=4),
+            humidity_status="NORMAL",
+        )
+
+        diff = compare_states(expected, observed)
+
+        self.assertEqual(diff.difference_type, ("FEISHU_DELAY",))
+        self.assertEqual(diff.details["feishu_latency_seconds"], -4.0)
+        self.assertEqual(
+            diff.details["feishu_delay_evidence"],
+            "observed_matches_previous_expected",
+        )
+
+    def test_humidity_normal_expected_high_observed_is_delay_when_previous_matches(self) -> None:
+        expected_at = datetime(2026, 9, 1, 9, 45, 47)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            expected_at=expected_at,
+            humidity_status="NORMAL",
+            previous_state={"humidity_status": "HIGH"},
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            observed_at=expected_at + timedelta(seconds=3),
+            humidity_status="HIGH",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("FEISHU_DELAY",),
+        )
+
+    def test_temperature_transient_uses_the_same_delay_rule(self) -> None:
+        expected_at = datetime(2026, 9, 1, 10, 0)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            expected_at=expected_at,
+            temperature_status="HIGH",
+            previous_state={"temperature_status": "NORMAL"},
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            observed_at=expected_at - timedelta(seconds=5),
+            temperature_status="NORMAL",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("FEISHU_DELAY",),
+        )
+
+    def test_dimension_differences_after_window_are_real_mismatches(self) -> None:
+        expected_at = datetime(2026, 9, 1, 10, 0)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            expected_at=expected_at,
+            temperature_status="HIGH",
+            humidity_status="HIGH",
+            previous_state={
+                "temperature_status": "NORMAL",
+                "humidity_status": "NORMAL",
+            },
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            observed_at=expected_at + timedelta(seconds=61),
+            temperature_status="NORMAL",
+            humidity_status="NORMAL",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("TEMPERATURE_STATUS_MISMATCH", "HUMIDITY_STATUS_MISMATCH"),
+        )
+
+    def test_persistent_business_difference_is_not_given_repeated_delay_windows(self) -> None:
+        expected_at = datetime(2026, 9, 1, 10, 0)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            expected_at=expected_at,
+            humidity_status="HIGH",
+            # Python was already HIGH on the preceding sample.  Observed NORMAL
+            # is therefore not a stale copy of the preceding Python projection.
+            previous_state={"humidity_status": "HIGH"},
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            observed_at=expected_at + timedelta(seconds=2),
+            humidity_status="NORMAL",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("HUMIDITY_STATUS_MISMATCH",),
+        )
+
+    def test_overall_and_alarm_keep_the_same_previous_state_delay_rule(self) -> None:
+        expected_at = datetime(2026, 9, 1, 10, 0)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "ALARM",
+            "OPERATING",
+            True,
+            overall_status="VIOLATION",
+            expected_at=expected_at,
+            previous_state={
+                "alarm_state": "PENDING",
+                "overall_status": "NORMAL",
+            },
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "PENDING",
+            "OPERATING",
+            True,
+            overall_status="NORMAL",
+            observed_at=expected_at + timedelta(seconds=6),
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("FEISHU_DELAY",),
+        )
+
+    def test_operation_state_uses_the_same_previous_state_delay_rule(self) -> None:
+        expected_at = datetime(2026, 9, 1, 10, 0)
+        expected = ExpectedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "OPERATING",
+            False,
+            expected_at=expected_at,
+            previous_state={"operation_state": "IDLE"},
+        )
+        observed = ObservedAutomationState(
+            "TH-04",
+            "NORMAL",
+            "IDLE",
+            False,
+            observed_at=expected_at + timedelta(seconds=2),
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("FEISHU_DELAY",),
+        )
+
     def test_duplicate_event_is_prioritized_over_alarm_mismatch(self) -> None:
         expected_at = datetime(2026, 8, 28, 13, 0)
         expected = ExpectedAutomationState(

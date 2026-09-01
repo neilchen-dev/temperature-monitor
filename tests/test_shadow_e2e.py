@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -200,6 +201,27 @@ class _RuntimeTestBase(unittest.TestCase):
 
 
 class FullChainTests(_RuntimeTestBase):
+    def test_shadow_task_carries_previous_expected_projection(self) -> None:
+        runtime = self.components.runtime
+        runtime._accepting_samples = True
+        self.components.handle_sample(self._sample("TH-10", 24.0))
+        self.now += timedelta(seconds=1)
+        self.components.handle_sample(self._sample("TH-10", 28.0))
+
+        payloads = [
+            json.loads(row[0])
+            for row in self.connection.execute(
+                "SELECT payload_json FROM automation_tasks "
+                "WHERE task_type = 'SHADOW_COMPARE' ORDER BY created_at, id"
+            ).fetchall()
+        ]
+
+        self.assertIsNone(payloads[0]["expected"]["previous_state"])
+        previous = payloads[1]["expected"]["previous_state"]
+        self.assertEqual(previous["temperature_status"], "NORMAL")
+        self.assertEqual(previous["overall_status"], "NORMAL")
+        self.assertEqual(previous["alarm_state"], "NORMAL")
+
     def test_temperature_report_to_automation_runs_e2e(self) -> None:
         """/temperature 上报 → 统一模型 → Shadow 域 → 比对结果落 automation_runs。"""
         runtime = self.components.runtime

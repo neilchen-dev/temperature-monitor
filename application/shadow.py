@@ -26,6 +26,9 @@ class ExpectedAutomationState:
     humidity_status: str | None = None
     active_event_ids: tuple[str, ...] = ()
     operation_type: str | None = None
+    # The immediately preceding Python projection proves that a differing
+    # Feishu value is stale, rather than merely different under a business rule.
+    previous_state: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,7 @@ def expected_state_from(
     humidity_status: str | None = None,
     active_event_ids: tuple[str, ...] = (),
     operation_type: str | None = None,
+    previous_state: Mapping[str, Any] | None = None,
 ) -> ExpectedAutomationState:
     normalized_alarm_state = AlarmLifecycleState(alarm_state).value
     normalized_operation_state = (
@@ -116,6 +120,7 @@ def expected_state_from(
         humidity_status=humidity_status,
         active_event_ids=active_event_ids,
         operation_type=operation_type,
+        previous_state=previous_state,
     )
 
 
@@ -152,6 +157,7 @@ def compare_states(
         and not observed.active_event_ids
         and expected.operation_type is None
         and observed.operation_type is None
+        and expected.previous_state is None
         and expected_at is None
     )
     if legacy_shape:
@@ -185,8 +191,28 @@ def compare_states(
     latency = _latency_seconds(actual_expected_at, observed.observed_at)
     if latency is not None:
         details["feishu_latency_seconds"] = latency
+        details["feishu_timestamp_skew_seconds"] = abs(latency)
         details["allowed_feishu_delay_seconds"] = max_feishu_delay.total_seconds()
-        if 0 <= latency <= max_feishu_delay.total_seconds():
+        previous_state_proves_delay = (
+            expected.previous_state is not None
+            and abs(latency) <= max_feishu_delay.total_seconds()
+            and _observed_matches_previous_expected(
+                previous_state=expected.previous_state,
+                observed=observed,
+                differences=differences,
+                details=details,
+            )
+        )
+        legacy_timestamp_delay = (
+            expected.previous_state is None
+            and 0 <= latency <= max_feishu_delay.total_seconds()
+        )
+        if previous_state_proves_delay or legacy_timestamp_delay:
+            details["feishu_delay_evidence"] = (
+                "observed_matches_previous_expected"
+                if previous_state_proves_delay
+                else "legacy_observed_timestamp_precedes_expected"
+            )
             return AutomationDiff(False, ("FEISHU_DELAY",), details)
 
     if event_difference is not None:
@@ -323,6 +349,54 @@ def _latency_seconds(
     if expected_at is None or observed_at is None:
         return None
     return (expected_at - observed_at).total_seconds()
+
+
+def _observed_matches_previous_expected(
+    *,
+    previous_state: Mapping[str, Any],
+    observed: ObservedAutomationState,
+    differences: list[str],
+    details: Mapping[str, Any],
+) -> bool:
+    """Return whether every mismatch is the immediately preceding Python value.
+
+    Record-level Feishu timestamps can be later than ``expected_at`` because the
+    comparison reads Feishu after Python creates its projection.  Timestamp
+    proximity alone therefore cannot prove delay.  Requiring the observed value
+    to equal the preceding Python projection prevents a persistent business-rule
+    difference from receiving a fresh delay window on every sample.
+    """
+    fields_by_difference = {
+        "ALARM_STATE_MISMATCH": ("alarm_state",),
+        "OVERALL_STATUS_MISMATCH": ("overall_status",),
+        "APPLICABILITY_MISMATCH": ("applicability",),
+        "DATA_QUALITY_MISMATCH": ("data_quality",),
+        "TEMPERATURE_STATUS_MISMATCH": ("temperature_status",),
+        "HUMIDITY_STATUS_MISMATCH": ("humidity_status",),
+    }
+    compared_any = False
+    for difference in differences:
+        if difference == "STANDARD_MISMATCH":
+            fields = ("standard_id", "standard_revision")
+        elif difference == "OPERATION_STATE_MISMATCH":
+            fields = tuple(
+                field_name
+                for field_name in ("operation_state", "operation_type")
+                if field_name in details
+            )
+        elif difference in {"EVENT_MISSING", "EVENT_DUPLICATED"}:
+            fields = ("event_exists",)
+        else:
+            fields = fields_by_difference.get(difference, ())
+        if not fields:
+            return False
+        for field_name in fields:
+            if field_name not in previous_state:
+                return False
+            if previous_state[field_name] != getattr(observed, field_name):
+                return False
+            compared_any = True
+    return compared_any
 
 
 class ShadowComparisonService:
