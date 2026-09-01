@@ -325,7 +325,10 @@ class SQLiteOperationRepository:
             )
             default_status = (
                 OperationStatus.NOT_APPLICABLE
-                if control_type in {"ALL_DAY", "全天控制"}
+                # ALL_DAY has no operation context; MONITOR_ONLY is outside
+                # operation-gated control.  Only OPERATION_PERIOD can be IDLE.
+                if control_type
+                in {"ALL_DAY", "全天控制", "MONITOR_ONLY", "仅监测"}
                 else OperationStatus.IDLE
             )
             return OperationState(

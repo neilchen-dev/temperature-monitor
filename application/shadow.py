@@ -292,22 +292,23 @@ def _canonical_differences(
         }
     if expected.overall_status is not None and observed.overall_status is not None:
         if expected.overall_status != observed.overall_status:
-            differences.append("ALARM_STATE_MISMATCH")
+            differences.append("OVERALL_STATUS_MISMATCH")
             details["overall_status"] = {
                 "expected": expected.overall_status,
                 "observed": observed.overall_status,
             }
-    for field_name in (
-        "applicability",
-        "data_quality",
-        "temperature_status",
-        "humidity_status",
-    ):
+    monitor_result_difference_types = {
+        "applicability": "APPLICABILITY_MISMATCH",
+        "data_quality": "DATA_QUALITY_MISMATCH",
+        "temperature_status": "TEMPERATURE_STATUS_MISMATCH",
+        "humidity_status": "HUMIDITY_STATUS_MISMATCH",
+    }
+    for field_name, difference_type in monitor_result_difference_types.items():
         expected_value = getattr(expected, field_name)
         observed_value = getattr(observed, field_name)
         if expected_value is not None and observed_value is not None:
             if expected_value != observed_value:
-                differences.append("ALARM_STATE_MISMATCH")
+                differences.append(difference_type)
                 details[field_name] = {
                     "expected": expected_value,
                     "observed": observed_value,

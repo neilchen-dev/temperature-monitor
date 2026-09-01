@@ -100,6 +100,26 @@ class ShadowComparisonTests(unittest.TestCase):
 
         self.assertTrue(diff.matched)
 
+    def test_th08_all_day_device_remains_a_shadow_match_control(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-08",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            overall_status="NORMAL",
+            applicability="APPLICABLE",
+        )
+        observed = ObservedAutomationState(
+            "TH-08",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            overall_status="NORMAL",
+            applicability="APPLICABLE",
+        )
+
+        self.assertTrue(compare_states(expected, observed).matched)
+
     def test_operation_type_difference_is_operation_mismatch(self) -> None:
         expected = ExpectedAutomationState(
             "TH-03", "NORMAL", "OPERATING", False, operation_type="工艺A"
@@ -109,6 +129,63 @@ class ShadowComparisonTests(unittest.TestCase):
         )
         diff = compare_states(expected, observed)
         self.assertEqual(diff.difference_type, ("OPERATION_STATE_MISMATCH",))
+
+    def test_overall_status_difference_is_not_an_alarm_state_mismatch(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-01",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            overall_status="UNKNOWN",
+        )
+        observed = ObservedAutomationState(
+            "TH-01",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            overall_status="NORMAL",
+        )
+
+        diff = compare_states(expected, observed)
+
+        self.assertEqual(diff.difference_type, ("OVERALL_STATUS_MISMATCH",))
+        self.assertNotIn("alarm_state", diff.details)
+        self.assertEqual(
+            diff.details["overall_status"],
+            {"expected": "UNKNOWN", "observed": "NORMAL"},
+        )
+
+    def test_monitor_result_differences_have_precise_types(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-03",
+            "NORMAL",
+            "IDLE",
+            False,
+            applicability="NOT_APPLICABLE",
+            data_quality="GOOD",
+            temperature_status="NORMAL",
+            humidity_status="NORMAL",
+        )
+        observed = ObservedAutomationState(
+            "TH-03",
+            "NORMAL",
+            "IDLE",
+            False,
+            applicability="APPLICABLE",
+            data_quality="OFFLINE",
+            temperature_status="HIGH",
+            humidity_status="LOW",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            (
+                "APPLICABILITY_MISMATCH",
+                "DATA_QUALITY_MISMATCH",
+                "TEMPERATURE_STATUS_MISMATCH",
+                "HUMIDITY_STATUS_MISMATCH",
+            ),
+        )
 
     def test_thirty_second_difference_is_feishu_delay(self) -> None:
         expected = ExpectedAutomationState(
