@@ -132,6 +132,16 @@ class EnvironmentStandard:
             raise ValueError("device_id cannot be blank when provided")
         if not self.source_document.strip():
             raise ValueError("source_document cannot be empty")
+        if self.effective_from.tzinfo is None or self.effective_from.utcoffset() is None:
+            raise ValueError("effective_from must be timezone-aware")
+        if (
+            self.effective_to is not None
+            and (
+                self.effective_to.tzinfo is None
+                or self.effective_to.utcoffset() is None
+            )
+        ):
+            raise ValueError("effective_to must be timezone-aware")
         if (self.temperature_min is None) != (self.temperature_max is None):
             raise ValueError("temperature bounds must be provided as a pair")
         if (self.humidity_min is None) != (self.humidity_max is None):

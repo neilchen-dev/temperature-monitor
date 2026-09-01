@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import config
 from domain.models import MonitorSample, OperationStatus
@@ -11,10 +13,12 @@ from integrations.feishu_records import FeishuRawRecord
 from application.operation_sync import OperationObservationService
 from repositories.runtime_state import SQLiteOperationRepository
 from runtime.bootstrap import build_runtime
+from services import devices
 
 
 class _ReadOnlySource:
     def __init__(self) -> None:
+        business_timezone = ZoneInfo(config.HISTORY_TIMEZONE)
         self.records = {
             config.FEISHU_STANDARD_TABLE_ID: (
                 FeishuRawRecord(
@@ -36,8 +40,8 @@ class _ReadOnlySource:
                         "来源文件": "SOP-001",
                         "条款": "5.2.3",
                     },
-                    created_at=datetime(2026, 1, 1),
-                    updated_at=datetime(2026, 1, 1),
+                    created_at=datetime(2026, 1, 1, tzinfo=business_timezone),
+                    updated_at=datetime(2026, 1, 1, tzinfo=business_timezone),
                 ),
             ),
             config.FEISHU_OPERATION_TABLE_ID: (),
@@ -54,7 +58,9 @@ class _ReadOnlySource:
                         "湿度判定": "正常",
                         "在线状态": "在线",
                     },
-                    updated_at=datetime(2026, 8, 31, 12, 0),
+                    updated_at=datetime(
+                        2026, 8, 31, 12, 0, tzinfo=business_timezone
+                    ),
                 ),
             ),
             "event-table": (),
@@ -131,7 +137,7 @@ class RuntimeTests(unittest.TestCase):
         components.stop()
 
     def test_whitelist_routes_sample_and_creates_only_local_tasks(self) -> None:
-        now = datetime(2026, 8, 31, 12, 0)
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         components = build_runtime(
             connection=sqlite3.connect(":memory:", check_same_thread=False),
             record_source=_ReadOnlySource(),
@@ -165,7 +171,9 @@ class RuntimeTests(unittest.TestCase):
         components.stop()
 
     def test_due_verification_persists_alarm_and_local_projected_event(self) -> None:
-        current_time = [datetime(2026, 8, 31, 12, 0)]
+        current_time = [
+            datetime(2026, 8, 31, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        ]
         components = build_runtime(
             connection=sqlite3.connect(":memory:", check_same_thread=False),
             record_source=_ReadOnlySource(),
@@ -195,6 +203,82 @@ class RuntimeTests(unittest.TestCase):
             1,
         )
         components.stop()
+
+    def test_started_runtime_listener_schedules_compare_from_naive_standard(self) -> None:
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        components = build_runtime(
+            connection=sqlite3.connect(":memory:", check_same_thread=False),
+            record_source=_ReadOnlySource(),
+            now_provider=lambda: now,
+        )
+        components.runtime.handle_standard_sync(object())
+        synced_standard = components.standard_repository.list_all()[0]
+        self.assertIsNotNone(synced_standard.effective_from.tzinfo)
+
+        try:
+            with patch.object(
+                components.runtime,
+                "_run_scheduler",
+                side_effect=lambda stop_event: stop_event.wait(),
+            ):
+                components.start()
+                with (
+                    patch(
+                        "services.devices.db.fetch_previous_device_sample",
+                        return_value=None,
+                    ),
+                    patch("services.devices.db.save_device_sample"),
+                ):
+                    devices.record_sample(
+                        device="TH-10",
+                        source=devices.SOURCE_HOME_ASSISTANT,
+                        temperature=24.0,
+                        humidity=50.0,
+                        status="在线",
+                        sample_time_ms=int(now.timestamp() * 1000),
+                    )
+
+            row = components.connection.execute(
+                "SELECT task_type, entity_id FROM automation_tasks "
+                "WHERE task_type = 'SHADOW_COMPARE'"
+            ).fetchone()
+            self.assertEqual(tuple(row), ("SHADOW_COMPARE", "TH-10"))
+        finally:
+            components.stop()
+
+    def test_scheduler_executes_compare_and_records_shadow_run(self) -> None:
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        source = _ReadOnlySource()
+        source.records[config.FEISHU_EVENT_TABLE_ID] = (
+            FeishuRawRecord(
+                record_id="event-10",
+                fields={"监测点": "TH-10", "处理状态": "处理中"},
+                updated_at=now,
+            ),
+        )
+        components = build_runtime(
+            connection=sqlite3.connect(":memory:", check_same_thread=False),
+            record_source=source,
+            now_provider=lambda: now,
+        )
+        try:
+            components.runtime.handle_standard_sync(object())
+            components.runtime._accepting_samples = True
+            components.handle_sample(
+                MonitorSample("TH-10", now, 24.0, 50.0, online_status="online")
+            )
+
+            report = components.runtime.scheduler.run_once(now=now)
+
+            self.assertEqual(report.succeeded, 1)
+            row = components.connection.execute(
+                "SELECT action_type, matched FROM automation_runs "
+                "WHERE action_type = 'SHADOW_COMPARE'"
+            ).fetchone()
+            self.assertEqual(row[0], "SHADOW_COMPARE")
+            self.assertIn(row[1], (0, 1))
+        finally:
+            components.stop()
 
     def test_operation_observations_are_applied_by_source_creation_order(self) -> None:
         connection = sqlite3.connect(":memory:")

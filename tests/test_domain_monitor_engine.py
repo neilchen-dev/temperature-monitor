@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 
 from domain.models import (
     ApplicabilityStatus,
@@ -28,12 +28,12 @@ class MonitorEngineTests(unittest.TestCase):
             temperature_max=26.0,
             humidity_min=40.0,
             humidity_max=60.0,
-            effective_from=datetime(2026, 1, 1),
+            effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
             effective_to=None,
             source_document="test-standard",
             clause="5.2.3",
         )
-        self.sample_time = datetime(2026, 8, 28, 13, 0)
+        self.sample_time = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
 
     def test_normal_inclusive_boundaries(self) -> None:
         result = evaluate_monitor_state(
@@ -84,7 +84,7 @@ class MonitorEngineTests(unittest.TestCase):
             temperature_max=26.0,
             humidity_min=None,
             humidity_max=None,
-            effective_from=datetime(2026, 1, 1),
+            effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
             effective_to=None,
             source_document="test-standard",
             clause=None,

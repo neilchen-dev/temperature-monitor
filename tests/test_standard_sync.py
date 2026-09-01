@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from application.standard_sync import (
     StandardSyncService,
@@ -24,7 +24,7 @@ class StandardSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:")
         self.repository = SQLiteStandardRepository(self.connection)
-        self.now = datetime(2026, 8, 28, 13, 0)
+        self.now = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
 
     def tearDown(self) -> None:
         self.connection.close()
@@ -46,7 +46,7 @@ class StandardSyncTests(unittest.TestCase):
             temperature_max=26.0,
             humidity_min=40.0,
             humidity_max=60.0,
-            effective_from=datetime(2026, 1, 1),
+            effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
             effective_to=None,
             source_document="SOP-001",
             clause="5.2.3",

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from application.operation_sync import (
     OperationAction,
@@ -22,6 +22,7 @@ from integrations.feishu_observation import (
 from integrations.feishu_standard import (
     FeishuStandardAdapter,
     FeishuStandardFieldMap,
+    _parse_datetime,
 )
 from integrations.feishu_standard_config import (
     FEISHU_STANDARD_FIELD_MAP,
@@ -41,6 +42,26 @@ class _Source:
 
 
 class FeishuStandardAdapterTests(unittest.TestCase):
+    def test_naive_iso_datetime_uses_configured_business_timezone(self) -> None:
+        parsed = _parse_datetime("2026-01-01T00:00:00")
+
+        self.assertIsNotNone(parsed)
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset(), timedelta(hours=8))
+
+    def test_iso_datetime_with_offset_stays_aware(self) -> None:
+        parsed = _parse_datetime("2026-01-01T00:00:00+08:00")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.utcoffset(), timedelta(hours=8))
+
+    def test_z_datetime_is_parsed_as_utc(self) -> None:
+        parsed = _parse_datetime("2026-01-01T00:00:00Z")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.tzinfo, timezone.utc)
+        self.assertEqual(parsed.utcoffset(), timedelta(0))
+
     def test_real_standard_table_mapping_is_frozen_explicitly(self) -> None:
         self.assertEqual(FEISHU_STANDARD_TABLE_ID, "tbl4S6Q0VOYjK92t")
         self.assertEqual(FEISHU_STANDARD_FIELD_MAP.standard_id, "标准编号")

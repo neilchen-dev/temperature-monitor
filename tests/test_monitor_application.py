@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 
 from application.action_executor import ActionExecutor
 from application.actions import ApplicationActionKind, ApplicationActionMapper
@@ -46,7 +46,7 @@ class _AlarmRepository:
 
 class MonitorApplicationServiceTests(unittest.TestCase):
     def test_handle_sample_runs_domain_then_shadow_executor(self) -> None:
-        now = datetime(2026, 8, 28, 13, 0)
+        now = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
         device = DeviceContext("TH-03", "仓库")
         standard = EnvironmentStandard(
             standard_id="ENV-002",
@@ -57,7 +57,7 @@ class MonitorApplicationServiceTests(unittest.TestCase):
             temperature_max=26.0,
             humidity_min=40.0,
             humidity_max=60.0,
-            effective_from=datetime(2026, 1, 1),
+            effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
             effective_to=None,
             source_document="SOP-001",
             clause="5.2.3",

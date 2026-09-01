@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from domain.standard_resolver import (
     StandardConfigurationConflictError,
@@ -18,8 +18,8 @@ from repositories.standard_resolver import (
 
 class StandardResolverTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.start = datetime(2026, 1, 1)
-        self.timestamp = datetime(2026, 8, 28, 13, 0)
+        self.start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.timestamp = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
 
     def _standard(
         self,
@@ -201,6 +201,32 @@ class StandardResolverTests(unittest.TestCase):
                 area_id="仓库",
                 operation_type=None,
                 timestamp=end,
+            )
+
+    def test_aware_standard_and_sample_time_compare_without_error(self) -> None:
+        selected = StaticStandardResolver((self._standard("AWARE"),)).resolve(
+            area_id="仓库",
+            operation_type=None,
+            timestamp=datetime(2026, 8, 28, 21, 0, tzinfo=timezone(timedelta(hours=8))),
+        )
+
+        self.assertEqual(selected.standard_id, "AWARE")
+
+    def test_environment_standard_rejects_naive_effective_from(self) -> None:
+        with self.assertRaisesRegex(ValueError, "effective_from must be timezone-aware"):
+            EnvironmentStandard(
+                standard_id="NAIVE",
+                revision="Rev.A",
+                area="仓库",
+                operation_type=None,
+                temperature_min=20.0,
+                temperature_max=26.0,
+                humidity_min=40.0,
+                humidity_max=60.0,
+                effective_from=datetime(2026, 1, 1),
+                effective_to=None,
+                source_document="SOP-001",
+                clause=None,
             )
 
     def test_bounds_must_be_complete_pairs(self) -> None:
