@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Mapping
+import math
 from typing import Any, Protocol
 
 from application.shadow import ObservedAutomationState
@@ -260,19 +261,50 @@ def _optional_text(raw: Mapping[str, Any], field_name: str | None) -> str | None
 def _optional_int(raw: Mapping[str, Any], field_name: str | None) -> int | None:
     if field_name is None:
         return None
-    value = raw.get(field_name)
-    if value is None or value == "":
+    return _normalize_optional_int(raw.get(field_name), field_name)
+
+
+def _normalize_optional_int(value: Any, field_name: str) -> int | None:
+    """Normalize the small set of integer shapes returned by Feishu fields.
+
+    Formula/rollup fields may wrap a scalar in a one-item list or ``value``
+    object.  Unwrap only those unambiguous shapes; never select one value from
+    a multi-value field or guess which member of an unknown object is numeric.
+    """
+    if value is None:
         return None
-    # 整数值（尤其是 0）必须直接转换：_text() 会把 0 当 falsy 归一成空串，
-    # int("") 抛 ValueError，导致“无打开事件”的设备 observe 必然失败。
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise _integer_field_error(field_name, value) from exc
     if isinstance(value, bool):
-        raise ValueError(f"Feishu observation field is not an integer: {field_name}")
-    if isinstance(value, (int, float)):
-        return int(value)
-    try:
-        return int(_text(value))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Feishu observation field is not an integer: {field_name}") from exc
+        raise _integer_field_error(field_name, value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise _integer_field_error(field_name, value)
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise _integer_field_error(field_name, value)
+        return _normalize_optional_int(value[0], field_name)
+    if isinstance(value, Mapping):
+        if set(value) != {"value"}:
+            raise _integer_field_error(field_name, value)
+        return _normalize_optional_int(value["value"], field_name)
+    raise _integer_field_error(field_name, value)
+
+
+def _integer_field_error(field_name: str, value: Any) -> ValueError:
+    return ValueError(
+        "Feishu observation field is not an integer: "
+        f"{field_name} (value_type={type(value).__name__})"
+    )
 
 
 def _optional_ids(raw: Mapping[str, Any], field_name: str | None) -> tuple[str, ...]:

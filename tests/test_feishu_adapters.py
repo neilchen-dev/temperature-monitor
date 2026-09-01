@@ -263,6 +263,117 @@ class FeishuOperationAdapterTests(unittest.TestCase):
 
 
 class FeishuObservationAdapterTests(unittest.TestCase):
+    def _observe_count(self, value, *, field_name="active_count"):
+        class _ObservationSource:
+            def read(self, device_id: str):
+                return {
+                    "alarm": "未触发",
+                    "operation": "N/A",
+                    "event": False,
+                    field_name: value,
+                }
+
+        return FeishuObservationAdapter(
+            source=_ObservationSource(),
+            fields=FeishuObservationFieldMap(
+                alarm_state="alarm",
+                operation_state="operation",
+                event_exists="event",
+                active_event_count=(
+                    field_name if field_name == "active_count" else None
+                ),
+                pending_closure_count=(
+                    field_name if field_name == "pending_count" else None
+                ),
+            ),
+        ).observe("TH-10")
+
+    def test_integer_field_accepts_supported_feishu_shapes(self) -> None:
+        supported = (
+            (0, 0),
+            (1, 1),
+            ("0", 0),
+            ("1", 1),
+            (0.0, 0),
+            (None, None),
+            ("", None),
+            ([0], 0),
+            (["0"], 0),
+            ({"value": 0}, 0),
+            ([{"value": 0}], 0),
+        )
+        for raw_value, expected in supported:
+            with self.subTest(raw_value=raw_value):
+                observed = self._observe_count(raw_value)
+                self.assertEqual(observed.active_event_count, expected)
+
+    def test_integer_field_rejects_ambiguous_or_non_integral_shapes(self) -> None:
+        for raw_value in (1.5, "abc", [0, 1], {"unexpected": 0}):
+            with self.subTest(raw_value=raw_value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Feishu observation field is not an integer: active_count",
+                ):
+                    self._observe_count(raw_value)
+
+    def test_pending_closure_count_uses_same_integer_normalization(self) -> None:
+        observed = self._observe_count(
+            [{"value": "1"}], field_name="pending_count"
+        )
+        self.assertEqual(observed.pending_closure_count, 1)
+
+    def test_raw_feishu_record_envelope_reaches_observation_adapter(self) -> None:
+        """Exercise API record envelope -> record DTO -> composed observation."""
+        timestamp_ms = 1_788_228_800_000
+
+        def fetch_records(table_id: str):
+            if table_id == "devices":
+                return (
+                    {
+                        "record_id": "device-10",
+                        "fields": {
+                            "设备编号": [{"text": "TH-10"}],
+                            "警报状态": [{"text": "未触发"}],
+                            "当前作业状态": {"value": "N/A"},
+                        },
+                        "created_time": timestamp_ms,
+                        "last_modified_time": timestamp_ms,
+                    },
+                )
+            return (
+                {
+                    "record_id": "event-1",
+                    "fields": {
+                        "监测点": [{"text": "TH-10"}],
+                        "处理状态": {"value": "处理中"},
+                        "恢复时间": None,
+                    },
+                },
+            )
+
+        record_source = FeishuBitableRecordSource(fetch_records=fetch_records)
+        observation_source = FeishuBitableObservationSource(
+            source=record_source,
+            device_table_id="devices",
+            event_table_id="events",
+        )
+        observed = FeishuObservationAdapter(
+            source=observation_source,
+            fields=FeishuObservationFieldMap(
+                alarm_state="警报状态",
+                operation_state="当前作业状态",
+                event_exists="__event_exists",
+                active_event_count="__active_event_count",
+                pending_closure_count="__pending_closure_count",
+            ),
+        ).observe("TH-10")
+
+        self.assertEqual(observed.alarm_state, "NORMAL")
+        self.assertEqual(observed.operation_state, "NOT_APPLICABLE")
+        self.assertTrue(observed.event_exists)
+        self.assertEqual(observed.active_event_count, 1)
+        self.assertEqual(observed.pending_closure_count, 0)
+
     def test_current_event_status_field_excludes_closed_events(self) -> None:
         timestamp = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 
