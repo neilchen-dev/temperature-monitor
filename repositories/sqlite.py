@@ -43,7 +43,8 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "environment_events": (
         "event_id", "device_id", "event_key", "status", "opened_at",
-        "closed_at", "payload_json",
+        "closed_at", "payload_json", "external_create_owner",
+        "external_create_lease_until",
     ),
     "standard_versions": (
         "standard_id", "revision", "area", "device_id", "operation_type",

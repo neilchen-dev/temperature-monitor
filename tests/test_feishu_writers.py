@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import unittest
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from application.action_executor import ActionExecutor
 from domain.models import (
     AlarmAction,
     AlarmActionType,
@@ -45,6 +47,25 @@ class _RecordingWriter:
     def update(self, table_id: str, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         self.updated.append((table_id, record_id, fields))
         return {"record_id": record_id, "fields": fields}
+
+
+class _BlockingCreateWriter(_RecordingWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def create(
+        self,
+        table_id: str,
+        fields: dict[str, Any],
+        *,
+        client_token: str | None = None,
+    ) -> dict[str, Any]:
+        self.created.append((table_id, fields, client_token))
+        self.entered.set()
+        self.release.wait(timeout=5)
+        return {"code": 0, "data": {"record": {"record_id": "recA"}}}
 
 
 class _RecordSource:
@@ -423,6 +444,277 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
         )
 
         self.assertEqual(recording.updated[-1][1], "rec-B")
+
+    def test_real_nested_create_response_is_persistently_bound(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        local = repository.create_or_get_active(
+            device_id="TH-03",
+            event_key="ENV:TH-03:nested-response",
+            opened_at=_sample().sample_time,
+        )
+        recording = _RecordingWriter()
+
+        def nested_create(table_id, fields, *, client_token=None):
+            recording.created.append((table_id, fields, client_token))
+            return {"code": 0, "data": {"record": {"record_id": "recA"}}}
+
+        recording.create = nested_create
+        writer = FeishuEnvironmentEventWriter(
+            writer=recording,
+            source=_RecordSource(
+                {
+                    "tbl-devices": (
+                        FeishuRawRecord(
+                            record_id="device",
+                            fields={
+                                "设备编号": "TH-03",
+                                "默认异常责任人": [{"id": "ou-owner"}],
+                            },
+                        ),
+                    )
+                }
+            ),
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            event_repository=repository,
+        )
+        writer.handle_alarm_action(
+            AlarmAction(
+                action_type=AlarmActionType.CREATE_ALARM_EVENT,
+                device_id="TH-03",
+                alarm_id=local.event_id,
+            ),
+            {
+                "created_at": _sample().sample_time.isoformat(),
+                "sample_time": _sample().sample_time.isoformat(),
+                "python_alarm_transition": {
+                    "violation_started_at": _sample().sample_time.isoformat(),
+                },
+                "operation_state": {"area_id": "精密装配间"},
+            },
+        )
+
+        self.assertEqual(repository.get(local.event_id).payload["feishu_record_id"], "recA")
+
+    def test_missing_record_id_cannot_be_a_successful_create_action(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        local = repository.create_or_get_active(
+            device_id="TH-03",
+            event_key="ENV:TH-03:missing-record-id",
+            opened_at=_sample().sample_time,
+        )
+        recording = _RecordingWriter()
+        def missing_id_create(table_id, fields, *, client_token=None):
+            return {"code": 0, "data": {}}
+
+        recording.create = missing_id_create
+        writer = FeishuEnvironmentEventWriter(
+            writer=recording,
+            source=_RecordSource(
+                {
+                    "tbl-devices": (
+                        FeishuRawRecord(
+                            record_id="device",
+                            fields={
+                                "设备编号": "TH-03",
+                                "默认异常责任人": [{"id": "ou-owner"}],
+                            },
+                        ),
+                    )
+                }
+            ),
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            event_repository=repository,
+        )
+        executor = ActionExecutor(
+            mode="active",
+            active_device_ids=("TH-03",),
+            context_handlers={AlarmActionType.CREATE_ALARM_EVENT: writer.handle_alarm_action},
+        )
+        execution = executor.execute(
+            (
+                AlarmAction(
+                    action_type=AlarmActionType.CREATE_ALARM_EVENT,
+                    device_id="TH-03",
+                    alarm_id=local.event_id,
+                ),
+            ),
+            context={
+                "device_id": "TH-03",
+                "created_at": _sample().sample_time.isoformat(),
+                "sample_time": _sample().sample_time.isoformat(),
+                "python_alarm_transition": {
+                    "violation_started_at": _sample().sample_time.isoformat(),
+                },
+                "operation_state": {"area_id": "精密装配间"},
+            },
+        )[0]
+
+        self.assertEqual(execution.status.value, "FAILED")
+        self.assertNotIn("feishu_record_id", repository.get(local.event_id).payload)
+
+    def test_concurrent_reconciliation_has_one_remote_create_owner(self) -> None:
+        connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        local = repository.create_or_get_active(
+            device_id="TH-03",
+            event_key="ENV:TH-03:concurrent",
+            opened_at=_sample().sample_time,
+        )
+        blocking = _BlockingCreateWriter()
+        source = _RecordSource(
+            {
+                "tbl-devices": (
+                    FeishuRawRecord(
+                        record_id="device",
+                        fields={
+                            "设备编号": "TH-03",
+                            "默认异常责任人": [{"id": "ou-owner"}],
+                        },
+                    ),
+                )
+            }
+        )
+        writer = FeishuEnvironmentEventWriter(
+            writer=blocking,
+            source=source,
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            event_repository=repository,
+        )
+        action = AlarmAction(
+            action_type=AlarmActionType.UPDATE_ALARM_EVENT,
+            device_id="TH-03",
+            alarm_id=local.event_id,
+        )
+        context = {
+            "created_at": _sample().sample_time.isoformat(),
+            "sample_time": _sample().sample_time.isoformat(),
+            "python_alarm_transition": {
+                "violation_started_at": _sample().sample_time.isoformat(),
+            },
+            "operation_state": {"area_id": "精密装配间"},
+        }
+        errors: list[Exception] = []
+
+        def invoke() -> None:
+            try:
+                writer.handle_alarm_action(action, context)
+            except Exception as exc:
+                errors.append(exc)
+
+        owner_thread = threading.Thread(target=invoke)
+        owner_thread.start()
+        self.assertTrue(blocking.entered.wait(timeout=5))
+        contender_thread = threading.Thread(target=invoke)
+        contender_thread.start()
+        contender_thread.join(timeout=5)
+        blocking.release.set()
+        owner_thread.join(timeout=5)
+
+        self.assertEqual(len(blocking.created), 1)
+        self.assertEqual(repository.get(local.event_id).payload["feishu_record_id"], "recA")
+        self.assertEqual(len(errors), 1)
+
+    def test_1254608_recovers_exact_record_then_stops_creating(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        local = repository.create_or_get_active(
+            device_id="TH-03",
+            event_key="ENV:TH-03:1254608",
+            opened_at=_sample().sample_time,
+        )
+        remote = FeishuRawRecord(
+            record_id="recA",
+            fields={
+                "监测点": "TH-03",
+                "开始时间": int(_sample().sample_time.timestamp() * 1000),
+            },
+        )
+
+        class EventuallyVisibleSource:
+            event_reads = 0
+
+            def read_records(self, table_id):
+                if table_id == "tbl-devices":
+                    return (
+                        FeishuRawRecord(
+                            record_id="device",
+                            fields={
+                                "设备编号": "TH-03",
+                                "默认异常责任人": [{"id": "ou-owner"}],
+                            },
+                        ),
+                    )
+                self.event_reads += 1
+                return () if self.event_reads == 1 else (remote,)
+
+        recording = _RecordingWriter()
+
+        def repeated_create(table_id, fields, *, client_token=None):
+            recording.created.append((table_id, fields, client_token))
+            raise RuntimeError(
+                "飞书新增 Base 记录失败: code=1254608, "
+                "msg=Same API requests are submitted repeatedly."
+            )
+
+        recording.create = repeated_create
+        writer = FeishuEnvironmentEventWriter(
+            writer=recording,
+            source=EventuallyVisibleSource(),
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            event_repository=repository,
+        )
+        action = AlarmAction(
+            action_type=AlarmActionType.CREATE_ALARM_EVENT,
+            device_id="TH-03",
+            alarm_id=local.event_id,
+        )
+        context = {
+            "created_at": _sample().sample_time.isoformat(),
+            "sample_time": _sample().sample_time.isoformat(),
+            "python_alarm_transition": {
+                "violation_started_at": _sample().sample_time.isoformat(),
+            },
+            "operation_state": {"area_id": "精密装配间"},
+        }
+
+        writer.handle_alarm_action(action, context)
+        writer.handle_alarm_action(action, context)
+
+        self.assertEqual(len(recording.created), 1)
+        self.assertEqual(repository.get(local.event_id).payload["feishu_record_id"], "recA")
+
+    def test_business_key_matching_uses_feishu_millisecond_precision(self) -> None:
+        started_at = datetime(
+            2026, 9, 2, 13, 41, 47, 162671, tzinfo=timezone.utc
+        )
+        remote = FeishuRawRecord(
+            record_id="recA",
+            fields={
+                "监测点": "TH-01",
+                "开始时间": int(started_at.timestamp() * 1000),
+            },
+        )
+        writer = self._writer(_RecordingWriter(), (remote,))
+
+        result = writer.create_event(
+            device_id="TH-01",
+            area="仓库",
+            start_time=started_at,
+            owner=[{"id": "ou-owner"}],
+            allow_existing=True,
+        )
+
+        self.assertEqual(result["record_id"], "recA")
 
     def test_close_requires_manual_closure_fields(self) -> None:
         recording = _RecordingWriter()

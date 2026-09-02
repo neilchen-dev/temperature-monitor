@@ -80,6 +80,33 @@ class EnvironmentEventRepositoryTests(unittest.TestCase):
         self.assertEqual(historical.payload["feishu_record_id"], "rec-A")
         self.assertEqual(historical.closed_at, self.opened_at + timedelta(minutes=5))
 
+    def test_two_alarm_cycles_keep_distinct_external_record_bindings(self) -> None:
+        first = self.repository.create_or_get_active(
+            device_id="TH-01",
+            event_key="ENV:TH-01:cycle-A",
+            opened_at=self.opened_at,
+        )
+        self.repository.bind_external_record(first.event_id, record_id="rec-A")
+        self.repository.mark_recovered(
+            first.event_id,
+            recovered_at=self.opened_at + timedelta(minutes=5),
+        )
+        second = self.repository.create_or_get_active(
+            device_id="TH-01",
+            event_key="ENV:TH-01:cycle-B",
+            opened_at=self.opened_at + timedelta(minutes=6),
+        )
+        self.repository.bind_external_record(second.event_id, record_id="rec-B")
+
+        self.assertEqual(
+            self.repository.get(first.event_id).payload["feishu_record_id"],
+            "rec-A",
+        )
+        self.assertEqual(
+            self.repository.get(second.event_id).payload["feishu_record_id"],
+            "rec-B",
+        )
+
     def test_two_connections_racing_for_different_events_keep_one_active(self) -> None:
         database_path = Path.cwd() / "events-race-test.sqlite"
         database_path.unlink(missing_ok=True)

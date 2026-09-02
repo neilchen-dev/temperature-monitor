@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 
@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS environment_events (
     status TEXT NOT NULL CHECK(status IN ('OPEN', 'IN_PROGRESS', 'CLOSED')),
     opened_at TEXT NOT NULL,
     closed_at TEXT,
-    payload_json TEXT NOT NULL
+    payload_json TEXT NOT NULL,
+    external_create_owner TEXT,
+    external_create_lease_until TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_environment_events_device_status
     ON environment_events(device_id, status);
@@ -62,7 +64,19 @@ class SQLiteEnvironmentEventRepository:
         self.connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self.connection.executescript(_SCHEMA)
+        self._apply_migrations()
         self.connection.commit()
+
+    def _apply_migrations(self) -> None:
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(environment_events)")
+        }
+        for column in ("external_create_owner", "external_create_lease_until"):
+            if column not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE environment_events ADD COLUMN {column} TEXT"
+                )
 
     def create_or_get_active(
         self,
@@ -183,28 +197,89 @@ class SQLiteEnvironmentEventRepository:
         if not record_id.strip():
             raise ValueError("record_id cannot be empty")
         with self._lock:
-            record = self._require(event_id)
-            payload = dict(record.payload)
-            existing = payload.get("feishu_record_id")
-            if existing is not None and existing != record_id:
-                raise ValueError(
-                    f"environment event {event_id} is already bound to {existing}"
-                )
-            payload["feishu_record_id"] = record_id
-            self.connection.execute(
-                "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                (
-                    json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                existing = payload.get("feishu_record_id")
+                if existing is not None and existing != record_id:
+                    raise ValueError(
+                        f"environment event {event_id} is already bound to {existing}"
+                    )
+                for row in self.connection.execute(
+                    """
+                    SELECT event_id, payload_json FROM environment_events
+                    WHERE event_id <> ?
+                    """,
+                    (event_id,),
+                ):
+                    other_payload = json.loads(row["payload_json"])
+                    if other_payload.get("feishu_record_id") == record_id:
+                        raise ValueError(
+                            f"Feishu record {record_id} is already bound to "
+                            f"environment event {row['event_id']}"
+                        )
+                payload["feishu_record_id"] = record_id
+                self.connection.execute(
+                    """
+                    UPDATE environment_events
+                    SET payload_json = ?, external_create_owner = NULL,
+                        external_create_lease_until = NULL
+                    WHERE event_id = ?
+                    """,
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        event_id,
                     ),
+                )
+                self.connection.commit()
+                return self._require(event_id)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
+    def claim_external_create(
+        self,
+        event_id: str,
+        *,
+        owner: str,
+        claimed_at: datetime,
+        lease_seconds: float,
+    ) -> bool:
+        """Atomically elect one CREATE/reconciliation owner for a local cycle."""
+        if not owner.strip():
+            raise ValueError("owner cannot be empty")
+        lease_until = claimed_at + timedelta(seconds=max(1.0, lease_seconds))
+        with self._lock:
+            cursor = self.connection.execute(
+                """
+                UPDATE environment_events
+                SET external_create_owner = ?, external_create_lease_until = ?
+                WHERE event_id = ?
+                  AND (
+                    external_create_owner IS NULL
+                    OR external_create_lease_until <= ?
+                  )
+                """,
+                (
+                    owner,
+                    _time_text(lease_until),
                     event_id,
+                    _time_text(claimed_at),
                 ),
             )
             self.connection.commit()
-            return self._require(event_id)
+            if cursor.rowcount:
+                return True
+            if self.get(event_id) is None:
+                raise KeyError(f"unknown environment event: {event_id}")
+            return False
 
     def get(self, event_id: str) -> EnvironmentEventRecord | None:
         row = self.connection.execute(

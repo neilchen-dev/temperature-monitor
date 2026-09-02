@@ -51,6 +51,7 @@ class _FeishuStore:
         self.clock = created_at
         self.sequence = 0
         self.fail_event_creates = 0
+        self.lose_event_create_response = False
         self.create_attempt_tokens: list[tuple[str, str | None]] = []
         self.tables: dict[str, list[FeishuRawRecord]] = {
             "tbl-device": [
@@ -78,7 +79,11 @@ class _FeishuStore:
     ) -> dict[str, Any]:
         self.create_attempt_tokens.append((table_id, client_token))
         if client_token and client_token in self.tokens:
-            return {"code": 0, "record_id": self.tokens[client_token], "deduped": True}
+            return {
+                "code": 0,
+                "data": {"record": {"record_id": self.tokens[client_token]}},
+                "deduped": True,
+            }
         if table_id == "tbl-event" and self.fail_event_creates:
             self.fail_event_creates -= 1
             # Simulate a transport failure before the remote record is
@@ -102,7 +107,15 @@ class _FeishuStore:
         self.clock += timedelta(seconds=1)
         if client_token:
             self.tokens[client_token] = record_id
-        return {"code": 0, "record_id": record_id, "fields": stored_fields}
+        if table_id == "tbl-event" and self.lose_event_create_response:
+            self.lose_event_create_response = False
+            raise TimeoutError("event create response lost")
+        return {
+            "code": 0,
+            "data": {
+                "record": {"record_id": record_id, "fields": stored_fields}
+            },
+        }
 
     def update(self, table_id: str, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         records = self.tables.get(table_id, [])
@@ -180,15 +193,16 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(operation_repository.get(device).state, OperationStatus.OPERATING)
 
+        local_event_repository = SQLiteEnvironmentEventRepository(connection)
         event_writer = FeishuEnvironmentEventWriter(
             writer=store,
             source=store,
             event_table_id="tbl-event",
             device_table_id="tbl-device",
+            event_repository=local_event_repository,
         )
         alarm_repository = SQLiteAlarmStateRepository(connection)
         task_repository = SQLiteAutomationTaskRepository(connection)
-        local_event_repository = SQLiteEnvironmentEventRepository(connection)
         latest_sample_repository = SQLiteLatestSampleRepository(connection)
         standard = EnvironmentStandard(
             standard_id="STD-E2E",
@@ -250,12 +264,29 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         self.assertEqual(verified.transition.next.state.value, "ALARM")
         event_records = store.read_records("tbl-event")
         self.assertEqual(len(event_records), 1)
+        local_event_id = verified.transition.next.active_alarm_id
+        self.assertIsNotNone(local_event_id)
+        self.assertEqual(
+            local_event_repository.get(local_event_id).payload["feishu_record_id"],
+            event_records[0].record_id,
+        )
         self.assertEqual(event_records[0].fields["责任人"], [{"id": "ou-owner"}])
         self.assertEqual(event_records[0].fields["异常类型"], "温度高于上限")
         self.assertEqual(event_records[0].fields["开始时间"], int(base_time.timestamp() * 1000))
         self.assertIsInstance(event_records[0].fields["开始时间"], int)
 
-        sample(base_time + timedelta(minutes=6), 37)
+        updated = sample(base_time + timedelta(minutes=6), 37)
+        self.assertTrue(
+            any(
+                execution.action.action_type is AlarmActionType.UPDATE_ALARM_EVENT
+                and execution.status.value == "SUCCEEDED"
+                for execution in updated.executions
+            )
+        )
+        self.assertEqual(
+            local_event_repository.get(local_event_id).payload["feishu_record_id"],
+            event_records[0].record_id,
+        )
         self.assertEqual(store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 37.0)
         sample(base_time + timedelta(minutes=7), 25)
         self.assertNotIn("恢复时间", store.read_records("tbl-event")[0].fields)
@@ -339,11 +370,13 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             area="精密装配间",
             control_type=ControlType.OPERATION_PERIOD,
         )
+        local_event_repository = SQLiteEnvironmentEventRepository(operation_connection)
         event_writer = FeishuEnvironmentEventWriter(
             writer=store,
             source=store,
             event_table_id="tbl-event",
             device_table_id="tbl-device",
+            event_repository=local_event_repository,
         )
         standard = EnvironmentStandard(
             standard_id="STD-FAIL-E2E",
@@ -383,7 +416,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
                     },
                 ),
                 task_repository=SQLiteAutomationTaskRepository(operation_connection),
-                event_repository=SQLiteEnvironmentEventRepository(operation_connection),
+                event_repository=local_event_repository,
                 latest_sample_repository=SQLiteLatestSampleRepository(operation_connection),
             )
 
@@ -403,7 +436,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
 
         service = build_service()
         self.assertEqual(sample(service, base_time, 35).transition.next.state.value, "PENDING")
-        store.fail_event_creates = 2
+        store.fail_event_creates = 1
         failed = sample(service, base_time + timedelta(minutes=5), 36)
         self.assertEqual(failed.transition.next.state.value, "ALARM")
         self.assertEqual(len(store.read_records("tbl-event")), 0)
@@ -430,7 +463,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             if task.task_type == "RECONCILE_ALARM_EVENT"
         )
         first_retry_at = base_time + timedelta(minutes=5, seconds=1)
-        with self.assertRaisesRegex(RuntimeError, "event create transport failure"):
+        with self.assertRaisesRegex(RuntimeError, "CREATE/reconciliation"):
             restarted.reconcile_alarm_event_task(
                 task=reconciliation,
                 device=device,
@@ -451,12 +484,14 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             )
             if task.task_type == "RECONCILE_ALARM_EVENT"
         )
-        restarted.reconcile_alarm_event_task(
+        executions = restarted.reconcile_alarm_event_task(
             task=retry,
             device=device,
             now=first_retry_at
             + timedelta(seconds=config.ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS),
         )
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0].status.value, "SUCCEEDED")
         restarted.task_repository.mark_succeeded(
             retry.task_id,
             finished_at=first_retry_at
@@ -464,12 +499,17 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             worker_id="restarted-worker",
         )
         self.assertEqual(len(store.read_records("tbl-event")), 1)
+        active_event_id = restarted.alarm_state_repository.get("TH-03").active_alarm_id
+        self.assertEqual(
+            local_event_repository.get(active_event_id).payload["feishu_record_id"],
+            store.read_records("tbl-event")[0].record_id,
+        )
         event_tokens = tuple(
             token
             for table_id, token in store.create_attempt_tokens
             if table_id == "tbl-event"
         )
-        self.assertEqual(len(event_tokens), 3)
+        self.assertEqual(len(event_tokens), 2)
         self.assertEqual(len(set(event_tokens)), 1)
         self.assertEqual(str(uuid.UUID(event_tokens[0] or "")), event_tokens[0])
         self.assertEqual(uuid.UUID(event_tokens[0] or "").version, 4)
@@ -481,6 +521,63 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         self.assertEqual(len(store.read_records("tbl-event")), 1)
         self.assertEqual(
             store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 38.0
+        )
+
+    def test_create_response_lost_recovers_same_remote_record_and_binds_it(self) -> None:
+        moment = datetime(2026, 9, 2, 13, 41, 47, tzinfo=timezone.utc)
+        connection = connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        local = repository.create_or_get_active(
+            device_id="TH-01",
+            event_key=f"ENV:TH-01:{moment.isoformat()}",
+            opened_at=moment,
+        )
+        store = _FeishuStore(moment)
+        store.tables["tbl-device"] = [
+            FeishuRawRecord(
+                record_id="rec-device",
+                fields={
+                    "设备编号": "TH-01",
+                    "默认异常责任人": [{"id": "ou-owner"}],
+                },
+            )
+        ]
+        store.lose_event_create_response = True
+        writer = FeishuEnvironmentEventWriter(
+            writer=store,
+            source=store,
+            event_table_id="tbl-event",
+            device_table_id="tbl-device",
+            event_repository=repository,
+        )
+        writer.handle_alarm_action(
+            type(
+                "Action",
+                (),
+                {
+                    "action_type": AlarmActionType.CREATE_ALARM_EVENT,
+                    "device_id": "TH-01",
+                    "alarm_id": local.event_id,
+                },
+            )(),
+            {
+                "created_at": moment.isoformat(),
+                "sample_time": moment.isoformat(),
+                "sample": {"temperature": 31.0, "humidity": 50.0},
+                "python_monitor_result": {"temperature_status": "HIGH"},
+                "python_alarm_transition": {
+                    "violation_started_at": moment.isoformat(),
+                    "active_alarm_id": local.event_id,
+                },
+                "operation_state": {"area_id": "仓库"},
+            },
+        )
+
+        self.assertEqual(len(store.read_records("tbl-event")), 1)
+        self.assertEqual(
+            repository.get(local.event_id).payload["feishu_record_id"],
+            store.read_records("tbl-event")[0].record_id,
         )
 
 

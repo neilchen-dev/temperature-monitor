@@ -55,8 +55,13 @@ def _event_time_matches(value: Any, expected: datetime) -> bool:
     elif reference.tzinfo is None and parsed.tzinfo is not None:
         reference = reference.replace(tzinfo=_business_timezone())
     if parsed.tzinfo is None or reference.tzinfo is None:
-        return parsed == reference
-    return parsed.astimezone(timezone.utc) == reference.astimezone(timezone.utc)
+        return parsed.replace(microsecond=(parsed.microsecond // 1000) * 1000) == (
+            reference.replace(microsecond=(reference.microsecond // 1000) * 1000)
+        )
+    # Base datetime cells preserve epoch milliseconds, not Python's remaining
+    # microseconds. Compare at that exact storage precision so a response-lost
+    # CREATE for e.g. .162671 can recover the remote .162 record.
+    return int(parsed.timestamp() * 1000) == int(reference.timestamp() * 1000)
 
 
 class FeishuWriteError(RuntimeError):
@@ -560,11 +565,26 @@ class FeishuEnvironmentEventWriter:
         token = normalize_client_token(idempotency_key or (
             f"ENV:{normalized_device}:{_datetime_cell(start_time)}"
         ))
-        return self.writer.create(
-            self.event_table_id,
-            fields,
-            client_token=token,
-        )
+        try:
+            return self.writer.create(
+                self.event_table_id,
+                fields,
+                client_token=token,
+            )
+        except Exception:
+            # A timeout/disconnect (and Feishu 1254608 for the same token) is
+            # ambiguous: the remote row may already exist. Recover it by the
+            # exact business key before allowing a later retry to CREATE.
+            existing_after_error = self._find_event_by_business_key(
+                normalized_device, start_time
+            )
+            if existing_after_error is not None:
+                return {
+                    "existing": True,
+                    "idempotent": True,
+                    "record_id": existing_after_error.record_id,
+                }
+            raise
 
     def update_event(
         self,
@@ -760,6 +780,9 @@ class FeishuEnvironmentEventWriter:
             )
             if started_at is None:
                 raise FeishuWriteError("创建环境异常缺少连续超限开始时间")
+            if self._bound_record_id(local_event_id) is not None:
+                return
+            self._claim_external_create(local_event_id, context)
             created = self.create_event(
                 device_id=device_id,
                 area=str(context.get("operation_state", {}).get("area_id", "")).strip()
@@ -789,6 +812,7 @@ class FeishuEnvironmentEventWriter:
             )
             record_id = self._resolve_record_id(local_event_id, device_id, started_at)
             if record_id is None:
+                self._claim_external_create(local_event_id, context)
                 reconciled = self.reconcile_active_event(
                     device_id=device_id,
                     area=area,
@@ -849,17 +873,15 @@ class FeishuEnvironmentEventWriter:
         device_id: str,
         started_at: datetime | None,
     ) -> str | None:
-        if local_event_id is not None and self.event_repository is not None:
-            event = self.event_repository.get(local_event_id)
-            if event is not None:
-                record_id = event.payload.get("feishu_record_id")
-                if isinstance(record_id, str) and record_id.strip():
-                    return record_id.strip()
+        bound_record_id = self._bound_record_id(local_event_id)
+        if bound_record_id is not None:
+            return bound_record_id
         if started_at is None:
             return None
         record = self._find_event_by_business_key(_device_id(device_id), started_at)
         if record is not None:
-            self._bind_external_record(local_event_id, {"record_id": record.record_id})
+            if local_event_id is not None and self.event_repository is not None:
+                self._bind_external_record(local_event_id, {"record_id": record.record_id})
             return record.record_id
         return None
 
@@ -869,13 +891,57 @@ class FeishuEnvironmentEventWriter:
         response: Mapping[str, Any],
     ) -> None:
         if local_event_id is None or self.event_repository is None:
-            return
-        record_id = response.get("record_id")
-        if isinstance(record_id, str) and record_id.strip():
-            self.event_repository.bind_external_record(
-                local_event_id,
-                record_id=record_id.strip(),
+            raise FeishuWriteError(
+                "Active 环境异常写入缺少本地 event repository/event_id，拒绝标记成功"
             )
+        record_id = _created_record_id(response)
+        if record_id is None:
+            raise FeishuWriteError("飞书新增环境异常成功响应缺少 record_id，拒绝标记成功")
+        self.event_repository.bind_external_record(
+            local_event_id,
+            record_id=record_id,
+        )
+
+    def _bound_record_id(self, local_event_id: str | None) -> str | None:
+        if local_event_id is None or self.event_repository is None:
+            return None
+        event = self.event_repository.get(local_event_id)
+        if event is None:
+            raise FeishuWriteError(f"找不到本地环境异常事件: {local_event_id}")
+        record_id = event.payload.get("feishu_record_id")
+        if isinstance(record_id, str) and record_id.strip():
+            return record_id.strip()
+        return None
+
+    def _claim_external_create(
+        self,
+        local_event_id: str | None,
+        context: Mapping[str, Any],
+    ) -> None:
+        if local_event_id is None or self.event_repository is None:
+            raise FeishuWriteError(
+                "Active 环境异常 CREATE 缺少本地 event repository/event_id"
+            )
+        claimed_at = _parse_datetime(context.get("created_at")) or datetime.now(
+            timezone.utc
+        )
+        claimed = self.event_repository.claim_external_create(
+            local_event_id,
+            owner=str(uuid.uuid4()),
+            claimed_at=claimed_at,
+            lease_seconds=max(
+                1.0,
+                float(config.ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS),
+            ),
+        )
+        if claimed:
+            return
+        # A concurrent owner may have completed between resolve and claim.
+        if self._bound_record_id(local_event_id) is not None:
+            return
+        raise FeishuWriteError(
+            f"本地环境异常 {local_event_id} 的 Feishu CREATE/reconciliation 已由其他任务执行"
+        )
 
     def _active_events(self, device_id: str) -> tuple[FeishuRawRecord, ...]:
         normalized_device = _device_id(device_id)
@@ -1436,6 +1502,21 @@ def _user_cell(value: Any) -> list[dict[str, str]]:
 
 def _link_cell(record_id: str) -> list[dict[str, str]]:
     return [{"id": _required_id(record_id, "parent_record_id")}]
+
+
+def _created_record_id(response: Mapping[str, Any]) -> str | None:
+    """Extract a Base record id from real and adapter-normalized responses."""
+    candidates: list[Any] = [response.get("record_id")]
+    data = response.get("data")
+    if isinstance(data, Mapping):
+        candidates.append(data.get("record_id"))
+        record = data.get("record")
+        if isinstance(record, Mapping):
+            candidates.extend((record.get("record_id"), record.get("id")))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _field_text(value: Any) -> str:
