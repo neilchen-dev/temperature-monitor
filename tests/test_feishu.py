@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 import uuid
 from unittest.mock import Mock, patch
@@ -151,24 +152,35 @@ class RecordDiscoveryTests(unittest.TestCase):
         for business_key in business_keys:
             with self.subTest(business_key=business_key):
                 token = feishu.normalize_client_token(business_key)
+                digest = hashlib.sha256(business_key.encode("utf-8")).digest()
                 self.assertEqual(
                     token,
-                    str(uuid.uuid5(uuid.NAMESPACE_URL, business_key)),
+                    str(uuid.UUID(bytes=digest[:16], version=4)),
                 )
                 self.assertEqual(str(uuid.UUID(token)), token)
                 self.assertEqual(len(token), 36)
+                self.assertEqual(uuid.UUID(token).version, 4)
                 self.assertEqual(token, feishu.normalize_client_token(business_key))
                 tokens.append(token)
 
         self.assertEqual(len(tokens), len(set(tokens)))
 
-    def test_normalized_uuid_is_unchanged_and_missing_key_gets_uuid4(self) -> None:
-        normalized = "12345678-1234-5678-9234-567812345678"
+    def test_normalized_uuid4_is_unchanged_and_missing_key_gets_uuid4(self) -> None:
+        normalized = "12345678-1234-4678-9234-567812345678"
 
         self.assertEqual(feishu.normalize_client_token(normalized), normalized)
         generated = feishu.normalize_client_token(None)
         self.assertEqual(str(uuid.UUID(generated)), generated)
         self.assertEqual(uuid.UUID(generated).version, 4)
+
+    def test_non_v4_uuid_is_remapped_to_deterministic_uuid4(self) -> None:
+        uuid5_token = str(uuid.uuid5(uuid.NAMESPACE_URL, "ENV:TH-01:test"))
+
+        normalized = feishu.normalize_client_token(uuid5_token)
+
+        self.assertNotEqual(normalized, uuid5_token)
+        self.assertEqual(uuid.UUID(normalized).version, 4)
+        self.assertEqual(normalized, feishu.normalize_client_token(uuid5_token))
 
     def test_create_never_sends_raw_business_key_as_client_token(self) -> None:
         response = Mock(status_code=200)
@@ -193,6 +205,7 @@ class RecordDiscoveryTests(unittest.TestCase):
         self.assertEqual(tokens[0], tokens[1])
         self.assertNotEqual(tokens[0], business_key)
         self.assertEqual(str(uuid.UUID(tokens[0])), tokens[0])
+        self.assertEqual(uuid.UUID(tokens[0]).version, 4)
 
     def test_reads_latest_history_timestamp_with_descending_sort(self) -> None:
         response = Mock(status_code=200)

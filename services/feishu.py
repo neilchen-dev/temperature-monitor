@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
@@ -23,6 +24,8 @@ _record_id_lock = threading.Lock()
 _RECORD_ID_CACHE_TTL_SECONDS = 3600
 _RECORD_NOT_FOUND_TTL_SECONDS = 300
 _TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
+
+
 def _resource_lock(key: str) -> threading.RLock:
     with _resource_locks_guard:
         lock = _resource_locks.get(key)
@@ -42,18 +45,23 @@ def _validate_bitable_config(*, require_default_table: bool = False) -> None:
 def normalize_client_token(client_token: Any | None) -> str:
     """Return one stable, Feishu-compatible idempotency token.
 
-    Caller-owned business keys map deterministically to UUIDv5 values.  A UUID
-    that has already been normalized remains unchanged when it crosses another
-    adapter layer.  A missing key receives a fresh UUIDv4 because it does not
-    represent a retryable business identity.
+    Caller-owned business keys map deterministically to UUIDv4-formatted values
+    derived from SHA-256.  A canonical UUIDv4 remains unchanged when it crosses
+    another adapter layer; UUIDs of other versions are treated as business keys
+    and remapped.  A missing key receives a fresh random UUIDv4 because it does
+    not represent a retryable business identity.
     """
     token = "" if client_token is None else str(client_token)
     if not token:
         return str(uuid.uuid4())
     try:
-        return str(uuid.UUID(token))
+        parsed = uuid.UUID(token)
     except ValueError:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, token))
+        parsed = None
+    if parsed is not None and parsed.version == 4 and str(parsed) == token:
+        return token
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
 
 
 def normalize_field_value(value: Any) -> str:

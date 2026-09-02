@@ -469,6 +469,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         self.assertEqual(len(event_tokens), 3)
         self.assertEqual(len(set(event_tokens)), 1)
         self.assertEqual(str(uuid.UUID(event_tokens[0] or "")), event_tokens[0])
+        self.assertEqual(uuid.UUID(event_tokens[0] or "").version, 4)
 
         # The next ALARM sample is a normal UPDATE of the recovered event;
         # repeated retries remain idempotent and never create a second row.
