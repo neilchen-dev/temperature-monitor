@@ -22,7 +22,6 @@ from integrations.feishu_writers import (
     FeishuEnvironmentEventWriter,
     FeishuInspectionRecordWriter,
     FeishuOperationRecordWriter,
-    FeishuWriteError,
 )
 
 
@@ -189,7 +188,7 @@ class EnvironmentEventIdempotencyTests(unittest.TestCase):
         self.assertNotIn("existing", result)
         self.assertEqual(len(self.writer.writer.created), 1)
 
-    def test_two_active_events_still_rejected(self) -> None:
+    def test_distinct_unclosed_cycles_do_not_block_new_cycle(self) -> None:
         later = self.start.replace(minute=30)
         for i, moment in enumerate((self.start, later)):
             self.source.add(
@@ -204,8 +203,9 @@ class EnvironmentEventIdempotencyTests(unittest.TestCase):
                 ),
             )
         newest = self.start.replace(minute=45)
-        with self.assertRaises(FeishuWriteError):
-            self._create(start_time=newest)
+        result = self._create(start_time=newest)
+        self.assertNotIn("existing", result)
+        self.assertEqual(len(self.writer.writer.created), 1)
 
 
 class OperationRegistrationIdempotencyTests(unittest.TestCase):

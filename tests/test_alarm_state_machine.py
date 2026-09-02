@@ -124,7 +124,10 @@ class AlarmStateMachineTests(unittest.TestCase):
             now=self.start + timedelta(minutes=7),
         )
         self.assertEqual(second.next.state, AlarmLifecycleState.NORMAL)
-        self.assertEqual(second.actions[0].action_type, AlarmActionType.CLOSE_ALARM_EVENT)
+        self.assertEqual(
+            second.actions[0].action_type,
+            AlarmActionType.MARK_ALARM_RECOVERED,
+        )
 
     def test_recovery_window_can_be_enabled(self) -> None:
         machine = AlarmStateMachine(recovery_after=timedelta(minutes=2))
@@ -141,7 +144,10 @@ class AlarmStateMachineTests(unittest.TestCase):
             now=self.start + timedelta(minutes=2),
         )
         self.assertEqual(second.next.state, AlarmLifecycleState.NORMAL)
-        self.assertEqual(second.actions[0].action_type, AlarmActionType.CLOSE_ALARM_EVENT)
+        self.assertEqual(
+            second.actions[0].action_type,
+            AlarmActionType.MARK_ALARM_RECOVERED,
+        )
 
 
 if __name__ == "__main__":

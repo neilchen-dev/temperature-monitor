@@ -274,7 +274,7 @@ def _event_difference(
     if not has_observed_alarm:
         return None
     if observed_count == 0 and pending_count is not None and pending_count > 0:
-        # CLOSE_ALARM_EVENT 有意不关闭飞书事件（人工闭环边界）。Python 已
+        # MARK_ALARM_RECOVERED 有意不关闭飞书事件（人工闭环边界）。Python 已
         # 回到 NORMAL 时，只剩余“已写恢复时间、等人工关闭”的事件是设计内
         # 的终态，不是重复报警。
         details["pending_closure_count"] = {"expected": 0, "observed": pending_count}

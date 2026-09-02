@@ -259,6 +259,7 @@ def build_runtime(
         event_table_id=event_table_id,
         device_table_id=device_table_id,
         device_id_field=config.DEVICE_ID_FIELD,
+        event_repository=event_repository,
     )
     inspection_writer = FeishuInspectionRecordWriter(
         writer=record_writer,
@@ -316,7 +317,7 @@ def build_runtime(
             AlarmActionType.CREATE_ALARM_EVENT: event_writer.handle_alarm_action,
             AlarmActionType.UPDATE_ALARM_EVENT: event_writer.handle_alarm_action,
             AlarmActionType.START_RECOVERY: event_writer.handle_alarm_action,
-            AlarmActionType.CLOSE_ALARM_EVENT: event_writer.handle_alarm_action,
+            AlarmActionType.MARK_ALARM_RECOVERED: event_writer.handle_alarm_action,
         },
         recorder=run_repository,
     )

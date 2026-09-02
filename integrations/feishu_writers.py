@@ -451,6 +451,8 @@ class FeishuEventWriteFieldMap:
     area: str = "区域"
     start_time: str = "开始时间"
     recovery_time: str = "恢复时间"
+    recovery_temperature: str | None = None
+    recovery_humidity: str | None = None
     close_time: str = "关闭时间"
     peak_temperature: str = "峰值温度(°C)"
     peak_humidity: str = "峰值湿度(%RH)"
@@ -485,6 +487,7 @@ class FeishuEnvironmentEventWriter:
         device_owner_field: str = "默认异常责任人",
         device_control_requirement_field: str = "要求来源",
         closed_statuses: tuple[str, ...] = ("关闭", "已关闭", "CLOSED"),
+        event_repository: Any | None = None,
     ) -> None:
         self.writer = writer
         self.source = source
@@ -495,6 +498,7 @@ class FeishuEnvironmentEventWriter:
         self.device_owner_field = device_owner_field
         self.device_control_requirement_field = device_control_requirement_field
         self.closed_statuses = tuple(item.strip().lower() for item in closed_statuses)
+        self.event_repository = event_repository
 
     def create_event(
         self,
@@ -522,18 +526,6 @@ class FeishuEnvironmentEventWriter:
                 "idempotent": True,
                 "record_id": existing_by_key.record_id,
             }
-        active = self._active_events(normalized_device)
-        if len(active) > 1:
-            raise FeishuWriteError(
-                f"设备 {normalized_device} 存在 {len(active)} 条未关闭环境异常，拒绝继续写入"
-            )
-        if active:
-            if allow_existing:
-                return {"existing": True, "record_id": active[0].record_id}
-            raise FeishuWriteError(
-                f"设备 {normalized_device} 已有未关闭环境异常 {active[0].record_id}"
-            )
-
         owner_cell = _user_cell(owner) if owner is not None else self._device_owner(
             normalized_device
         )
@@ -644,14 +636,14 @@ class FeishuEnvironmentEventWriter:
         key and uses the same deterministic client token.
         """
         normalized_device = _device_id(device_id)
-        active = self._active_events(normalized_device)
-        if len(active) > 1:
-            raise FeishuWriteError(
-                f"设备 {normalized_device} 存在 {len(active)} 条未关闭环境异常，拒绝继续写入"
-            )
-        if active:
+        existing = (
+            self._find_event_by_business_key(normalized_device, start_time)
+            if start_time is not None
+            else None
+        )
+        if existing is not None:
             return self.update_event(
-                record_id=active[0].record_id,
+                record_id=existing.record_id,
                 temperature=temperature,
                 humidity=humidity,
                 temperature_status=temperature_status,
@@ -679,11 +671,20 @@ class FeishuEnvironmentEventWriter:
         *,
         record_id: str,
         recovered_at: datetime,
+        temperature: float | None = None,
+        humidity: float | None = None,
     ) -> Mapping[str, Any]:
+        fields: dict[str, Any] = {
+            self.fields.recovery_time: _datetime_cell(recovered_at)
+        }
+        if self.fields.recovery_temperature is not None:
+            _put_number(fields, self.fields.recovery_temperature, temperature)
+        if self.fields.recovery_humidity is not None:
+            _put_number(fields, self.fields.recovery_humidity, humidity)
         return self.writer.update(
             self.event_table_id,
             _required_id(record_id, "record_id"),
-            {self.fields.recovery_time: _datetime_cell(recovered_at)},
+            fields,
         )
 
     def recover_active_event(
@@ -751,6 +752,7 @@ class FeishuEnvironmentEventWriter:
         if not isinstance(transition, Mapping):
             transition = {}
 
+        local_event_id = self._local_event_id(action, transition)
         if action_type == "CREATE_ALARM_EVENT":
             started_at = _parse_datetime(
                 transition.get("violation_started_at")
@@ -758,7 +760,7 @@ class FeishuEnvironmentEventWriter:
             )
             if started_at is None:
                 raise FeishuWriteError("创建环境异常缺少连续超限开始时间")
-            self.create_event(
+            created = self.create_event(
                 device_id=device_id,
                 area=str(context.get("operation_state", {}).get("area_id", "")).strip()
                 if isinstance(context.get("operation_state"), Mapping)
@@ -771,6 +773,7 @@ class FeishuEnvironmentEventWriter:
                 idempotency_key=f"ENV:{device_id}:{_datetime_cell(started_at)}",
                 allow_existing=True,
             )
+            self._bind_external_record(local_event_id, created)
             return
         if action_type == "UPDATE_ALARM_EVENT":
             started_at = _parse_datetime(
@@ -784,31 +787,95 @@ class FeishuEnvironmentEventWriter:
                 if isinstance(operation_state, Mapping)
                 else ""
             )
-            self.reconcile_active_event(
-                device_id=device_id,
-                area=area,
-                start_time=started_at,
-                temperature=_number_value(sample.get("temperature")),
-                humidity=_number_value(sample.get("humidity")),
-                temperature_status=str(result.get("temperature_status") or ""),
-                humidity_status=str(result.get("humidity_status") or ""),
-                idempotency_key=(
-                    f"ENV:{device_id}:{_datetime_cell(started_at)}"
-                    if started_at is not None
-                    else None
-                ),
-            )
+            record_id = self._resolve_record_id(local_event_id, device_id, started_at)
+            if record_id is None:
+                reconciled = self.reconcile_active_event(
+                    device_id=device_id,
+                    area=area,
+                    start_time=started_at,
+                    temperature=_number_value(sample.get("temperature")),
+                    humidity=_number_value(sample.get("humidity")),
+                    temperature_status=str(result.get("temperature_status") or ""),
+                    humidity_status=str(result.get("humidity_status") or ""),
+                    idempotency_key=(
+                        f"ENV:{device_id}:{_datetime_cell(started_at)}"
+                        if started_at is not None
+                        else None
+                    ),
+                )
+                self._bind_external_record(local_event_id, reconciled)
+            else:
+                self.update_event(
+                    record_id=record_id,
+                    temperature=_number_value(sample.get("temperature")),
+                    humidity=_number_value(sample.get("humidity")),
+                    temperature_status=str(result.get("temperature_status") or ""),
+                    humidity_status=str(result.get("humidity_status") or ""),
+                )
             return
         if action_type == "START_RECOVERY":
-            recovery_at = _parse_datetime(context.get("created_at") or context.get("sample_time"))
-            if recovery_at is None:
+            # This only starts the one-minute confirmation window.  Physical
+            # recovery is recorded after VERIFY_RECOVERY succeeds.
+            return
+        if action_type == "MARK_ALARM_RECOVERED":
+            recovered_at = _parse_datetime(
+                context.get("created_at") or context.get("sample_time")
+            )
+            if recovered_at is None:
                 raise FeishuWriteError("恢复环境异常缺少恢复时间")
-            self.recover_active_event(device_id=device_id, recovered_at=recovery_at)
+            started_at = _parse_datetime(
+                transition.get("violation_started_at")
+                or transition.get("alarm_started_at")
+            )
+            record_id = self._resolve_record_id(local_event_id, device_id, started_at)
+            if record_id is None:
+                raise FeishuWriteError("无法关联本次报警对应的飞书异常记录")
+            self.recover_event(
+                record_id=record_id,
+                recovered_at=recovered_at,
+                temperature=_number_value(sample.get("temperature")),
+                humidity=_number_value(sample.get("humidity")),
+            )
             return
-        if action_type == "CLOSE_ALARM_EVENT":
-            # The Python state machine closes its local projection after the
-            # one-minute recovery check; Feishu still requires human closure.
+
+    @staticmethod
+    def _local_event_id(action: Any, transition: Mapping[str, Any]) -> str | None:
+        value = getattr(action, "alarm_id", None) or transition.get("active_alarm_id")
+        return str(value).strip() if value else None
+
+    def _resolve_record_id(
+        self,
+        local_event_id: str | None,
+        device_id: str,
+        started_at: datetime | None,
+    ) -> str | None:
+        if local_event_id is not None and self.event_repository is not None:
+            event = self.event_repository.get(local_event_id)
+            if event is not None:
+                record_id = event.payload.get("feishu_record_id")
+                if isinstance(record_id, str) and record_id.strip():
+                    return record_id.strip()
+        if started_at is None:
+            return None
+        record = self._find_event_by_business_key(_device_id(device_id), started_at)
+        if record is not None:
+            self._bind_external_record(local_event_id, {"record_id": record.record_id})
+            return record.record_id
+        return None
+
+    def _bind_external_record(
+        self,
+        local_event_id: str | None,
+        response: Mapping[str, Any],
+    ) -> None:
+        if local_event_id is None or self.event_repository is None:
             return
+        record_id = response.get("record_id")
+        if isinstance(record_id, str) and record_id.strip():
+            self.event_repository.bind_external_record(
+                local_event_id,
+                record_id=record_id.strip(),
+            )
 
     def _active_events(self, device_id: str) -> tuple[FeishuRawRecord, ...]:
         normalized_device = _device_id(device_id)

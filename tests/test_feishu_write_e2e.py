@@ -216,7 +216,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
                 AlarmActionType.CREATE_ALARM_EVENT: event_writer.handle_alarm_action,
                 AlarmActionType.UPDATE_ALARM_EVENT: event_writer.handle_alarm_action,
                 AlarmActionType.START_RECOVERY: event_writer.handle_alarm_action,
-                AlarmActionType.CLOSE_ALARM_EVENT: event_writer.handle_alarm_action,
+                AlarmActionType.MARK_ALARM_RECOVERED: event_writer.handle_alarm_action,
             },
         )
         service = MonitorApplicationService(
@@ -258,11 +258,13 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         sample(base_time + timedelta(minutes=6), 37)
         self.assertEqual(store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 37.0)
         sample(base_time + timedelta(minutes=7), 25)
+        self.assertNotIn("恢复时间", store.read_records("tbl-event")[0].fields)
+        recovered = sample(base_time + timedelta(minutes=8), 25)
+        self.assertEqual(recovered.transition.next.state.value, "NORMAL")
         self.assertEqual(
             store.read_records("tbl-event")[0].fields["恢复时间"],
-            int((base_time + timedelta(minutes=7)).timestamp() * 1000),
+            int((base_time + timedelta(minutes=8)).timestamp() * 1000),
         )
-        sample(base_time + timedelta(minutes=8), 25)
         self.assertEqual(local_event_repository.list_active(device_id="TH-03"), ())
         self.assertNotIn("关闭时间", store.read_records("tbl-event")[0].fields)
 
@@ -377,7 +379,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
                         AlarmActionType.CREATE_ALARM_EVENT: event_writer.handle_alarm_action,
                         AlarmActionType.UPDATE_ALARM_EVENT: event_writer.handle_alarm_action,
                         AlarmActionType.START_RECOVERY: event_writer.handle_alarm_action,
-                        AlarmActionType.CLOSE_ALARM_EVENT: event_writer.handle_alarm_action,
+                        AlarmActionType.MARK_ALARM_RECOVERED: event_writer.handle_alarm_action,
                     },
                 ),
                 task_repository=SQLiteAutomationTaskRepository(operation_connection),

@@ -103,7 +103,7 @@ class ApplicationActionMapper:
                     AlarmActionType.CREATE_ALARM_EVENT,
                     AlarmActionType.UPDATE_ALARM_EVENT,
                     AlarmActionType.START_RECOVERY,
-                    AlarmActionType.CLOSE_ALARM_EVENT,
+                    AlarmActionType.MARK_ALARM_RECOVERED,
                 }
                 else ApplicationActionKind.INTEGRATION
             )

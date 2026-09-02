@@ -155,7 +155,7 @@ class AlarmStateMachine:
         if self.recovery_after == timedelta(0):
             next_state = AlarmState.normal(state.device_id)
             action = AlarmAction(
-                action_type=AlarmActionType.CLOSE_ALARM_EVENT,
+                action_type=AlarmActionType.MARK_ALARM_RECOVERED,
                 device_id=state.device_id,
                 alarm_id=state.active_alarm_id,
             )
@@ -221,7 +221,7 @@ class AlarmStateMachine:
 
         next_state = AlarmState.normal(state.device_id)
         action = AlarmAction(
-            action_type=AlarmActionType.CLOSE_ALARM_EVENT,
+            action_type=AlarmActionType.MARK_ALARM_RECOVERED,
             device_id=state.device_id,
             alarm_id=state.active_alarm_id,
         )

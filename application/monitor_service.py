@@ -95,8 +95,8 @@ class LocalEnvironmentEventRepository(Protocol):
     ) -> Any:
         """Create an application-owned projected event."""
 
-    def close(self, event_id: str, *, closed_at: datetime) -> Any:
-        """Close an application-owned projected event."""
+    def mark_recovered(self, event_id: str, *, recovered_at: datetime) -> Any:
+        """Finish the monitoring cycle without claiming business closure."""
 
 
 @dataclass(frozen=True)
@@ -542,10 +542,10 @@ class MonitorApplicationService:
                 )
                 next_state = replace(next_state, active_alarm_id=event.event_id)
 
-            if action.action_type.value == "CLOSE_ALARM_EVENT":
+            if action.action_type.value == "MARK_ALARM_RECOVERED":
                 event_id = action.alarm_id or transition.previous.active_alarm_id
                 if event_id is not None and self.event_repository is not None:
-                    self.event_repository.close(event_id, closed_at=created_at)
+                    self.event_repository.mark_recovered(event_id, recovered_at=created_at)
 
         return replace(transition, next=next_state)
 
@@ -625,19 +625,24 @@ def _monitor_result_dict(result: MonitorResult) -> dict[str, Any]:
 
 
 def _transition_dict(transition: StateTransition) -> dict[str, Any]:
+    violation_started_at = (
+        transition.next.violation_started_at or transition.previous.violation_started_at
+    )
+    alarm_started_at = transition.next.alarm_started_at or transition.previous.alarm_started_at
+    active_alarm_id = transition.next.active_alarm_id or transition.previous.active_alarm_id
     return {
         "from": _enum_value(transition.previous.state),
         "to": _enum_value(transition.next.state),
         "reason": transition.reason,
         "actions": [action.action_type.value for action in transition.actions],
         "violation_started_at": (
-            transition.next.violation_started_at.isoformat()
-            if transition.next.violation_started_at
+            violation_started_at.isoformat()
+            if violation_started_at
             else None
         ),
         "alarm_started_at": (
-            transition.next.alarm_started_at.isoformat()
-            if transition.next.alarm_started_at
+            alarm_started_at.isoformat()
+            if alarm_started_at
             else None
         ),
         "recovery_started_at": (
@@ -645,7 +650,7 @@ def _transition_dict(transition: StateTransition) -> dict[str, Any]:
             if transition.next.recovery_started_at
             else None
         ),
-        "active_alarm_id": transition.next.active_alarm_id,
+        "active_alarm_id": active_alarm_id,
     }
 
 

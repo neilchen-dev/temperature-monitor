@@ -462,13 +462,22 @@ class ObservationEdgeCaseTests(unittest.TestCase):
         )
         return adapter
 
-    def _event(self, record_id: str, status: str, recovery_time) -> FeishuRawRecord:
+    def _event(
+        self,
+        record_id: str,
+        status: str,
+        recovery_time,
+        *,
+        start_time=1_756_699_000_000,
+    ) -> FeishuRawRecord:
         return FeishuRawRecord(
             record_id=record_id,
             fields={
                 "监测点": "TH-01",
                 "处理状态": status,
                 "恢复时间": recovery_time,
+                "开始时间": start_time,
+                "闭环状态": "已闭环" if status == "关闭" else "未关闭",
             },
             created_at=datetime(2026, 9, 1, 11, 0, tzinfo=TZ),
             updated_at=datetime(2026, 9, 1, 11, 0, tzinfo=TZ),
@@ -526,6 +535,17 @@ class ObservationEdgeCaseTests(unittest.TestCase):
         observed = adapter.observe("TH-01")
         self.assertEqual(observed.active_event_count, 3)
         self.assertEqual(observed.pending_closure_count, 0)
+
+    def test_distinct_unclosed_alarm_cycles_are_not_counted_as_duplicates(self) -> None:
+        adapter = self._build(
+            self._device_fields(),
+            [
+                self._event("e1", "处理中", None, start_time=1_756_699_000_000),
+                self._event("e2", "处理中", None, start_time=1_756_700_000_000),
+            ],
+        )
+        observed = adapter.observe("TH-01")
+        self.assertEqual(observed.active_event_count, 1)
 
     def test_missing_formula_fields_do_not_raise(self) -> None:
         """公式字段缺失（表结构变化/权限）不得让 observe 抛异常。"""

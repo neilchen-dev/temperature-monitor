@@ -47,6 +47,8 @@ class FeishuObservationTableFieldMap:
     closed_statuses: tuple[str, ...] = ("关闭", "已关闭", "CLOSED")
     # 已写恢复时间的打开事件 = 已物理恢复、等待人工闭环，不是当前活动报警。
     event_recovery_time: str = "恢复时间"
+    event_start_time: str = "开始时间"
+    business_closure_status: str = "闭环状态"
 
 
 class FeishuBitableObservationSource:
@@ -87,7 +89,10 @@ class FeishuBitableObservationSource:
             for record in self.source.read_records(self.event_table_id)
             if _field_text(record.fields, self.fields.event_device_id).upper()
             == normalized_device
-            and not self._is_closed(record.fields.get(self.fields.event_status))
+            and not business_closed(
+                record.fields,
+                field_name=self.fields.business_closure_status,
+            )
         )
         active_events = tuple(
             record
@@ -101,8 +106,9 @@ class FeishuBitableObservationSource:
         )
         raw = dict(device_record.fields)
         raw["__event_exists"] = bool(open_events)
-        raw["__active_event_count"] = len(active_events)
-        raw["__active_event_ids"] = [record.record_id for record in active_events]
+        active_cycle = self._latest_alarm_cycle(active_events)
+        raw["__active_event_count"] = len(active_cycle)
+        raw["__active_event_ids"] = [record.record_id for record in active_cycle]
         raw["__pending_closure_count"] = len(pending_closure_events)
         raw["__observed_at"] = _record_time(device_record.updated_at) or _record_time(
             device_record.created_at
@@ -117,6 +123,39 @@ class FeishuBitableObservationSource:
 
     def _has_recovery_time(self, fields: Mapping[str, Any]) -> bool:
         return _field_text(fields.get(self.fields.event_recovery_time)) != ""
+
+    def _latest_alarm_cycle(
+        self,
+        records: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        """Return records for one alarm cycle, grouped by exact start time.
+
+        Multiple unresolved historical cycles for a device are legitimate.
+        Only multiple records sharing one cycle key represent duplication.
+        """
+        groups: dict[str, list[Any]] = {}
+        order: list[str] = []
+        for record in records:
+            start = _field_text(record.fields.get(self.fields.event_start_time))
+            key = f"start:{start}" if start else f"record:{record.record_id}"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(record)
+        if not order:
+            return ()
+        started = [key for key in order if key.startswith("start:")]
+        selected = max(started) if started else order[-1]
+        return tuple(groups[selected])
+
+
+def business_closed(
+    fields: Mapping[str, Any],
+    *,
+    field_name: str = "闭环状态",
+) -> bool:
+    """Read the Feishu formula field that alone decides business closure."""
+    return _field_text(fields.get(field_name)) == "已闭环"
 
 
 class FeishuObservationAdapter:

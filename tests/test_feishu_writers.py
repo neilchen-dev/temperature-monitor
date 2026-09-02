@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from domain.models import (
+    AlarmAction,
+    AlarmActionType,
     DataQualityStatus,
     MonitorResult,
     MonitorSample,
@@ -15,11 +18,12 @@ from domain.models import (
 from domain.operation import OperationAction, OperationObservation
 from integrations.feishu_records import FeishuRawRecord
 from integrations.feishu_writers import (
+    FeishuEventWriteFieldMap,
     FeishuEnvironmentEventWriter,
     FeishuInspectionRecordWriter,
     FeishuOperationRecordWriter,
-    FeishuWriteError,
 )
+from repositories.environment_events import SQLiteEnvironmentEventRepository
 from services.feishu import normalize_client_token
 
 
@@ -263,22 +267,162 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             recording.created[1][1]["开始时间"],
         )
 
-    def test_duplicate_active_event_is_rejected(self) -> None:
+    def test_recovered_unclosed_event_does_not_block_new_alarm_cycle(self) -> None:
         recording = _RecordingWriter()
-        active = FeishuRawRecord(
-            record_id="rec-active",
-            fields={"监测点": "TH-03", "处理状态": "处理中"},
+        historical = FeishuRawRecord(
+            record_id="rec-historical",
+            fields={
+                "监测点": "TH-03",
+                "处理状态": "处理中",
+                "恢复时间": 1_756_700_000_000,
+                "闭环状态": "未关闭",
+            },
         )
-        writer = self._writer(recording, (active,))
+        writer = self._writer(recording, (historical,))
 
-        with self.assertRaises(FeishuWriteError):
-            writer.create_event(
+        writer.create_event(
+            device_id="TH-03",
+            area="精密装配间",
+            start_time=_sample().sample_time,
+            temperature=46,
+        )
+        self.assertEqual(len(recording.created), 1)
+
+    def test_mark_recovered_updates_exact_cycle_without_manual_fields(self) -> None:
+        recording = _RecordingWriter()
+        event = FeishuRawRecord(
+            record_id="rec-current",
+            fields={
+                "监测点": "TH-03",
+                "开始时间": int(_sample().sample_time.timestamp() * 1000),
+                "闭环状态": "未关闭",
+            },
+        )
+        writer = self._writer(recording, (event,))
+        action = AlarmAction(
+            action_type=AlarmActionType.MARK_ALARM_RECOVERED,
+            device_id="TH-03",
+        )
+        recovered_at = _sample().sample_time.replace(minute=1)
+
+        writer.handle_alarm_action(
+            action,
+            {
+                "created_at": recovered_at.isoformat(),
+                "sample": {"temperature": 25.5, "humidity": 55.0},
+                "python_alarm_transition": {
+                    "violation_started_at": _sample().sample_time.isoformat(),
+                },
+            },
+        )
+
+        table_id, record_id, fields = recording.updated[-1]
+        self.assertEqual((table_id, record_id), ("tbl-events", "rec-current"))
+        self.assertEqual(fields, {"恢复时间": int(recovered_at.timestamp() * 1000)})
+        for forbidden in ("闭环状态", "异常原因", "处理措施", "产品影响", "关闭时间"):
+            self.assertNotIn(forbidden, fields)
+
+    def test_optional_recovery_measurement_fields_are_written_when_configured(self) -> None:
+        recording = _RecordingWriter()
+        writer = FeishuEnvironmentEventWriter(
+            writer=recording,
+            source=_RecordSource({}),
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            fields=FeishuEventWriteFieldMap(
+                recovery_temperature="恢复温度(°C)",
+                recovery_humidity="恢复湿度(%RH)",
+            ),
+        )
+        writer.recover_event(
+            record_id="rec-current",
+            recovered_at=_sample().sample_time,
+            temperature=25.5,
+            humidity=55.0,
+        )
+        fields = recording.updated[-1][2]
+        self.assertEqual(fields["恢复温度(°C)"], 25.5)
+        self.assertEqual(fields["恢复湿度(%RH)"], 55.0)
+
+    def test_update_targets_current_cycle_not_recovered_unclosed_history(self) -> None:
+        recording = _RecordingWriter()
+        old_start = _sample().sample_time.replace(hour=9)
+        current_start = _sample().sample_time
+        events = (
+            FeishuRawRecord(
+                record_id="rec-A",
+                fields={
+                    "监测点": "TH-03",
+                    "开始时间": int(old_start.timestamp() * 1000),
+                    "恢复时间": int(old_start.replace(minute=30).timestamp() * 1000),
+                    "闭环状态": "未关闭",
+                },
+            ),
+            FeishuRawRecord(
+                record_id="rec-B",
+                fields={
+                    "监测点": "TH-03",
+                    "开始时间": int(current_start.timestamp() * 1000),
+                    "闭环状态": "未关闭",
+                },
+            ),
+        )
+        writer = self._writer(recording, events)
+        action = AlarmAction(
+            action_type=AlarmActionType.UPDATE_ALARM_EVENT,
+            device_id="TH-03",
+        )
+        writer.handle_alarm_action(
+            action,
+            {
+                "sample": {"temperature": 47.0, "humidity": 56.0},
+                "python_monitor_result": {
+                    "temperature_status": "HIGH",
+                    "humidity_status": "NORMAL",
+                },
+                "python_alarm_transition": {
+                    "violation_started_at": current_start.isoformat(),
+                },
+                "operation_state": {"area_id": "精密装配间"},
+            },
+        )
+        self.assertEqual(recording.updated[-1][1], "rec-B")
+
+    def test_restart_uses_persisted_local_to_feishu_record_binding(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        local = repository.create_or_get_active(
+            device_id="TH-03",
+            event_key="ENV:TH-03:round-B",
+            opened_at=_sample().sample_time,
+        )
+        repository.bind_external_record(local.event_id, record_id="rec-B")
+
+        recording = _RecordingWriter()
+        restarted_repository = SQLiteEnvironmentEventRepository(connection)
+        writer = FeishuEnvironmentEventWriter(
+            writer=recording,
+            source=_RecordSource({}),
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            event_repository=restarted_repository,
+        )
+        writer.handle_alarm_action(
+            AlarmAction(
+                action_type=AlarmActionType.UPDATE_ALARM_EVENT,
                 device_id="TH-03",
-                area="精密装配间",
-                start_time=_sample().sample_time,
-                temperature=46,
-            )
-        self.assertEqual(recording.created, [])
+                alarm_id=local.event_id,
+            ),
+            {
+                "sample": {"temperature": 47.0},
+                "python_monitor_result": {"temperature_status": "HIGH"},
+                "python_alarm_transition": {},
+                "operation_state": {"area_id": "精密装配间"},
+            },
+        )
+
+        self.assertEqual(recording.updated[-1][1], "rec-B")
 
     def test_close_requires_manual_closure_fields(self) -> None:
         recording = _RecordingWriter()

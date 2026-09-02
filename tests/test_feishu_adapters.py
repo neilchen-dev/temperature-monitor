@@ -18,6 +18,7 @@ from integrations.feishu_observation import (
     FeishuBitableObservationSource,
     FeishuObservationAdapter,
     FeishuObservationFieldMap,
+    business_closed,
 )
 from integrations.feishu_standard import (
     FeishuStandardAdapter,
@@ -374,7 +375,7 @@ class FeishuObservationAdapterTests(unittest.TestCase):
         self.assertEqual(observed.active_event_count, 1)
         self.assertEqual(observed.pending_closure_count, 0)
 
-    def test_current_event_status_field_excludes_closed_events(self) -> None:
+    def test_business_closure_formula_excludes_closed_events(self) -> None:
         timestamp = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 
         class _ObservationSource:
@@ -396,11 +397,19 @@ class FeishuObservationAdapterTests(unittest.TestCase):
                 return (
                     FeishuRawRecord(
                         record_id="closed-event",
-                        fields={"监测点": "TH-10", "处理状态": "关闭"},
+                        fields={
+                            "监测点": "TH-10",
+                            "处理状态": "关闭",
+                            "闭环状态": "已闭环",
+                        },
                     ),
                     FeishuRawRecord(
                         record_id="open-event",
-                        fields={"监测点": "TH-10", "处理状态": "待处理"},
+                        fields={
+                            "监测点": "TH-10",
+                            "处理状态": "待处理",
+                            "闭环状态": "未关闭",
+                        },
                     ),
                 )
 
@@ -422,6 +431,19 @@ class FeishuObservationAdapterTests(unittest.TestCase):
 
         self.assertTrue(observed.event_exists)
         self.assertEqual(observed.active_event_count, 1)
+
+    def test_business_closed_uses_formula_only(self) -> None:
+        self.assertFalse(business_closed({"闭环状态": "未关闭"}))
+        self.assertTrue(business_closed({"闭环状态": "已闭环"}))
+        self.assertFalse(
+            business_closed(
+                {
+                    "闭环状态": "未关闭",
+                    "处理状态": "关闭",
+                    "恢复时间": 1_756_700_000_000,
+                }
+            )
+        )
 
     def test_no_standard_observation_maps_to_unknown_overall(self) -> None:
         class _Source:

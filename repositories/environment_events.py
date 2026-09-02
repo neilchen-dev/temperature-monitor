@@ -1,4 +1,4 @@
-"""Concurrency-safe local store for active environmental events."""
+"""Concurrency-safe local store for environmental monitoring cycles."""
 
 from __future__ import annotations
 
@@ -158,6 +158,52 @@ class SQLiteEnvironmentEventRepository:
                 if record is None:
                     raise KeyError(f"unknown environment event: {event_id}")
                 return record
+            return self._require(event_id)
+
+    def mark_recovered(
+        self,
+        event_id: str,
+        *,
+        recovered_at: datetime,
+    ) -> EnvironmentEventRecord:
+        """Release the active-cycle constraint after physical recovery.
+
+        ``CLOSED`` is the legacy SQLite value for a completed *monitoring
+        cycle*.  It says nothing about the Feishu event's business closure.
+        """
+        return self.close(event_id, closed_at=recovered_at)
+
+    def bind_external_record(
+        self,
+        event_id: str,
+        *,
+        record_id: str,
+    ) -> EnvironmentEventRecord:
+        """Persist the exact Feishu record created for this monitoring cycle."""
+        if not record_id.strip():
+            raise ValueError("record_id cannot be empty")
+        with self._lock:
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            existing = payload.get("feishu_record_id")
+            if existing is not None and existing != record_id:
+                raise ValueError(
+                    f"environment event {event_id} is already bound to {existing}"
+                )
+            payload["feishu_record_id"] = record_id
+            self.connection.execute(
+                "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    event_id,
+                ),
+            )
+            self.connection.commit()
             return self._require(event_id)
 
     def get(self, event_id: str) -> EnvironmentEventRecord | None:
