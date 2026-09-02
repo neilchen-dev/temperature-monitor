@@ -227,7 +227,7 @@ class ProjectionRuntimeE2ETests(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["entity_id"], "TH-10")
 
-        # --- 3. 飞书恢复：重试成功 → 先投影后派发 ---
+        # --- 3. 飞书恢复：重试成功 → 只 mark projected（单一 dispatch owner）---
         with (
             patch("services.projection.resolve_record_id", return_value="dev-10"),
             patch(
@@ -238,6 +238,9 @@ class ProjectionRuntimeE2ETests(unittest.TestCase):
             report = runtime.scheduler.run_once(now=self._clock(62))
         self.assertGreaterEqual(report.succeeded, 1)
         retry_update.assert_called_once()
+        # retry handler 不直接派发（AB-BA 修复）；同一 tick 的 maintenance
+        # 钩子（_ensure_projection_tasks → recover_pending_dispatches）补派发。
+        runtime._ensure_projection_tasks(now=self._clock(62.5))
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self.dispatched[0].device_id, "TH-10")
         # SHADOW_COMPARE 任务恰好一个（同 sample 只比对一次）

@@ -354,6 +354,8 @@ class CrashConsistencyTests(unittest.TestCase):
             report = runtime.scheduler.run_once(now=self._clock(62))
 
         self.assertGreaterEqual(report.succeeded, 1)
+        # retry handler 只 mark projected；派发由同一 tick 的 recovery 钩子补
+        runtime._ensure_projection_tasks(now=self._clock(62.5))
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(len(self._task_rows("SHADOW_COMPARE")), 1)
         self.assertEqual(
@@ -373,7 +375,8 @@ class CrashConsistencyTests(unittest.TestCase):
         base = datetime.now().astimezone()
         self.now = base
 
-        # TH-10 先成功一次：产生一个待执行的 SHADOW_COMPARE 任务
+        # TH-10 先成功一次：HTTP 投影成功（不直接派发），由 recovery
+        # 派发后产生一个待执行的 SHADOW_COMPARE 任务
         with (
             patch("routes.temperature.resolve_record_id", return_value="dev-10"),
             patch("routes.temperature.update_feishu_fields", return_value={"code": 0}),
@@ -384,6 +387,7 @@ class CrashConsistencyTests(unittest.TestCase):
                 json={"device": "TH-10", "temperature": 24.0, "humidity": 50.0},
             )
         self.assertEqual(ok.status_code, 200)
+        runtime._ensure_projection_tasks(now=base + timedelta(seconds=1))
         self.assertEqual(len(self._task_rows("SHADOW_COMPARE")), 1)
 
         # 11 台设备（含 TH-10 的第二个样本）同时进入 projection failure

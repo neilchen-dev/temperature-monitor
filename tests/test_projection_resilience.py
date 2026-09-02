@@ -206,6 +206,9 @@ class ProjectionResilienceTests(unittest.TestCase):
         ):
             self._post()
 
+        # HTTP 线程不派发（单一 dispatch owner = scheduler recovery）。
+        self.assertEqual(self.dispatched, [])
+        projection.recover_pending_dispatches(now=self._future_now())
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self.dispatched[0].device_id, "TH-05")
         self.assertEqual(self.dispatched[0].temperature, 24.6)
@@ -240,11 +243,14 @@ class ProjectionResilienceTests(unittest.TestCase):
 
         self.assertEqual(first["result"], "projected")
         self.assertEqual(second["result"], "skipped")
+        # retry handler 只 mark projected；派发由 recovery 统一完成。
+        self.assertEqual(self.dispatched, [])
+        projection.recover_pending_dispatches(now=self._future_now())
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self._state()["projection_status"], "ok")
 
     def test_dispatch_happens_after_feishu_write(self) -> None:
-        """顺序不变量：先飞书投影，后 Runtime/Shadow 派发。"""
+        """顺序不变量：先飞书投影（HTTP），后 Runtime/Shadow 派发（recovery）。"""
         events: list[str] = []
 
         def _update(*_args, **_kwargs):
@@ -263,6 +269,9 @@ class ProjectionResilienceTests(unittest.TestCase):
         ):
             self._post()
 
+        # HTTP 路径只做投影；派发发生在投影成功之后（scheduler recovery）。
+        self.assertEqual(events, ["feishu"])
+        projection.recover_pending_dispatches(now=self._future_now())
         self.assertEqual(events, ["feishu", "dispatch"])
 
     # ------------------------------------------------------------------
@@ -283,9 +292,12 @@ class ProjectionResilienceTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.get_json()["status"], "success")
         self.assertEqual(len(self._samples()), 1)
-        self.assertEqual(len(self.dispatched), 1)
+        # 重复请求被投影水位短路：飞书只调一次。
         resolve.assert_called_once()
         update.assert_called_once()
+        # 派发由 scheduler recovery 统一完成：恰好一次。
+        projection.recover_pending_dispatches(now=self._future_now())
+        self.assertEqual(len(self.dispatched), 1)
 
     def test_projection_retry_no_duplicate_feishu_write(self) -> None:
         """相同 projection retry：飞书副作用不重复。"""
@@ -344,6 +356,9 @@ class ProjectionResilienceTests(unittest.TestCase):
             self.assertEqual(second.claimed, 0)
 
         retry_update.assert_called_once()
+        # retry handler 只 mark projected；派发由 recovery 统一补齐一次。
+        self.assertEqual(self.dispatched, [])
+        projection.recover_pending_dispatches(now=self._future_now(640))
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(len(self._samples()), 1)
         self.assertEqual(self._state()["projection_status"], "ok")
@@ -464,8 +479,11 @@ class ProjectionResilienceTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.get_json()["status"], "success")
         self.assertEqual(len(self._samples()), 1)
-        self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self._state()["projection_status"], "ok")
+        # HTTP 成功不直接派发；recovery 补派发恰好一次。
+        self.assertEqual(self.dispatched, [])
+        projection.recover_pending_dispatches(now=self._future_now())
+        self.assertEqual(len(self.dispatched), 1)
 
     def test_retry_exhaustion_marks_failed_and_stops(self) -> None:
         """连续失败：重试有上限，终态 failed 可被发现，不再生成新任务。"""
@@ -515,7 +533,8 @@ class ProjectionResilienceTests(unittest.TestCase):
         self.assertEqual(summary["by_status"]["failed"], 1)
         self.assertEqual(summary["failed_devices"][0]["device"], "TH-05")
 
-        # 恢复：飞书恢复后的下一次内联投影成功 → 状态复位、Shadow 恢复
+        # 恢复：飞书恢复后的下一次内联投影成功 → 状态复位；
+        # 派发由 recovery 补齐 → Shadow 恢复
         with (
             patch("routes.temperature.resolve_record_id", return_value="rec_01"),
             patch("routes.temperature.update_feishu_fields", return_value={"code": 0}),
@@ -524,6 +543,8 @@ class ProjectionResilienceTests(unittest.TestCase):
             recovery = self._post(temperature=26.0)
         self.assertEqual(recovery.status_code, 200)
         self.assertEqual(self._state()["projection_status"], "ok")
+        self.assertEqual(self.dispatched, [])
+        projection.recover_pending_dispatches(now=self._future_now())
         self.assertEqual(len(self.dispatched), 1)
 
     def test_scanner_creates_single_task_per_device(self) -> None:
@@ -568,7 +589,9 @@ class ProjectionResilienceTests(unittest.TestCase):
         fields = retry_update.call_args.args[1]
         self.assertEqual(fields["当前温度"], 25.5)
         self.assertEqual(fields["当前湿度"], 60.0)
-        # 只派发最新样本一次
+        # retry 只投影不派发；recovery 只派发最新样本一次
+        self.assertEqual(self.dispatched, [])
+        projection.recover_pending_dispatches(now=self._future_now())
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self.dispatched[0].temperature, 25.5)
 

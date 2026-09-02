@@ -41,14 +41,17 @@ def temperature():
     Feishu call, so an external Feishu outage can never lose the raw
     sample (production invariant; see docs/ for the TH-05 incident).
 
-    Phase B — Feishu realtime projection + Runtime/Shadow dispatch: the
-    projection is attempted inline (legacy realtime behaviour). On
-    success the sample is dispatched to the Shadow pipeline, preserving
-    the ordering "Feishu updated before SHADOW_COMPARE observes it". On
-    failure the sample stays local, the failure is recorded durably
-    (sample_projection_state + temperature_reports evidence), a bounded
-    retry task is scheduled, dispatch is deferred (no guaranteed-wrong
-    compares), and the request returns 200 accepted/deferred.
+    Phase B — Feishu realtime projection (HTTP) + Runtime/Shadow dispatch
+    (scheduler-owned): the projection is attempted inline (legacy
+    realtime behaviour). On success the projected watermark advances and
+    the request returns; the **dispatch to the Shadow pipeline is owned
+    by the scheduler** (``recover_pending_dispatches``, every tick) —
+    HTTP threads never dispatch, which removed the production AB-BA
+    deadlock (2026-09-02). On failure the sample stays local, the failure
+    is recorded durably (sample_projection_state + temperature_reports
+    evidence), a bounded retry task is scheduled, dispatch is deferred
+    (no guaranteed-wrong compares), and the request returns 200
+    accepted/deferred.
     """
     auth_error = _temperature_auth_error()
     if auth_error:
@@ -116,12 +119,14 @@ def temperature():
             outcome.duplicate,
         )
 
-    # 重复上报且上一份已经投影+派发完成：直接重放成功语义，不再触碰飞书
+    # 重复上报且上一份已经投影成功：直接重放成功语义，不再触碰飞书
     # （HA/客户端重试不会产生重复副作用）。请求级审计日志照常记录。
+    # 判定用投影水位而非派发水位：派发已统一延迟到 scheduler
+    # recovery（见下），重复请求不应因派发未发生而重放飞书写。
     if (
         outcome.duplicate
         and sample is not None
-        and projection.is_sample_dispatched(bitable_device, int(outcome.sample_time_ms))
+        and projection.is_sample_projected(bitable_device, int(outcome.sample_time_ms))
     ):
         logger.info(
             "duplicate_request_accepted | device=%s | sample_time_ms=%s",
@@ -177,20 +182,24 @@ def temperature():
     success = attempted and projection_error is None and feishu_code == 0
 
     if success:
-        # 投影成功：与旧版一致的顺序 —— 先历史镜像，再派发 Runtime/Shadow
-        # （保证 SHADOW_COMPARE 观察到的飞书已是最新投影）。
-        # mark_projection_success 先落投影水位再清状态：崩溃在水位之后、
-        # 派发之前时，恢复扫描（recover_pending_dispatches）能发现
-        # projected > dispatched 并补派发。
+        # 投影成功：mark 投影水位 + 历史镜像，HTTP 到此为止 —— **不派发**。
+        #
+        # Dispatch ownership（2026-09-02 生产死锁修复）：HA projection →
+        # Runtime dispatch 的唯一 owner 是 shadow-scheduler 线程，通过每
+        # tick 的 recover_pending_dispatches 发现 projected > dispatched
+        # 并补派发（延迟 ≤ 一个 poll interval）。此前 HTTP 线程在成功路径
+        # 直接 dispatch，形成 _dispatch_lock → _execution_lock 与 scheduler
+        # 反向获取的经典 AB-BA 死锁：scheduler 停转、SYNC_OPERATIONS 永久
+        # PENDING，而 Waitress 线程仍持续投影。副作用不变量不变：sample
+        # 不丢（阶段A持久化）、SHADOW_COMPARE 恰好一次（device+sample_time
+        # 去重）、飞书失败时 defer 不派发。
+        # mark_projection_success 先落投影水位再清状态：崩溃在水位之后
+        # 时，恢复扫描同样能发现并补派发。
         projection.mark_projection_success(
             bitable_device,
             int(outcome.sample_time_ms) if outcome.sample_time_ms is not None else None,
         )
         save_history(bitable_device, temperature_c, humidity, final_status, 0, feishu_message)
-        if sample is not None:
-            projection.dispatch_projected_sample(
-                bitable_device, sample, outcome.sample_time_ms
-            )
         logger.info(
             "%s | 飞书更新成功 | status=%s | temperature=%s | humidity=%s",
             device,

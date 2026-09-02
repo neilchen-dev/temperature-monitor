@@ -222,6 +222,13 @@ class ShadowRuntime:
             # listener.  This keeps all repositories on the runtime's single
             # SQLite connection transaction-safe while preserving the
             # domain-agnostic TaskScheduler implementation.
+            #
+            # Lock-order invariant (2026-09-02 AB-BA deadlock fix): this
+            # thread is the ONLY code path that dispatches HA projections
+            # into the Runtime (via _ensure_projection_tasks ->
+            # recover_pending_dispatches). HTTP threads never dispatch, so
+            # _execution_lock is the only runtime lock in the system and can
+            # never be acquired in opposite orders by two threads.
             while not stop_event.is_set():
                 with self._execution_lock:
                     self._maybe_purge()
@@ -472,9 +479,12 @@ class ShadowRuntime:
         """Retry a deferred Feishu projection for one device.
 
         Business logic lives in ``services.projection``: project the latest
-        persisted sample, then dispatch it to the Shadow pipeline exactly
-        once. Raises on failure so the task is recorded FAILED (visible
-        evidence) while the pending state drives the next backoff retry.
+        persisted sample and advance the projected watermark. The dispatch
+        belongs to the same tick's ``recover_pending_dispatches`` hook
+        (single dispatch owner — see the 2026-09-02 deadlock fix notes in
+        ``services/projection.py``). Raises on failure so the task is
+        recorded FAILED (visible evidence) while the pending state drives
+        the next backoff retry.
         """
         from services import projection
 
@@ -649,10 +659,14 @@ class ShadowRuntime:
         )
 
     def _ensure_projection_tasks(self, *, now: datetime) -> None:
-        """Per-tick projection maintenance: crash recovery + retry scheduling.
+        """Per-tick projection maintenance — the dispatch single owner.
 
-        1. ``recover_pending_dispatches`` finishes Shadow dispatches that a
-           crash left unfinished (projected > dispatched watermark).
+        1. ``recover_pending_dispatches`` dispatches every sample with
+           projected > dispatched: both the normal flow (HTTP projection
+           succeeded; dispatch is deferred to here by design) and crash
+           recovery. This scheduler thread is the ONLY dispatch owner for
+           HA projections → Runtime, which removed the 2026-09-02 AB-BA
+           deadlock (HTTP threads no longer touch any runtime lock).
         2. ``ensure_projection_tasks`` (re)creates durable, staggered
            FEISHU_PROJECTION retry tasks for pending devices.
 

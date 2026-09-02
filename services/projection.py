@@ -8,6 +8,25 @@ the existing ``automation_tasks`` scheduler, and the Runtime/Shadow
 dispatch is deferred until the projection actually succeeds (so a frozen
 Feishu table can never produce guaranteed-wrong SHADOW_COMPARE results).
 
+Dispatch ownership (SINGLE OWNER — 2026-09-02 production deadlock fix):
+
+The Shadow scheduler thread is the **only** caller of
+``dispatch_projected_sample`` (via ``recover_pending_dispatches`` on every
+tick). HTTP threads never dispatch: they only persist, project, and
+advance the projected watermark. Previously the /temperature success path
+dispatched inline, which acquired ``_dispatch_lock`` and then (through the
+sample listener) ``ShadowRuntime._execution_lock``, while the scheduler
+thread held ``_execution_lock`` and reached for ``_dispatch_lock`` inside
+``recover_pending_dispatches`` / the FEISHU_PROJECTION handler — a classic
+AB-BA deadlock (production: scheduler stalled, SYNC_OPERATIONS stuck
+PENDING while Waitress threads kept projecting).
+
+Lock-order invariant: HTTP paths acquire **no** runtime locks at all. The
+scheduler thread acquires ``_execution_lock`` (RLock, same-thread
+reentrant) and nothing else; ``_dispatch_lock`` was removed entirely, so
+no two locks can ever be acquired in opposite orders. Cost: dispatch may
+lag projection by at most one scheduler poll interval.
+
 State machine per device (``sample_projection_state``):
 
 - ``ok``      — latest local sample is projected; dispatch is up to date.
@@ -62,7 +81,6 @@ the caller falls back to legacy semantics.
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -81,10 +99,12 @@ PROJECTION_OK = "ok"
 PROJECTION_PENDING = "pending"
 PROJECTION_FAILED = "failed"
 
-# Serializes the "check last_dispatched -> notify -> update" sequence so two
-# concurrent duplicate HTTP requests cannot double-notify the Runtime. The
-# SHADOW_COMPARE dedupe key is the second line of defence.
-_dispatch_lock = threading.Lock()
+# Dispatch ownership contract (see module docstring): only the scheduler
+# thread calls dispatch_projected_sample, via recover_pending_dispatches.
+# There is deliberately NO process lock here — the old _dispatch_lock was
+# half of the 2026-09-02 AB-BA deadlock. Cross-thread/crash idempotency is
+# guaranteed by the durable watermark (last_dispatched_sample_time_ms) plus
+# at-least-once delivery with downstream dedupe, not by locking.
 
 # 同 tick 到期的 FEISHU_PROJECTION 任务按设备错峰的间隔（秒）。Scheduler
 # 串行执行：错峰 + 1s poll ⇒ 每 tick 至多 1-2 个有界投影尝试（各 ≤
@@ -374,12 +394,15 @@ def ensure_projection_tasks(task_repository: Any, now: datetime | None = None) -
 
 
 def recover_pending_dispatches(now: datetime | None = None) -> None:
-    """Finish Shadow dispatches that a crash left unfinished (recovery scan).
+    """Dispatch projected samples that are not dispatched yet (every tick).
 
-    Invariant: ``last_projected_sample_time_ms > last_dispatched_sample_time_ms``
-    ⇒ unfinished dispatch work — independent of ``projection_status`` (the
-    crash can happen after the status already flipped to ``ok``). Runs on
-    every scheduler tick and never raises.
+    This is the **single dispatch owner** for the HA projection → Runtime
+    pipeline: the scheduler thread runs it on every tick, both for the
+    normal flow (HTTP succeeded, projected watermark advanced) and for
+    crash recovery. Invariant: ``last_projected_sample_time_ms >
+    last_dispatched_sample_time_ms`` ⇒ unfinished dispatch work —
+    independent of ``projection_status`` (the crash can happen after the
+    status already flipped to ``ok``). Never raises.
 
     Delivery semantics are **at-least-once**, not exactly-once: a crash
     between the listener call and the watermark write can re-deliver the
@@ -447,6 +470,22 @@ def is_sample_dispatched(device: str, sample_time_ms: int) -> bool:
     return dispatched is not None and int(dispatched) >= int(sample_time_ms)
 
 
+def is_sample_projected(device: str, sample_time_ms: int) -> bool:
+    """True when this sample already succeeded on the Feishu projection.
+
+    Used by the /temperature duplicate-request short-circuit: with dispatch
+    deferred to the scheduler, a duplicate request whose sample is already
+    projected (same content, watermark covers it) can replay the success
+    semantics without touching Feishu again. Dispatch follows on the next
+    scheduler tick via ``recover_pending_dispatches``.
+    """
+    state = db.fetch_projection_state(device)
+    if state is None:
+        return False
+    projected = state.get("last_projected_sample_time_ms")
+    return projected is not None and int(projected) >= int(sample_time_ms)
+
+
 def dispatch_projected_sample(
     device: str,
     sample: MonitorSample,
@@ -454,10 +493,18 @@ def dispatch_projected_sample(
 ) -> bool:
     """Notify Runtime/Shadow listeners exactly once per business sample.
 
-    The guard is durable (``last_dispatched_sample_time_ms``), so duplicate
-    HTTP requests, scheduler retries, and restarts cannot re-dispatch a
-    sample that already entered the Shadow pipeline. Returns False when the
-    sample was already dispatched or superseded by a newer one.
+    Ownership contract: the **scheduler thread only** (via
+    ``recover_pending_dispatches``). HTTP threads must never call this —
+    an inline dispatch from a Waitress thread was one half of the
+    2026-09-02 AB-BA deadlock (HTTP held the dispatch lock waiting for
+    ``_execution_lock`` while the scheduler held ``_execution_lock``
+    waiting for the dispatch lock). There is no process lock in here by
+    design: with a single owner there is nothing to serialize, and the
+    durable watermark (``last_dispatched_sample_time_ms``) keeps the
+    check -> notify -> mark sequence idempotent across restarts.
+
+    Returns False when the sample was already dispatched or superseded by
+    a newer one.
     """
     if sample_time_ms is None:
         sample_time_ms = round(sample.sample_time.timestamp() * 1000)
@@ -469,42 +516,40 @@ def dispatch_projected_sample(
         devices.dispatch_sample(sample)
         return True
 
-    with _dispatch_lock:
-        state = db.fetch_projection_state(device)
-        dispatched_ms = (
-            int(state.get("last_dispatched_sample_time_ms"))
-            if state is not None and state.get("last_dispatched_sample_time_ms") is not None
-            else None
-        )
-        if dispatched_ms is not None and dispatched_ms >= sample_time_ms:
-            logger.info(
-                "sample_dispatch_skipped | device=%s | sample_time_ms=%s"
-                " | last_dispatched_sample_time_ms=%s | reason=already_dispatched",
-                device,
-                sample_time_ms,
-                dispatched_ms,
-            )
-            return False
-
-        devices.dispatch_sample(sample)
-        advanced = db.mark_projection_dispatched(device, sample_time_ms)
-        if not advanced:
-            # Lost a race inside the same process is impossible (we hold
-            # _dispatch_lock), but a previous crash between notify and mark
-            # could leave a higher watermark — keep it, log for forensics.
-            logger.warning(
-                "sample_dispatch_watermark_conflict | device=%s"
-                " | sample_time_ms=%s",
-                device,
-                sample_time_ms,
-            )
-            return False
+    state = db.fetch_projection_state(device)
+    dispatched_ms = (
+        int(state.get("last_dispatched_sample_time_ms"))
+        if state is not None and state.get("last_dispatched_sample_time_ms") is not None
+        else None
+    )
+    if dispatched_ms is not None and dispatched_ms >= sample_time_ms:
         logger.info(
-            "sample_dispatched | device=%s | sample_time_ms=%s",
+            "sample_dispatch_skipped | device=%s | sample_time_ms=%s"
+            " | last_dispatched_sample_time_ms=%s | reason=already_dispatched",
+            device,
+            sample_time_ms,
+            dispatched_ms,
+        )
+        return False
+
+    devices.dispatch_sample(sample)
+    advanced = db.mark_projection_dispatched(device, sample_time_ms)
+    if not advanced:
+        # A previous crash between notify and mark could leave a higher
+        # watermark — keep it, log for forensics.
+        logger.warning(
+            "sample_dispatch_watermark_conflict | device=%s"
+            " | sample_time_ms=%s",
             device,
             sample_time_ms,
         )
-        return True
+        return False
+    logger.info(
+        "sample_dispatched | device=%s | sample_time_ms=%s",
+        device,
+        sample_time_ms,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -525,10 +570,12 @@ def retry_device_projection(
     next attempt is rescheduled by the scanner via exponential backoff.
 
     Projects the *latest* persisted sample (Feishu is a current-state
-    projection — replaying superseded values would regress it), then, on
-    success, dispatches that sample to the Runtime/Shadow pipeline exactly
-    once. Idempotent: a device whose state is no longer ``pending`` is a
-    no-op (the inline path already converged it), which makes duplicate
+    projection — replaying superseded values would regress it). On success
+    it only advances the projected watermark; the **dispatch belongs to
+    ``recover_pending_dispatches``** in the same tick's maintenance hook —
+    keeping a single dispatch owner is precisely what removed the AB-BA
+    deadlock. Idempotent: a device whose state is no longer ``pending`` is
+    a no-op (the inline path already converged it), which makes duplicate
     tasks after restarts harmless.
 
     Raises RuntimeError when the retry fails so the scheduler marks the
@@ -578,21 +625,20 @@ def retry_device_projection(
     mark_projection_success(
         device, int(latest["sample_time_ms"]), now=now
     )
-    sample = devices.sample_from_row(device, latest, int(latest["sample_time_ms"]))
-    dispatched = dispatch_projected_sample(
-        device, sample, int(latest["sample_time_ms"])
-    )
+    # Dispatch ownership: scheduler-only. recover_pending_dispatches (the
+    # maintenance hook that runs right after this handler in the same tick)
+    # sees projected > dispatched and dispatches — the handler must NOT
+    # dispatch itself.
     logger.info(
         "feishu_projection_retry_ok | device=%s | sample_time_ms=%s"
-        " | shadow_dispatched=%s",
+        " | dispatch=scheduler_recovery",
         device,
         latest.get("sample_time_ms"),
-        dispatched,
     )
     return {
         "device": device,
         "result": "projected",
-        "shadow_dispatched": dispatched,
+        "dispatch": "scheduler_recovery",
     }
 
 
