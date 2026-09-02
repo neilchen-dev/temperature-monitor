@@ -5,7 +5,6 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import config
 
@@ -253,17 +252,15 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         self.assertEqual(len(event_records), 1)
         self.assertEqual(event_records[0].fields["责任人"], [{"id": "ou-owner"}])
         self.assertEqual(event_records[0].fields["异常类型"], "温度高于上限")
+        self.assertEqual(event_records[0].fields["开始时间"], int(base_time.timestamp() * 1000))
+        self.assertIsInstance(event_records[0].fields["开始时间"], int)
 
         sample(base_time + timedelta(minutes=6), 37)
         self.assertEqual(store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 37.0)
         sample(base_time + timedelta(minutes=7), 25)
-        # 写回时间按业务时区（HISTORY_TIMEZONE）输出，不能用系统本地时区：
-        # 容器/CI 的本地时区是 UTC，断言会整体偏移 8 小时。
         self.assertEqual(
             store.read_records("tbl-event")[0].fields["恢复时间"],
-            (base_time + timedelta(minutes=7))
-            .astimezone(ZoneInfo(config.HISTORY_TIMEZONE))
-            .strftime("%Y-%m-%d %H:%M:%S"),
+            int((base_time + timedelta(minutes=7)).timestamp() * 1000),
         )
         sample(base_time + timedelta(minutes=8), 25)
         self.assertEqual(local_event_repository.list_active(device_id="TH-03"), ())
@@ -290,6 +287,10 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         )
         inspection = store.read_records("tbl-inspection")[0]
         self.assertEqual(inspection.fields["仓库区域"], "设备区")
+        self.assertEqual(
+            inspection.fields["状态记录时间"],
+            int((base_time + timedelta(minutes=9)).timestamp() * 1000),
+        )
         self.assertNotIn("点检时间", inspection.fields)
         self.assertNotIn("点检人", inspection.fields)
 

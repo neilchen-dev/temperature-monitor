@@ -1177,16 +1177,14 @@ def _interval_status_text(value: Any) -> str:
         raise ValueError(f"不支持的作业区间状态: {value!r}") from exc
 
 
-def _datetime_cell(value: datetime) -> str:
+def _datetime_cell(value: datetime) -> int:
     if not isinstance(value, datetime):
         raise TypeError("时间字段必须是 datetime")
-    if not value.tzinfo:
-        # 已经是“业务墙上时间”的 naive 值按原样输出。
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    # 容器时区通常是 UTC；直接 astimezone() 会把事件时间写成 UTC 墙钟，
-    # 飞书按租户时区解析后整体偏移 8 小时。统一换算到业务时区
-    # （HISTORY_TIMEZONE，默认 Asia/Shanghai）再输出。
-    return value.astimezone(_business_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+    if value.tzinfo is None:
+        # Naive values represent business wall time, preserving the existing
+        # HISTORY_TIMEZONE interpretation before conversion to an instant.
+        value = value.replace(tzinfo=_business_timezone())
+    return int(value.timestamp() * 1000)
 
 
 def _snapshot_online_text(snapshot: MonitorSample | MonitorResult) -> str | None:

@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import config
 from domain.models import (
     DataQualityStatus,
     MonitorResult,
@@ -106,6 +105,10 @@ class FeishuOperationWriterTests(unittest.TestCase):
         self.assertEqual(fields["状态变更"], "开始作业")
         self.assertEqual(fields["当前工艺"], "未关联工艺文件（TH-03）")
         self.assertEqual(fields["当时湿度判定"], "高于上限")
+        self.assertEqual(
+            fields["状态记录时间"], int(_sample().sample_time.timestamp() * 1000)
+        )
+        self.assertIsInstance(fields["状态记录时间"], int)
         self.assertNotIn("登记编号", fields)
         self.assertNotIn("提交时间", fields)
 
@@ -134,7 +137,36 @@ class FeishuOperationWriterTests(unittest.TestCase):
         self.assertEqual(token, normalize_client_token("RUN:rec-operation"))
         self.assertEqual(fields["区间状态"], "作业中")
         self.assertEqual(fields["工艺"], "未关联工艺文件（TH-03） ")
+        self.assertEqual(fields["开始时间"], int(_sample().sample_time.timestamp() * 1000))
+        self.assertIsInstance(fields["开始时间"], int)
         self.assertNotIn("记录类型", fields)
+
+    def test_operation_datetime_updates_use_epoch_milliseconds(self) -> None:
+        recording = _RecordingWriter()
+        writer = FeishuOperationRecordWriter(
+            writer=recording,
+            operation_table_id="tbl-operation",
+            interval_table_id="tbl-interval",
+            device_table_id="tbl-device",
+        )
+        moment = _sample().sample_time
+        expected = int(moment.timestamp() * 1000)
+
+        writer.update_registration_snapshot(
+            registration_record_id="rec-operation",
+            snapshot=_result(),
+            status_recorded_at=moment,
+        )
+        self.assertEqual(recording.updated[-1][2]["状态记录时间"], expected)
+        writer.close_interval(interval_record_id="rec-interval", ended_at=moment)
+        self.assertEqual(recording.updated[-1][2]["结束时间"], expected)
+        writer.update_device_context(
+            device_record_id="rec-device",
+            state="OPERATING",
+            operation_type="未关联工艺文件（TH-03）",
+            started_at=moment,
+        )
+        self.assertEqual(recording.updated[-1][2]["作业开始时间"], expected)
 
 
 class FeishuEnvironmentEventWriterTests(unittest.TestCase):
@@ -182,8 +214,54 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
         self.assertEqual(fields["异常类型"], "温度高于上限")
         self.assertEqual(fields["处理状态"], "待处理")
         self.assertEqual(fields["控制要求"], "执行适用标准")
+        self.assertEqual(fields["开始时间"], int(_sample().sample_time.timestamp() * 1000))
+        self.assertIsInstance(fields["开始时间"], int)
         self.assertNotIn("自动异常类型", fields)
         self.assertNotIn("记录类型", fields)
+
+    def test_recovery_and_close_datetimes_use_epoch_milliseconds(self) -> None:
+        recording = _RecordingWriter()
+        writer = self._writer(recording)
+        moment = _sample().sample_time
+        expected = int(moment.timestamp() * 1000)
+
+        writer.recover_event(record_id="rec-event", recovered_at=moment)
+        self.assertEqual(recording.updated[-1][2]["恢复时间"], expected)
+        writer.close_event(
+            record_id="rec-event",
+            closed_at=moment,
+            cause="测试原因",
+            measure="测试措施",
+            product_impact="无",
+            recovered_at=moment,
+        )
+        self.assertEqual(recording.updated[-1][2]["关闭时间"], expected)
+        self.assertEqual(recording.updated[-1][2]["恢复时间"], expected)
+
+    def test_event_generated_idempotency_key_is_stable_for_same_instant(self) -> None:
+        recording = _RecordingWriter()
+        writer = self._writer(recording)
+        utc_start = _sample().sample_time
+        business_start = utc_start.astimezone(ZoneInfo("Asia/Shanghai"))
+
+        writer.create_event(
+            device_id="TH-03",
+            area="精密装配间",
+            start_time=utc_start,
+            temperature=46,
+        )
+        writer.create_event(
+            device_id="TH-03",
+            area="精密装配间",
+            start_time=business_start,
+            temperature=46,
+        )
+
+        self.assertEqual(recording.created[0][2], recording.created[1][2])
+        self.assertEqual(
+            recording.created[0][1]["开始时间"],
+            recording.created[1][1]["开始时间"],
+        )
 
     def test_duplicate_active_event_is_rejected(self) -> None:
         recording = _RecordingWriter()
@@ -243,20 +321,26 @@ class FeishuInspectionWriterTests(unittest.TestCase):
 
         _, fields, token = recording.created[-1]
         self.assertEqual(token, normalize_client_token("inspection-1"))
-        # 写回时间按业务时区（HISTORY_TIMEZONE）输出，不能用系统本地时区：
-        # 容器/CI 的本地时区是 UTC，断言会整体偏移。
         self.assertEqual(
             fields["状态记录时间"],
-            _sample()
-            .sample_time.astimezone(ZoneInfo(config.HISTORY_TIMEZONE))
-            .strftime("%Y-%m-%d %H:%M:%S"),
+            int(_sample().sample_time.timestamp() * 1000),
         )
+        self.assertIsInstance(fields["状态记录时间"], int)
         self.assertEqual(fields["当时环境判定"], "超限")
         self.assertEqual(fields["监测系统状态"], "离线/数据异常")
         self.assertEqual(fields["现场仓储状态"], "正常，无明显异常")
         self.assertEqual(fields["父记录"], [{"id": "rec-parent"}])
         self.assertNotIn("点检时间", fields)
         self.assertNotIn("点检人", fields)
+
+        writer.update_device_recent_inspection(
+            device_record_id="rec-device",
+            inspected_at=_sample().sample_time,
+        )
+        self.assertEqual(
+            recording.updated[-1][2]["最近仓库点检时间"],
+            int(_sample().sample_time.timestamp() * 1000),
+        )
 
     def test_inspection_does_not_accept_text_environment_event_number(self) -> None:
         writer = FeishuInspectionRecordWriter(

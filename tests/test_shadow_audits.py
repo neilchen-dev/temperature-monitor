@@ -317,15 +317,20 @@ class ShadowAuditTests(unittest.TestCase):
         self.assertEqual(remaining_runs, 1)
         components.stop()
 
-    def test_datetime_cell_converts_utc_to_business_timezone(self) -> None:
-        """Aware datetime 写飞书前必须换算业务时区；naive 视为墙上时间。"""
+    def test_datetime_cell_converts_instants_to_epoch_milliseconds(self) -> None:
+        """Aware values preserve their instant; naive values use business time."""
         import integrations.feishu_writers as writers
 
         writers._business_tz_cache = None
         utc_value = datetime(2026, 8, 31, 4, 30, 0, tzinfo=timezone.utc)
-        self.assertEqual(writers._datetime_cell(utc_value), "2026-08-31 12:30:00")
+        expected = int(utc_value.timestamp() * 1000)
+        self.assertEqual(writers._datetime_cell(utc_value), expected)
+        business_value = utc_value.astimezone(writers._business_timezone())
+        self.assertEqual(writers._datetime_cell(business_value), expected)
         naive_value = datetime(2026, 8, 31, 12, 30, 0)
-        self.assertEqual(writers._datetime_cell(naive_value), "2026-08-31 12:30:00")
+        self.assertEqual(writers._datetime_cell(naive_value), expected)
+        with_microseconds = utc_value.replace(microsecond=987654)
+        self.assertEqual(writers._datetime_cell(with_microseconds), expected + 987)
         writers._business_tz_cache = None
 
     def test_runtime_status_reflects_built_runtime(self) -> None:
