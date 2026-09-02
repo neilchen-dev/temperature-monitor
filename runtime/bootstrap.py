@@ -127,19 +127,44 @@ def active_block_reason() -> str | None:
     if config.ACTIVE_CUTOVER_ACK != config.ACTIVE_CUTOVER_ACK_EXPECTED:
         reasons.append(
             f"ACTIVE_CUTOVER_ACK={config.ACTIVE_CUTOVER_ACK_EXPECTED} is required "
-            "(legacy Feishu automation workflows must be disabled by hand first)"
+            "(legacy owner for ACTIVE_DEVICE_IDS must be disabled or excluded; "
+            "other devices may retain legacy workflows during Canary)"
         )
     return "; ".join(reasons) if reasons else None
+
+
+def active_canary_status() -> dict[str, Any]:
+    """Return the configured Active Canary state for health endpoints."""
+    active_device_ids = list(config.ACTIVE_DEVICE_IDS)
+    active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
+    return {
+        "active_device_ids": active_device_ids,
+        "active_device_count": len(active_device_ids),
+        "active_canary_enabled": bool(
+            active_mode
+            and config.FEISHU_WRITE_ENABLED
+            and config.ACTIVE_CUTOVER_ACK == config.ACTIVE_CUTOVER_ACK_EXPECTED
+            and active_device_ids
+        ),
+    }
 
 
 def runtime_status() -> dict[str, Any]:
     """Return the live Shadow Runtime status for observability endpoints."""
     if _last_components is None:
-        return {"available": False, "reason": "runtime not built"}
+        return {
+            "available": False,
+            "reason": "runtime not built",
+            **active_canary_status(),
+        }
     try:
         status = _last_components.status()
     except Exception:  # noqa: BLE001 - status endpoint must never raise
-        return {"available": False, "reason": "runtime status unavailable"}
+        return {
+            "available": False,
+            "reason": "runtime status unavailable",
+            **active_canary_status(),
+        }
     block = active_block_reason()
     if block is not None:
         status["active_block_reason"] = block
@@ -278,6 +303,7 @@ def build_runtime(
     )
     action_executor = ActionExecutor(
         mode=effective_mode,
+        active_device_ids=config.ACTIVE_DEVICE_IDS,
         handlers={
             # Verification tasks are already persisted by the application
             # service; Active mode should audit them as successful local work,
@@ -294,6 +320,17 @@ def build_runtime(
         },
         recorder=run_repository,
     )
+    if mode == AutomationMode.ACTIVE.value:
+        if effective_mode == AutomationMode.ACTIVE.value and config.ACTIVE_DEVICE_IDS:
+            logger.info(
+                "ACTIVE CANARY enabled | devices=%s",
+                ",".join(config.ACTIVE_DEVICE_IDS),
+            )
+        else:
+            logger.warning(
+                "ACTIVE CANARY fail-closed | devices=%s",
+                ",".join(config.ACTIVE_DEVICE_IDS) or "none",
+            )
     operation_state_provider = operation_repository
     monitor_service = MonitorApplicationService(
         operation_state_provider=operation_state_provider,
@@ -355,6 +392,7 @@ def build_runtime(
         unavailable_reason="; ".join(reason_parts) if reason_parts else None,
         feishu_readonly_available=not missing,
         feishu_write_enabled=_active_write_allowed(mode),
+        active_device_ids=config.ACTIVE_DEVICE_IDS,
         devices=devices,
         monitor_service=monitor_service,
         standard_sync=StandardSyncService(

@@ -25,6 +25,8 @@ options:
   table_id: ""
   automation_mode: disabled
   shadow_device_ids: ""
+  active_device_ids: TH-10
+  active_cutover_ack: ""
   shadow_device_contexts: ""
   feishu_standard_table_id: tbl4S6Q0VOYjK92t
   feishu_operation_table_id: tbl3xFxhxnNlv4pm
@@ -83,6 +85,8 @@ schema:
   table_id: str
   automation_mode: list(disabled|shadow|active)
   shadow_device_ids: str
+  active_device_ids: str
+  active_cutover_ack: str
   shadow_device_contexts: str
   feishu_standard_table_id: str
   feishu_operation_table_id: str

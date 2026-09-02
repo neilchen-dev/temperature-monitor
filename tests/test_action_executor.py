@@ -70,19 +70,29 @@ class ActionExecutorTests(unittest.TestCase):
     def test_active_calls_injected_handler(self) -> None:
         executor = ActionExecutor(
             mode="active",
+            active_device_ids=("TH-03",),
             handlers={AlarmActionType.CREATE_VERIFY_TASK: self._handler},
             recorder=self.recorder,
         )
-        executions = executor.execute((self.action,), created_at=self.created_at)
+        executions = executor.execute(
+            (self.action,),
+            context={"device_id": "TH-03"},
+            created_at=self.created_at,
+        )
         self.assertEqual(executions[0].status, ActionExecutionStatus.SUCCEEDED)
         self.assertEqual(self.calls, ["CREATE_VERIFY_TASK"])
 
     def test_active_missing_handler_is_audited_as_failure(self) -> None:
         executor = ActionExecutor(
             mode=AutomationMode.ACTIVE,
+            active_device_ids=("TH-03",),
             recorder=self.recorder,
         )
-        executions = executor.execute((self.action,), created_at=self.created_at)
+        executions = executor.execute(
+            (self.action,),
+            context={"device_id": "TH-03"},
+            created_at=self.created_at,
+        )
         self.assertEqual(executions[0].status, ActionExecutionStatus.FAILED)
         self.assertIn("no handler", executions[0].error or "")
 
@@ -95,18 +105,25 @@ class ActionExecutorTests(unittest.TestCase):
 
         executor = ActionExecutor(
             mode="active",
+            active_device_ids=("TH-03",),
             context_handlers={
                 AlarmActionType.CREATE_VERIFY_TASK: context_handler,
             },
         )
         executions = executor.execute(
             (self.action,),
-            context={"sample_time": "2026-08-28T13:00:00"},
+            context={
+                "device_id": "TH-03",
+                "sample_time": "2026-08-28T13:00:00",
+            },
             created_at=self.created_at,
         )
 
         self.assertEqual(executions[0].status, ActionExecutionStatus.SUCCEEDED)
-        self.assertEqual(received, [{"sample_time": "2026-08-28T13:00:00"}])
+        self.assertEqual(
+            received,
+            [{"device_id": "TH-03", "sample_time": "2026-08-28T13:00:00"}],
+        )
 
 
 if __name__ == "__main__":

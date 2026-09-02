@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from domain.models import AlarmAction, AlarmActionType
 
 from .actions import ApplicationAction
+from .active_scope import active_scope_allows, normalize_device_id, normalize_device_ids
 
 
 class AutomationMode(str, Enum):
@@ -61,9 +62,11 @@ class ActionExecutor:
         context_handlers: Mapping[
             AlarmActionType | str, ContextActionHandler
         ] | None = None,
+        active_device_ids: Iterable[str] | str | None = None,
         recorder: ActionRunRecorder | None = None,
     ) -> None:
         self.mode = AutomationMode(mode)
+        self.active_device_ids = normalize_device_ids(active_device_ids)
         self.handlers = {
             AlarmActionType(action_type): handler
             for action_type, handler in (handlers or {}).items()
@@ -85,9 +88,10 @@ class ActionExecutor:
         """Process actions according to the configured mode.
 
         ``shadow`` records what would have happened but never invokes a
-        handler.  ``active`` invokes the injected handler and captures a
-        failure as an auditable result.  External adapters are deliberately
-        supplied by the application bootstrap rather than imported here.
+        handler.  ``active`` invokes the injected handler only for an
+        allowlisted ``context["device_id"]`` and captures failures as
+        auditable results.  External adapters are deliberately supplied by
+        the application bootstrap rather than imported here.
         """
         action_context = dict(context or {})
         executions: list[ActionExecution] = []
@@ -126,6 +130,62 @@ class ActionExecutor:
                 created_at=created_at,
             )
 
+        # The Active canary gate deliberately runs before handler lookup.  A
+        # device outside the allowlist must remain PLANNED even when its
+        # action has no handler, and no external adapter may be reached.
+        device_id = self._context_device_id(context)
+        if device_id is None:
+            return ActionExecution(
+                action=action,
+                mode=self.mode,
+                status=ActionExecutionStatus.FAILED,
+                error=(
+                    "active action requires a non-empty context.device_id; "
+                    "refusing external write"
+                ),
+                context=context,
+                created_at=created_at,
+            )
+        if not self.active_device_ids:
+            return ActionExecution(
+                action=action,
+                mode=self.mode,
+                status=ActionExecutionStatus.PLANNED,
+                error="ACTIVE_DEVICE_IDS is empty; action remains PLANNED",
+                context=context,
+                created_at=created_at,
+            )
+        if not active_scope_allows(
+            device_id,
+            active_device_ids=self.active_device_ids,
+        ):
+            return ActionExecution(
+                action=action,
+                mode=self.mode,
+                status=ActionExecutionStatus.PLANNED,
+                error=(
+                    f"device_id {device_id} is not in ACTIVE_DEVICE_IDS; "
+                    "action remains PLANNED"
+                ),
+                context=context,
+                created_at=created_at,
+            )
+
+        action_device_id = self._action_device_id(action)
+        if action_device_id != device_id:
+            return ActionExecution(
+                action=action,
+                mode=self.mode,
+                status=ActionExecutionStatus.FAILED,
+                error=(
+                    "active action device scope mismatch: "
+                    f"context.device_id={device_id}, action.device_id={action_device_id}; "
+                    "refusing external write"
+                ),
+                context=context,
+                created_at=created_at,
+            )
+
         context_handler = self.context_handlers.get(action.action_type)
         handler = self.handlers.get(action.action_type)
         if context_handler is None and handler is None:
@@ -158,3 +218,24 @@ class ActionExecutor:
             context=context,
             created_at=created_at,
         )
+
+    @staticmethod
+    def _context_device_id(context: Mapping[str, Any]) -> str | None:
+        """Read and normalize the device scope supplied to ``execute``.
+
+        Active authorization is intentionally based on the execution scope,
+        not on a field carried by the action object.  This keeps the gate at
+        the action boundary and prevents a stale/mismatched action field from
+        widening the write scope.
+        """
+        raw_device_id = context.get("device_id")
+        if not isinstance(raw_device_id, str):
+            return None
+        return normalize_device_id(raw_device_id)
+
+    @staticmethod
+    def _action_device_id(action: AlarmAction | ApplicationAction) -> str | None:
+        raw_device_id = getattr(action, "device_id", None)
+        if not isinstance(raw_device_id, str):
+            return None
+        return normalize_device_id(raw_device_id)

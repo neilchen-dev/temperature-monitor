@@ -1,7 +1,8 @@
 """Active 切换三开关保护测试（P1）。
 
 AUTOMATION_MODE=active + FEISHU_WRITE_ENABLED=true +
-ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足；
+ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足；该确认
+只覆盖 ACTIVE_DEVICE_IDS 中设备的 legacy owner，Canary 阶段不要求关闭其他设备工作流；
 缺任何一项 Runtime 降级为 disabled，且 /api/system/status 的 runtime 段
 给出 active_block_reason。
 """
@@ -63,6 +64,7 @@ class ActiveCutoverTests(unittest.TestCase):
             for name in (
                 "AUTOMATION_MODE",
                 "SHADOW_DEVICE_IDS",
+                "ACTIVE_DEVICE_IDS",
                 "APP_ID",
                 "APP_SECRET",
                 "APP_TOKEN",
@@ -76,6 +78,7 @@ class ActiveCutoverTests(unittest.TestCase):
         }
         config.AUTOMATION_MODE = "active"
         config.SHADOW_DEVICE_IDS = ("TH-10",)
+        config.ACTIVE_DEVICE_IDS = ("TH-10",)
         config.APP_ID = "app"
         config.APP_SECRET = "secret"
         config.APP_TOKEN = "token"
@@ -168,7 +171,7 @@ class ActiveCutoverTests(unittest.TestCase):
             self.assertIn("active_block_reason", status)
             self.assertIn("ACTIVE_CUTOVER_ACK", status["active_block_reason"])
             self.assertIn(
-                "legacy Feishu automation workflows must be disabled",
+                "legacy owner for ACTIVE_DEVICE_IDS must be disabled or excluded",
                 status["active_block_reason"],
             )
         finally:

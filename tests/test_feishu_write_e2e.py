@@ -196,6 +196,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         )
         action_executor = ActionExecutor(
             mode="active",
+            active_device_ids=("TH-03",),
             handlers={
                 AlarmActionType.CREATE_VERIFY_TASK: lambda action: None,
                 AlarmActionType.COMPLETE_VERIFY_TASK: lambda action: None,

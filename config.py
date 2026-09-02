@@ -55,6 +55,7 @@ def _load_hassio_options() -> None:
         "event_temperature_high_c": "EVENT_TEMPERATURE_HIGH_C",
         "automation_mode": "AUTOMATION_MODE",
         "shadow_device_ids": "SHADOW_DEVICE_IDS",
+        "active_device_ids": "ACTIVE_DEVICE_IDS",
         "shadow_device_contexts": "SHADOW_DEVICE_CONTEXTS",
         "feishu_standard_table_id": "FEISHU_STANDARD_TABLE_ID",
         "feishu_operation_table_id": "FEISHU_OPERATION_TABLE_ID",
@@ -333,6 +334,13 @@ SHADOW_DEVICE_IDS = tuple(
     for device in os.getenv("SHADOW_DEVICE_IDS", "").split(",")
     if device.strip()
 )
+ACTIVE_DEVICE_IDS = tuple(
+    dict.fromkeys(
+        device.strip().upper()
+        for device in os.getenv("ACTIVE_DEVICE_IDS", "").split(",")
+        if device.strip()
+    )
+)
 SHADOW_SCHEDULER_POLL_SECONDS = max(
     0.1, _get_float("SHADOW_SCHEDULER_POLL_SECONDS", 1.0)
 )
@@ -393,8 +401,10 @@ FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS = max(
     1.0, _get_float("FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS", 5.0)
 )
 # Active 切换三开关确认：AUTOMATION_MODE=active + FEISHU_WRITE_ENABLED=true
-# + ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足
-# 才允许 Active 写回；确认字符串不匹配时 Runtime 降级为 disabled。
+# + ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足。
+# ACK 只承诺 ACTIVE_DEVICE_IDS 中设备的 legacy owner 已禁用或排除；Canary
+# 阶段不要求关闭其他非白名单设备的 legacy 工作流。
+# 确认字符串不匹配时 Runtime 降级为 disabled。
 ACTIVE_CUTOVER_ACK_EXPECTED = "I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS"
 ACTIVE_CUTOVER_ACK = os.getenv("ACTIVE_CUTOVER_ACK", "").strip()
 SHADOW_WORKER_ID = os.getenv("SHADOW_WORKER_ID", "").strip()

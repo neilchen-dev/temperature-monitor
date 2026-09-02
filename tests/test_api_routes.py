@@ -195,6 +195,10 @@ class ApiRouteTests(unittest.TestCase):
         self.assertIsNotNone(payload["last_sample_time_ms"])
         self.assertIn("sqlite", payload)
         self.assertIn("collectors", payload)
+        self.assertEqual(payload["active_device_ids"], list(config.ACTIVE_DEVICE_IDS))
+        self.assertEqual(payload["active_device_count"], len(config.ACTIVE_DEVICE_IDS))
+        self.assertIn("active_canary_enabled", payload)
+        self.assertIn("active_device_ids", payload["runtime"])
         modbus = payload["collectors"]["modbus"]
         # 健康摘要不得泄漏端点/端口/密钥等配置细节
         self.assertNotIn("host", modbus)

@@ -10,6 +10,7 @@ from .action_executor import (
     AutomationMode,
 )
 from .actions import ApplicationAction, ApplicationActionKind, ApplicationActionMapper
+from .active_scope import active_scope_allows
 from .monitor_service import (
     AlarmStateRepository,
     AutomationTaskRepository,
@@ -54,6 +55,7 @@ __all__ = [
     "ApplicationAction",
     "ApplicationActionKind",
     "ApplicationActionMapper",
+    "active_scope_allows",
     "AlarmStateRepository",
     "AutomationTaskRepository",
     "LatestSampleRepository",

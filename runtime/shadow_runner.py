@@ -56,6 +56,9 @@ class RuntimeStatus:
     feishu_readonly_available: bool
     feishu_write_enabled: bool
     configured_shadow_devices: tuple[str, ...]
+    active_device_ids: tuple[str, ...]
+    active_device_count: int
+    active_canary_enabled: bool
     scheduler_running: bool
     last_standard_sync_time: datetime | None
     enabled_standard_count: int
@@ -73,6 +76,9 @@ class RuntimeStatus:
             "feishu_readonly_available": self.feishu_readonly_available,
             "feishu_write_enabled": self.feishu_write_enabled,
             "configured_shadow_devices": list(self.configured_shadow_devices),
+            "active_device_ids": list(self.active_device_ids),
+            "active_device_count": self.active_device_count,
+            "active_canary_enabled": self.active_canary_enabled,
             "scheduler_running": self.scheduler_running,
             "last_standard_sync_time": _iso(self.last_standard_sync_time),
             "enabled_standard_count": self.enabled_standard_count,
@@ -93,6 +99,7 @@ class ShadowRuntime:
         unavailable_reason: str | None,
         feishu_readonly_available: bool,
         feishu_write_enabled: bool,
+        active_device_ids: tuple[str, ...],
         devices: Mapping[str, DeviceContext],
         monitor_service: MonitorApplicationService,
         standard_sync: StandardSyncService,
@@ -116,6 +123,12 @@ class ShadowRuntime:
         self.unavailable_reason = unavailable_reason
         self.feishu_readonly_available = feishu_readonly_available
         self.feishu_write_enabled = feishu_write_enabled
+        self.active_device_ids = tuple(active_device_ids)
+        self.active_canary_enabled = bool(
+            self.mode == "active"
+            and self.feishu_write_enabled
+            and self.active_device_ids
+        )
         self.devices = {key.strip().upper(): value for key, value in devices.items()}
         self.monitor_service = monitor_service
         self.standard_sync = standard_sync
@@ -360,6 +373,9 @@ class ShadowRuntime:
                 feishu_readonly_available=self.feishu_readonly_available,
                 feishu_write_enabled=self.feishu_write_enabled,
                 configured_shadow_devices=tuple(self.devices),
+                active_device_ids=self.active_device_ids,
+                active_device_count=len(self.active_device_ids),
+                active_canary_enabled=self.active_canary_enabled,
                 scheduler_running=scheduler_running,
                 last_standard_sync_time=self._last_standard_sync_time,
                 enabled_standard_count=self._enabled_standard_count,

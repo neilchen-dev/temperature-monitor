@@ -126,10 +126,10 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 | `GET /api/devices` | 查询统一设备状态 | `X-History-Key` |
 | `GET /api/events` | 查询设备事件 | `X-History-Key` |
 | `GET /api/thresholds` / `PUT /api/thresholds/<device_id>` | 查询或写入设备控制区间 | `X-History-Key` |
-| `POST /api/operations` | 写入一条作业登记 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
-| `POST /api/environment-events` | 写入一条环境异常事件 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
-| `PATCH /api/environment-events/<record_id>` | 填写闭环资料并关闭环境异常 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
-| `POST /api/inspections` | 写入一条仓库点检记录 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` |
+| `POST /api/operations` | 写入一条作业登记 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` + 白名单设备 |
+| `POST /api/environment-events` | 写入一条环境异常事件 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` + 白名单设备 |
+| `PATCH /api/environment-events/<record_id>` | 填写闭环资料并关闭环境异常 | `X-History-Key`；先按 `record_id` 解析事件设备，再检查白名单 |
+| `POST /api/inspections` | 写入一条仓库点检记录 | `X-History-Key`；请求必须提供白名单 `device_id`，且仅 Active + `FEISHU_WRITE_ENABLED=true` |
 | `GET /api/system/status` | 采集器和运行摘要 | 无 |
 
 程序化访问查询 API 时使用 `X-History-Key`，也可以使用 `Authorization: Bearer <HISTORY_API_KEY>`。密钥不会通过 URL 传递。
@@ -140,7 +140,7 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 - **`disabled`**：默认模式，不执行自动化动作；Home Assistant、历史同步和基础监控链路仍可运行；
 - **`shadow`**：只读读取飞书业务状态，计算预期监控结果并与观察状态比对，持久化任务、运行记录和差异，不调用外部动作 handler；
-- **`active`**：启用 Python 的异常事件自动写入；作业登记和仓库点检可通过受保护 API 写入。必须同时设置 `FEISHU_WRITE_ENABLED=true`，否则自动降级为 disabled；恢复只回写 `恢复时间`，异常关闭仍要求人工填写闭环资料。
+- **`active`**：启用 Python 的异常事件自动写入；作业登记和仓库点检可通过受保护 API 写入。必须同时设置 `FEISHU_WRITE_ENABLED=true` 和正确的 `ACTIVE_CUTOVER_ACK`，否则 Runtime 自动降级为 disabled；恢复只回写 `恢复时间`，异常关闭仍要求人工填写闭环资料。Active action 还必须命中 `ACTIVE_DEVICE_IDS`；白名单外设备保留为 `PLANNED`，不会调用 handler。
 
 此外，工业采集与本地镜像可以独立开关：
 
@@ -148,6 +148,10 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 - **本地镜像**：`SQLITE_ENABLED=true` 时启用本地查询、控制台、事件、统计和 Shadow 持久化。
 
 `SHADOW_DEVICE_IDS` 为空时不会处理任何 Shadow 设备。真正试运行前，应显式配置设备白名单、飞书只读表和 SQLite 持久化；Shadow 不会修改或关闭既有飞书工作流。
+
+Active Canary 使用独立的 `ACTIVE_DEVICE_IDS` 逗号分隔白名单（自动去空格并转大写），例如 `ACTIVE_DEVICE_IDS=TH-10`。空白名单严格 fail closed，不会被解释为所有设备 Active。统一 `active_scope_allows(device_id)` policy 同时位于 `ActionExecutor` 和 Feishu write-surface 边界，仅限制业务自动化 action/写回，不影响 Modbus、采集、本地状态或实时 projection。
+
+`ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS` 表示 `ACTIVE_DEVICE_IDS` 中设备的 legacy owner 已在飞书侧人工停用或排除；Canary 阶段不要求关闭其他非白名单设备的 legacy 工作流。
 
 Modbus 采集线程只在 `python app.py` 的生产入口启动一次。若以后使用多进程服务器，只允许一个 worker 开启 `MODBUS_ENABLED`，避免重复轮询同一设备或 RS485 总线。
 
@@ -221,6 +225,8 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `HISTORY_API_KEY` | — | 历史采样、查询 API 和控制台数据请求共享密钥，至少 32 字节 |
 | `AUTOMATION_MODE` | `disabled` | 自动化运行模式：`disabled`、`shadow` 或 `active`；Active 还要求 `FEISHU_WRITE_ENABLED=true` |
 | `SHADOW_DEVICE_IDS` | 空 | Shadow 处理的设备白名单；为空时不处理设备 |
+| `ACTIVE_DEVICE_IDS` | 空 | Active Canary 写回白名单；逗号分隔、自动 uppercase/strip；为空时 fail closed |
+| `ACTIVE_CUTOVER_ACK` | 空 | 确认白名单设备的 legacy owner 已禁用/排除；Canary 阶段不要求关闭其他设备工作流 |
 | `SHADOW_DEVICE_CONTEXTS` | 空 | 设备上下文 JSON，可覆盖区域和控制类型 |
 | `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID |
 | `FEISHU_OPERATION_INTERVAL_TABLE_ID` / `FEISHU_INSPECTION_TABLE_ID` | 当前台账表 ID | 作业区间和仓库点检写入目标表 |

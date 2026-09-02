@@ -268,7 +268,7 @@
 | 环境异常 | `环境异常事件表` | 创建前读取并强制同设备最多一条未关闭事件；写入责任人、控制要求、异常类型、峰值；恢复只写 `恢复时间` |
 | 仓库点检 | `仓库环境点检记录` | 写入快照和现场状态；`点检时间`、`点检人`由飞书系统生成；`异常/报警编号`按真实数字字段处理，不写 `ENV-...` 文本 |
 
-运行时 Active 会执行异常事件的创建、峰值更新和恢复时间回写；关闭仍保留人工闭环边界。作业登记和点检记录通过受保护 API 写入：`POST /api/operations`、`POST /api/inspections`；异常关闭使用 `PATCH /api/environment-events/<record_id>`。三类写入都要求 `X-History-Key`。
+运行时 Active 会执行异常事件的创建、峰值更新和恢复时间回写；关闭仍保留人工闭环边界。作业登记和点检记录通过受保护 API 写入：`POST /api/operations`、`POST /api/inspections`；异常关闭使用 `PATCH /api/environment-events/<record_id>`。四个 Feishu 写入口统一要求 `X-History-Key` 和 Active 设备白名单；PATCH 必须先按 `record_id` 解析事件所属设备，点检请求必须显式提供 `device_id`。
 
 ## 5. 17 条工作流规则摘要
 

@@ -9,22 +9,26 @@ read access after upgrade. ``/api/system/status`` is unauthenticated like
 ``/health`` and intentionally exposes only health aggregates — never
 endpoints, IPs, or key details.
 
-``/api/thresholds`` is the only writing surface here: it stores per-device
-control bands in the local SQLite mirror (never pushed to Feishu) for the
-``/console`` page to render limit highlighting.
+``/api/thresholds`` is the only local-mirror writing surface here: it stores
+per-device control bands in SQLite (never pushed to Feishu) for the
+``/console`` page to render limit highlighting.  Feishu write routes below
+share the Active Canary scope policy before constructing a writer.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 import hmac
 import requests
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 
-from runtime.bootstrap import runtime_status, shadow_summary_snapshot
+from runtime.bootstrap import active_canary_status, runtime_status, shadow_summary_snapshot
 
 import config
+from application.active_scope import active_scope_allows, normalize_device_id
 from integrations.feishu_records import FeishuBitableRecordSource
 from integrations.feishu_writers import (
     FeishuBitableRecordWriter,
@@ -81,6 +85,85 @@ def _feishu_write_disabled_error():
         "status": "error",
         "error": "飞书写入未启用；请同时设置 FEISHU_WRITE_ENABLED=true 和 AUTOMATION_MODE=active",
     }), 503
+
+
+def _active_scope_error(device_id: object, *, reason: str | None = None):
+    normalized = normalize_device_id(device_id)
+    if reason is None:
+        if normalized is None:
+            reason = (
+                "Active scope denied: device_id is missing or invalid; "
+                "refusing Feishu write"
+            )
+        else:
+            reason = (
+                f"Active scope denied: device_id {normalized} is not in "
+                "ACTIVE_DEVICE_IDS; refusing Feishu write"
+            )
+    return jsonify({"status": "error", "error": reason}), 403
+
+
+def _require_active_device_scope(device_id: object):
+    if active_scope_allows(device_id):
+        return None
+    return _active_scope_error(device_id)
+
+
+def _record_field_device_ids(value: Any) -> set[str]:
+    if isinstance(value, list):
+        device_ids: set[str] = set()
+        for item in value:
+            device_ids.update(_record_field_device_ids(item))
+        return device_ids
+    if isinstance(value, Mapping):
+        if "value" in value:
+            return _record_field_device_ids(value["value"])
+        for field_name in ("text", "name"):
+            if field_name in value:
+                return _record_field_device_ids(value[field_name])
+        return set()
+    normalized = normalize_device_id(value)
+    return {normalized} if normalized is not None else set()
+
+
+def _resolve_environment_event_device_id(
+    record_id: str,
+) -> tuple[str | None, str | None]:
+    """Resolve one event's device before any write adapter is constructed."""
+    normalized_record_id = str(record_id or "").strip()
+    if not normalized_record_id:
+        return None, "无法确定环境事件所属设备：record_id 不能为空"
+
+    try:
+        records = FeishuBitableRecordSource().read_records(config.FEISHU_EVENT_TABLE_ID)
+        matches = [
+            record
+            for record in records
+            if str(
+                record.get("record_id", "")
+                if isinstance(record, Mapping)
+                else getattr(record, "record_id", "")
+            ).strip()
+            == normalized_record_id
+        ]
+    except Exception:  # noqa: BLE001 - lookup failure must fail closed
+        return None, "无法查询环境事件所属设备，拒绝 Feishu 写回"
+    if len(matches) != 1:
+        return None, "无法确定环境事件所属设备，拒绝 Feishu 写回"
+
+    fields = (
+        matches[0].get("fields", {})
+        if isinstance(matches[0], Mapping)
+        else getattr(matches[0], "fields", {})
+    )
+    if not isinstance(fields, Mapping):
+        return None, "无法确定环境事件所属设备，拒绝 Feishu 写回"
+    device_ids = _record_field_device_ids(
+        fields.get(config.FEISHU_EVENT_DEVICE_FIELD)
+    )
+    if len(device_ids) != 1:
+        return None, "无法确定环境事件所属设备，拒绝 Feishu 写回"
+    return next(iter(device_ids)), None
 
 
 def _json_payload() -> tuple[dict | None, tuple]:
@@ -214,6 +297,9 @@ def create_operation_registration():
     if payload_error:
         return payload_error
     assert payload is not None
+    scope_error = _require_active_device_scope(payload.get("device_id"))
+    if scope_error:
+        return scope_error
     try:
         writer = FeishuOperationRecordWriter(
             writer=FeishuBitableRecordWriter(),
@@ -261,6 +347,9 @@ def create_environment_event():
     if payload_error:
         return payload_error
     assert payload is not None
+    scope_error = _require_active_device_scope(payload.get("device_id"))
+    if scope_error:
+        return scope_error
     try:
         writer = FeishuEnvironmentEventWriter(
             writer=FeishuBitableRecordWriter(),
@@ -296,6 +385,12 @@ def close_environment_event(record_id: str):
     if payload_error:
         return payload_error
     assert payload is not None
+    device_id, scope_reason = _resolve_environment_event_device_id(record_id)
+    if scope_reason is not None:
+        return _active_scope_error(device_id, reason=scope_reason)
+    scope_error = _require_active_device_scope(device_id)
+    if scope_error:
+        return scope_error
     try:
         writer = FeishuEnvironmentEventWriter(
             writer=FeishuBitableRecordWriter(),
@@ -331,6 +426,9 @@ def create_inspection_record():
     if payload_error:
         return payload_error
     assert payload is not None
+    scope_error = _require_active_device_scope(payload.get("device_id"))
+    if scope_error:
+        return scope_error
     try:
         writer = FeishuInspectionRecordWriter(
             writer=FeishuBitableRecordWriter(),
@@ -463,12 +561,14 @@ def replace_threshold(device_id: str):
 def system_status():
     summary = db.fetch_device_summary()
     last_sample_ms = summary.get("last_sample_time_ms")
+    canary = active_canary_status()
     return jsonify({
         "status": "ok",
         "service": "temperature-monitor",
         "sqlite": db.get_stats(),
         "collectors": get_collector_status(),
         "runtime": runtime_status(),
+        **canary,
         # 统一设备模型健康：record_sample 错误计数/最后错误/最后成功时间，
         # 以及“/temperature 仍有上报但统一样本断流”的 degraded 判定。
         "device_model": devices.get_device_model_health(),

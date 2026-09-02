@@ -68,6 +68,16 @@ class DeviceConfigurationTests(unittest.TestCase):
 
         self.assertEqual(reloaded_config.HISTORY_DEVICES, ("DEV-01", "TH-02"))
 
+    def test_active_device_ids_normalizes_and_deduplicates(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"ACTIVE_DEVICE_IDS": " th-10, TH-09, th-10 ,, "},
+            clear=False,
+        ):
+            reloaded_config = importlib.reload(config)
+
+        self.assertEqual(reloaded_config.ACTIVE_DEVICE_IDS, ("TH-10", "TH-09"))
+
     def test_invalid_int_env_raises_friendly_error(self) -> None:
         with patch.dict(
             os.environ,

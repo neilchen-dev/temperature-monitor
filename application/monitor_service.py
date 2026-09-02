@@ -174,6 +174,7 @@ class MonitorApplicationService:
         executions = self.action_executor.execute(
             actions,
             context={
+                "device_id": sample.device_id,
                 "created_at": evaluated_at.isoformat(),
                 "sample_time": sample.sample_time.isoformat(),
                 "sample": _sample_dict(sample),
