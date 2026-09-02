@@ -24,8 +24,11 @@ _record_id_lock = threading.Lock()
 _RECORD_ID_CACHE_TTL_SECONDS = 3600
 _RECORD_NOT_FOUND_TTL_SECONDS = 300
 _TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
-_CLIENT_TOKEN_MAX_LENGTH = 50
-_CLIENT_TOKEN_HASH_PREFIX = "tm:"
+_CLIENT_TOKEN_LENGTH = 40
+
+
+class _NormalizedClientToken(str):
+    """Marker type that prevents hashing a token twice across adapter layers."""
 
 
 def _resource_lock(key: str) -> threading.RLock:
@@ -47,19 +50,24 @@ def _validate_bitable_config(*, require_default_table: bool = False) -> None:
 def normalize_client_token(client_token: Any | None) -> str:
     """Return one stable, Feishu-compatible idempotency token.
 
-    Bitable accepts at most 50 characters for ``client_token``.  Business
-    keys are intentionally kept verbatim when they already fit so existing
-    idempotency keys remain observable and backwards compatible.  Longer
-    keys are replaced with a deterministic digest rather than truncated;
-    truncation could merge two different business identities.
+    Every caller-owned business key is represented by the first 40 lowercase
+    hexadecimal characters of its SHA-256 digest.  This is deterministic and
+    stays below Bitable's 50-character limit regardless of the input's length,
+    language, whitespace, or punctuation.
+
+    The marker subtype keeps normalization idempotent inside the write stack:
+    domain adapters normalize before ``writer.create`` and the HTTP boundary
+    normalizes again as a final safeguard, without changing the resulting
+    token.  A missing key receives a fresh UUID before hashing because it does
+    not represent a retryable business identity.
     """
-    token = str(client_token or "").strip()
+    if isinstance(client_token, _NormalizedClientToken):
+        return client_token
+    token = "" if client_token is None else str(client_token)
     if not token:
-        return str(uuid.uuid4())
-    if len(token) <= _CLIENT_TOKEN_MAX_LENGTH:
-        return token
+        token = str(uuid.uuid4())
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    return f"{_CLIENT_TOKEN_HASH_PREFIX}{digest[:_CLIENT_TOKEN_MAX_LENGTH - len(_CLIENT_TOKEN_HASH_PREFIX)]}"
+    return _NormalizedClientToken(digest[:_CLIENT_TOKEN_LENGTH])
 
 
 def normalize_field_value(value: Any) -> str:

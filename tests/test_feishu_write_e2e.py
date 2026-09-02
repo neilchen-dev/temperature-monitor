@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,7 @@ class _FeishuStore:
         self.clock = created_at
         self.sequence = 0
         self.fail_event_creates = 0
+        self.create_attempt_tokens: list[tuple[str, str | None]] = []
         self.tables: dict[str, list[FeishuRawRecord]] = {
             "tbl-device": [
                 FeishuRawRecord(
@@ -75,6 +77,7 @@ class _FeishuStore:
         *,
         client_token: str | None = None,
     ) -> dict[str, Any]:
+        self.create_attempt_tokens.append((table_id, client_token))
         if client_token and client_token in self.tokens:
             return {"code": 0, "record_id": self.tokens[client_token], "deduped": True}
         if table_id == "tbl-event" and self.fail_event_creates:
@@ -458,6 +461,14 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             worker_id="restarted-worker",
         )
         self.assertEqual(len(store.read_records("tbl-event")), 1)
+        event_tokens = tuple(
+            token
+            for table_id, token in store.create_attempt_tokens
+            if table_id == "tbl-event"
+        )
+        self.assertEqual(len(event_tokens), 3)
+        self.assertEqual(len(set(event_tokens)), 1)
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", event_tokens[0] or ""))
 
         # The next ALARM sample is a normal UPDATE of the recovered event;
         # repeated retries remain idempotent and never create a second row.

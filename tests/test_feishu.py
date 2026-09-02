@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
@@ -135,25 +137,55 @@ class RecordDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["code"], 0)
         self.assertEqual(request.call_count, 2)
 
-    def test_normalizes_long_client_token_stably(self) -> None:
+    def test_normalizes_all_business_client_tokens_stably_and_safely(self) -> None:
+        business_keys = (
+            "ENV:TH-01:2026-09-02T08:30:00+08:00",
+            "PROC:TH-01:开始作业:2026-09-02 08:30:00",
+            "RUN:rec-operation-01",
+            "中文幂等键",
+            "key with spaces",
+            "special:/?#[]@!$&'()*+,;=%",
+            "ENV:" + ("TH-01/very-long-business-key:" * 20),
+        )
+
+        tokens: list[str] = []
+        for business_key in business_keys:
+            with self.subTest(business_key=business_key):
+                token = feishu.normalize_client_token(business_key)
+                self.assertEqual(
+                    token,
+                    hashlib.sha256(business_key.encode("utf-8")).hexdigest()[:40],
+                )
+                self.assertRegex(token, r"^[0-9a-f]{40}$")
+                self.assertLessEqual(len(token), 50)
+                self.assertEqual(token, feishu.normalize_client_token(business_key))
+                tokens.append(token)
+
+        self.assertEqual(len(tokens), len(set(tokens)))
+
+    def test_create_never_sends_raw_business_key_as_client_token(self) -> None:
         response = Mock(status_code=200)
         response.json.return_value = {"code": 0, "data": {"record_id": "rec-1"}}
-        long_key = "  ENV:" + ("TH-01/very-long-business-key:" * 4) + "  "
+        business_key = "ENV:TH-01:2026-09-02T08:30:00+08:00"
 
         with (
             patch.object(feishu, "get_token", return_value="token"),
             patch.object(feishu, "request_with_retry", return_value=response) as request,
         ):
-            feishu.create_bitable_record("tbl_event", {"监测点": "TH-01"}, client_token=long_key)
-            feishu.create_bitable_record("tbl_event", {"监测点": "TH-01"}, client_token=long_key)
+            feishu.create_bitable_record(
+                "tbl_event", {"监测点": "TH-01"}, client_token=business_key
+            )
+            feishu.create_bitable_record(
+                "tbl_event", {"监测点": "TH-01"}, client_token=business_key
+            )
 
         tokens = [
             parse_qs(urlparse(call.args[1]).query)["client_token"][0]
             for call in request.call_args_list
         ]
         self.assertEqual(tokens[0], tokens[1])
-        self.assertLessEqual(len(tokens[0]), 50)
-        self.assertTrue(tokens[0].startswith("tm:"))
+        self.assertNotEqual(tokens[0], business_key)
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", tokens[0]))
 
     def test_reads_latest_history_timestamp_with_descending_sort(self) -> None:
         response = Mock(status_code=200)

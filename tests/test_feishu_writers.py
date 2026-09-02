@@ -21,6 +21,7 @@ from integrations.feishu_writers import (
     FeishuOperationRecordWriter,
     FeishuWriteError,
 )
+from services.feishu import normalize_client_token
 
 
 class _RecordingWriter:
@@ -99,7 +100,7 @@ class FeishuOperationWriterTests(unittest.TestCase):
 
         table_id, fields, token = recording.created[-1]
         self.assertEqual(table_id, "tbl-operation")
-        self.assertEqual(token, "operation-1")
+        self.assertEqual(token, normalize_client_token("operation-1"))
         self.assertEqual(fields["监测点"], "TH-03")
         self.assertEqual(fields["区域"], "精密装配间")
         self.assertEqual(fields["状态变更"], "开始作业")
@@ -130,7 +131,7 @@ class FeishuOperationWriterTests(unittest.TestCase):
         writer.create_interval(observation=observation, snapshot=_result())
 
         _, fields, token = recording.created[-1]
-        self.assertEqual(token, "RUN:rec-operation")
+        self.assertEqual(token, normalize_client_token("RUN:rec-operation"))
         self.assertEqual(fields["区间状态"], "作业中")
         self.assertEqual(fields["工艺"], "未关联工艺文件（TH-03） ")
         self.assertNotIn("记录类型", fields)
@@ -176,7 +177,7 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
         )
 
         _, fields, token = recording.created[-1]
-        self.assertEqual(token, "event-1")
+        self.assertEqual(token, normalize_client_token("event-1"))
         self.assertEqual(fields["责任人"], [{"id": "ou_owner"}])
         self.assertEqual(fields["异常类型"], "温度高于上限")
         self.assertEqual(fields["处理状态"], "待处理")
@@ -241,7 +242,7 @@ class FeishuInspectionWriterTests(unittest.TestCase):
         )
 
         _, fields, token = recording.created[-1]
-        self.assertEqual(token, "inspection-1")
+        self.assertEqual(token, normalize_client_token("inspection-1"))
         # 写回时间按业务时区（HISTORY_TIMEZONE）输出，不能用系统本地时区：
         # 容器/CI 的本地时区是 UTC，断言会整体偏移。
         self.assertEqual(
