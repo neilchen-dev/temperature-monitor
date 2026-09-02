@@ -343,6 +343,9 @@ def build_runtime(
             "SHADOW_COMPARE": lambda task: runtime_holder["runtime"].handle_shadow_compare(task),
             "SYNC_STANDARD": lambda task: runtime_holder["runtime"].handle_standard_sync(task),
             "SYNC_OPERATIONS": lambda task: runtime_holder["runtime"].handle_operation_sync(task),
+            # /temperature 可靠性：飞书投影失败后的 durable 重试任务
+            # （services.projection 状态机 + shadow_runner 扫描器生成）。
+            "FEISHU_PROJECTION": lambda task: runtime_holder["runtime"].handle_feishu_projection(task),
         },
         now_provider=now_provider,
     )

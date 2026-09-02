@@ -33,7 +33,7 @@ from integrations.feishu_writers import (
     FeishuOperationRecordWriter,
     FeishuWriteError,
 )
-from services import db, devices
+from services import db, devices, projection
 from services.collector import get_collector_status
 
 
@@ -472,6 +472,9 @@ def system_status():
         # 统一设备模型健康：record_sample 错误计数/最后错误/最后成功时间，
         # 以及“/temperature 仍有上报但统一样本断流”的 degraded 判定。
         "device_model": devices.get_device_model_health(),
+        # 飞书投影状态机：pending/failed 设备与最后错误——外部飞书故障
+        # 时确认“本地 sample 不丢、投影延迟可发现”的直接证据。
+        "feishu_projection": projection.projection_health_summary(),
         # device_count = 不同设备编号数；identity_count = (设备, 数据源)
         # 身份对数量，与 /api/devices 的 count 一致。
         "device_count": summary.get("device_count", 0),

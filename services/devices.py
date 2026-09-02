@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime
 import threading
 from collections.abc import Callable
@@ -200,6 +201,33 @@ def _coerce_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+@dataclass(frozen=True)
+class SamplePersistOutcome:
+    """Phase-A persistence result for one incoming sample.
+
+    - ``sample``: normalized sample (from the new row, or the previous row
+      on a dedupe hit). None when rejected or on internal failure.
+    - ``persisted``: True only when a new device_samples row was committed.
+    - ``duplicate``: True when an identical-content repeat within the
+      dedupe window was collapsed onto the previous sample.
+    - ``transitions``: state-transition events produced (duplicates and
+      skips produce none).
+    - ``reason``: rejection/skip cause when ``sample`` is None.
+    """
+
+    sample: MonitorSample | None
+    sample_time_ms: int | None
+    duplicate: bool
+    persisted: bool
+    transitions: list[dict[str, Any]]
+    reason: str | None
+
+    @property
+    def durable(self) -> bool:
+        """True when this business sample exists in the local store."""
+        return self.persisted or self.duplicate
+
+
 def record_sample(
     device: str,
     source: str,
@@ -209,7 +237,12 @@ def record_sample(
     sample_time_ms: int | None = None,
     only_on_status_change: bool = False,
 ) -> list[dict[str, Any]]:
-    """Persist one unified sample and record any state transitions.
+    """Persist one unified sample, record transitions, and dispatch listeners.
+
+    Compatibility wrapper for the legacy acquisition chain (Modbus poller):
+    persist + notify in one call. The /temperature route uses the split
+    :func:`persist_sample` / :func:`dispatch_sample` pair instead so local
+    durability never depends on the Feishu projection.
 
     Returns the transition events produced by this sample (empty list when
     none). Never raises.
@@ -219,27 +252,86 @@ def record_sample(
     already offline, so a 5s poll against a powered-off device does not
     spam the table with identical rows.
     """
+    outcome = persist_sample(
+        device,
+        source,
+        temperature,
+        humidity,
+        status,
+        sample_time_ms=sample_time_ms,
+        only_on_status_change=only_on_status_change,
+    )
+    if outcome.sample is not None:
+        dispatch_sample(outcome.sample)
+    return list(outcome.transitions)
+
+
+def dispatch_sample(sample: MonitorSample) -> None:
+    """Phase B: hand a persisted sample to Runtime/Shadow listeners.
+
+    Pure notification — no persistence. Listener failures are isolated.
+    """
+    _notify_sample_listeners(sample)
+
+
+def sample_from_row(
+    device: str, row: dict[str, Any], now_ms: int
+) -> MonitorSample:
+    """Build the normalized MonitorSample for a persisted/previous row."""
+    status = str(row.get("status") or STATUS_ONLINE)
+    return MonitorSample(
+        device_id=device,
+        sample_time=datetime.fromtimestamp(now_ms / 1000).astimezone(),
+        temperature=row.get("temperature"),
+        humidity=row.get("humidity"),
+        online_status=status,
+        data_quality=(
+            DataQualityStatus.OFFLINE if status == STATUS_OFFLINE else None
+        ),
+    )
+
+
+def persist_sample(
+    device: str,
+    source: str,
+    temperature: Any,
+    humidity: Any,
+    status: str,
+    sample_time_ms: int | None = None,
+    only_on_status_change: bool = False,
+    dedupe_window_ms: int = 0,
+) -> SamplePersistOutcome:
+    """Phase A: durably persist one unified sample locally. No listener dispatch.
+
+    Never raises and never touches the network. ``dedupe_window_ms > 0``
+    treats a repeat submission with *identical* content (temperature,
+    humidity, status) for the same (device, source) within the window as
+    the same business sample: no new row, no repeated events — the previous
+    sample identity is returned with ``duplicate=True``. HA payloads carry
+    no source timestamp, so content+window is the only safe request-level
+    dedupe identity (a real sensor state change alters the content).
+    """
     try:
         normalized_device = str(device or "").strip().upper()
         normalized_source = str(source or "").strip().lower()
         normalized_status = normalize_status(status)
         if not normalized_device:
             logger.warning("统一模型拒绝无设备名样本 | source=%s", normalized_source)
-            return []
+            return SamplePersistOutcome(None, None, False, False, [], "empty_device")
         if normalized_source not in KNOWN_SOURCES:
             logger.warning(
                 "统一模型拒绝未知数据源 | device=%s | source=%s",
                 normalized_device,
                 normalized_source,
             )
-            return []
+            return SamplePersistOutcome(None, None, False, False, [], "unknown_source")
         if normalized_status is None:
             logger.warning(
                 "统一模型拒绝未知状态 | device=%s | status=%r",
                 normalized_device,
                 status,
             )
-            return []
+            return SamplePersistOutcome(None, None, False, False, [], "unknown_status")
 
         now_ms = int(sample_time_ms if sample_time_ms is not None
                      else time.time() * 1000)
@@ -273,9 +365,32 @@ def record_sample(
                     and normalized_status == STATUS_OFFLINE
                     and previous is not None
                     and str(previous.get("status") or "").lower() == STATUS_OFFLINE):
-                return []
+                return SamplePersistOutcome(
+                    None, None, False, False, [], "status_unchanged"
+                )
 
-            db.save_device_sample(
+            if (dedupe_window_ms > 0
+                    and _is_duplicate_sample(previous, current, now_ms,
+                                             dedupe_window_ms)):
+                logger.info(
+                    "重复上报去重命中 | device=%s | source=%s | sample_time_ms=%s"
+                    " | previous_sample_time_ms=%s",
+                    normalized_device,
+                    normalized_source,
+                    now_ms,
+                    previous.get("sample_time_ms"),
+                )
+                previous_ms = int(previous["sample_time_ms"])
+                return SamplePersistOutcome(
+                    sample_from_row(normalized_device, previous, previous_ms),
+                    previous_ms,
+                    True,
+                    False,
+                    [],
+                    None,
+                )
+
+            persisted = db.save_device_sample(
                 device=normalized_device,
                 source=normalized_source,
                 sample_time_ms=now_ms,
@@ -297,19 +412,17 @@ def record_sample(
                     source=normalized_source,
                 )
 
-        _notify_sample_listeners(
-            MonitorSample(
-                device_id=normalized_device,
-                sample_time=datetime.fromtimestamp(now_ms / 1000).astimezone(),
-                temperature=current["temperature"],
-                humidity=current["humidity"],
-                online_status=normalized_status,
-                data_quality=(
-                    DataQualityStatus.OFFLINE
-                    if normalized_status == STATUS_OFFLINE
-                    else None
-                ),
-            )
+        sample = MonitorSample(
+            device_id=normalized_device,
+            sample_time=datetime.fromtimestamp(now_ms / 1000).astimezone(),
+            temperature=current["temperature"],
+            humidity=current["humidity"],
+            online_status=normalized_status,
+            data_quality=(
+                DataQualityStatus.OFFLINE
+                if normalized_status == STATUS_OFFLINE
+                else None
+            ),
         )
         if transitions:
             logger.info(
@@ -318,10 +431,38 @@ def record_sample(
                 ", ".join(f"{e['old_state']}->{e['new_state']}" for e in transitions),
             )
         _note_record_success()
-        return transitions
+        return SamplePersistOutcome(
+            sample, now_ms, False, persisted, transitions, None
+        )
     except Exception as exc:
         # 旁路隔离不变：旧采集链路继续可用。但断流不再静默——计数与
         # 最后错误暴露在 /api/system/status 的 device_model 段。
         _note_record_error(exc)
         logger.exception("统一设备样本入库失败 | device=%s | source=%s", device, source)
-        return []
+        return SamplePersistOutcome(None, None, False, False, [], "exception")
+
+
+def _is_duplicate_sample(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+    now_ms: int,
+    dedupe_window_ms: int,
+) -> bool:
+    """True when ``previous`` is a recent row with identical content.
+
+    Requires a non-negative, in-window age delta so a clock skew backwards
+    never silently drops a reading.
+    """
+    if previous is None:
+        return False
+    previous_ms = previous.get("sample_time_ms")
+    if previous_ms is None:
+        return False
+    delta = now_ms - int(previous_ms)
+    if delta < 0 or delta > dedupe_window_ms:
+        return False
+    return (
+        str(previous.get("status") or "").lower() == current["status"]
+        and previous.get("temperature") == current["temperature"]
+        and previous.get("humidity") == current["humidity"]
+    )
