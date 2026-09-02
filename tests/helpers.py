@@ -59,19 +59,32 @@ class ModbusTestServer:
         loop_holder: dict[str, object] = {}
 
         def run() -> None:
-            asyncio.run(self._serve(initial, initial_input, loop_holder))
+            try:
+                asyncio.run(self._serve(initial, initial_input, loop_holder))
+            except Exception as exc:  # pragma: no cover - startup diagnostic
+                loop_holder["error"] = exc
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
+            error = loop_holder.get("error")
+            if error is not None:
+                raise RuntimeError("Modbus 测试服务器启动失败") from error
             if "server" in loop_holder and "loop" in loop_holder:
-                break
-            time.sleep(0.05)
-        self._server = loop_holder["server"]  # type: ignore[assignment]
-        self._loop = loop_holder["loop"]  # type: ignore[assignment]
-        if self._server is None or self._loop is None:
-            raise RuntimeError("Modbus 测试服务器未能启动")
+                try:
+                    with socket.create_connection(
+                        ("127.0.0.1", self.port), timeout=0.1
+                    ):
+                        self._server = loop_holder["server"]  # type: ignore[assignment]
+                        self._loop = loop_holder["loop"]  # type: ignore[assignment]
+                        return
+                except OSError:
+                    # The server object exists before serve_forever has bound
+                    # and started listening.  Wait for actual TCP readiness.
+                    pass
+            time.sleep(0.01)
+        raise RuntimeError("Modbus 测试服务器未能在 5 秒内监听")
 
     async def _serve(self, initial: list[int], initial_input, holder: dict) -> None:
         def block(values: list[int]) -> list[SimData]:
