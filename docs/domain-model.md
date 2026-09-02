@@ -243,10 +243,12 @@ ObservedAutomationState
 ```
 
 `FeishuObservationAdapter` 负责把飞书原始字段转换成 `alarm_state`、`operation_state`、
-`event_exists` 和可选事件数量/标准信息。Python expected 已变化、飞书仍为旧状态时，延迟
-≤60 秒统一记录 `FEISHU_DELAY`；超过 60 秒才按 `STANDARD_MISMATCH`、
-`OPERATION_STATE_MISMATCH`、`ALARM_STATE_MISMATCH`、`EVENT_MISSING`、
-`EVENT_DUPLICATED` 或 `UNKNOWN` 分类。`EVENT_MISSING`/`EVENT_DUPLICATED` 优先于普通
+`event_exists` 和可选事件数量/标准信息。Python expected 已变化、飞书仍等于上一份 Python
+expected，且 expected 快照时间与飞书记录更新时间的绝对偏差 ≤60 秒时，统一记录
+`FEISHU_DELAY`；超过 60 秒或 observed 不是上一份 expected 时才按 `STANDARD_MISMATCH`、
+`OPERATION_STATE_MISMATCH`、`ALARM_STATE_MISMATCH`、`OVERALL_STATUS_MISMATCH`、
+监测结果分项 mismatch、`EVENT_MISSING`、`EVENT_DUPLICATED` 或 `UNKNOWN` 分类。
+`EVENT_MISSING`/`EVENT_DUPLICATED` 优先于普通
 报警状态差异。
 
 ## 第一版冻结决策
@@ -264,7 +266,7 @@ ObservedAutomationState
 | 工单号 | 选填 |
 | 作业新旧 | 按记录创建时间；旧记录只审计、不覆盖 |
 | active ENV 事件 | 同设备最多 1 个未关闭事件 |
-| Shadow 延迟 | ≤60 秒为 `FEISHU_DELAY`，>60 秒才是实际 mismatch |
+| Shadow 延迟 | observed 等于上一份 expected 且双向时间偏差 ≤60 秒为 `FEISHU_DELAY`；否则为实际 mismatch |
 
 ## 后续集成原则
 

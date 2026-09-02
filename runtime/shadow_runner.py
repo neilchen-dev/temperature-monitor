@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+import json
 import logging
 import sqlite3
 import threading
@@ -320,6 +321,13 @@ class ShadowRuntime:
                 temperature_status=result.monitor_result.temperature_status.value,
                 humidity_status=result.monitor_result.humidity_status.value,
                 operation_type=result.operation_state.operation_type,
+                resolved_control_type=(
+                    result.monitor_result.resolved_control_type.value
+                    if result.monitor_result.resolved_control_type is not None
+                    else None
+                ),
+                control_type_source=result.monitor_result.control_type_source,
+                control_type_consistency=result.monitor_result.control_type_consistency,
             )
             self._schedule_shadow_compare(expected, sample_time=normalized_sample.sample_time)
             self._last_processed_sample_time = normalized_sample.sample_time
@@ -359,7 +367,7 @@ class ShadowRuntime:
         cutoff_text = (current - timedelta(hours=hours)).isoformat()
         rows = self.connection.execute(
             """
-            SELECT device_id, matched, difference_type, created_at
+            SELECT device_id, matched, difference_type, context_json, created_at
             FROM automation_runs
             WHERE action_type = 'SHADOW_COMPARE' AND created_at >= ?
             """,
@@ -373,6 +381,14 @@ class ShadowRuntime:
         mismatch = total - matched - observation_errors
         by_difference_type: dict[str, int] = {}
         by_device: dict[str, dict[str, int]] = {}
+        control_type_diagnostics = {
+            "standard_equals_legacy": 0,
+            "standard_differs_legacy": 0,
+            "standard_missing": 0,
+            "legacy_missing": 0,
+            "configuration_error": 0,
+        }
+        control_type_mismatch_devices: set[str] = set()
         last_compare_time: str | None = None
         for row in rows:
             key = row["difference_type"] or "MATCH"
@@ -388,6 +404,24 @@ class ShadowRuntime:
                 device_stats["observation_error"] += 1
             else:
                 device_stats["mismatch"] += 1
+            try:
+                expected_context = json.loads(row["context_json"]).get("expected", {})
+            except (TypeError, ValueError):
+                expected_context = {}
+            consistency = expected_context.get("control_type_consistency")
+            source = expected_context.get("control_type_source")
+            diagnostic_key = {
+                "match": "standard_equals_legacy",
+                "mismatch": "standard_differs_legacy",
+                "standard_missing": "standard_missing",
+                "legacy_missing": "legacy_missing",
+            }.get(consistency)
+            if diagnostic_key is not None:
+                control_type_diagnostics[diagnostic_key] += 1
+            if source == "configuration_error":
+                control_type_diagnostics["configuration_error"] += 1
+            if consistency == "mismatch":
+                control_type_mismatch_devices.add(row["device_id"])
             if last_compare_time is None or row["created_at"] > last_compare_time:
                 last_compare_time = row["created_at"]
         standard_age = (
@@ -409,6 +443,8 @@ class ShadowRuntime:
             "match_rate": round(matched / total, 4) if total else None,
             "by_difference_type": by_difference_type,
             "by_device": by_device,
+            "control_type_diagnostics": control_type_diagnostics,
+            "control_type_mismatch_devices": sorted(control_type_mismatch_devices),
             "last_compare_time": last_compare_time,
             "devices_with_no_compare": sorted(set(self.devices) - set(by_device)),
             "scheduler_running": bool(
@@ -614,6 +650,9 @@ def _expected_payload(expected: ExpectedAutomationState) -> dict[str, Any]:
         "humidity_status": expected.humidity_status,
         "active_event_ids": list(expected.active_event_ids),
         "operation_type": expected.operation_type,
+        "resolved_control_type": expected.resolved_control_type,
+        "control_type_source": expected.control_type_source,
+        "control_type_consistency": expected.control_type_consistency,
         "previous_state": (
             dict(expected.previous_state) if expected.previous_state is not None else None
         ),
@@ -654,5 +693,8 @@ def _expected_from_payload(payload: Mapping[str, Any]) -> ExpectedAutomationStat
         humidity_status=payload.get("humidity_status"),
         active_event_ids=tuple(payload.get("active_event_ids") or ()),
         operation_type=payload.get("operation_type"),
+        resolved_control_type=payload.get("resolved_control_type"),
+        control_type_source=payload.get("control_type_source"),
+        control_type_consistency=payload.get("control_type_consistency"),
         previous_state=payload.get("previous_state"),
     )

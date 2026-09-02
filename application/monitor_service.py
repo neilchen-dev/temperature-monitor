@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+import logging
 from typing import Any, Callable, Mapping, Protocol
 
 from domain.models import (
@@ -20,6 +21,9 @@ from domain.standard_resolver import StandardNotFoundError, StandardResolver
 
 from .action_executor import ActionExecution, ActionExecutor
 from .actions import ApplicationAction, ApplicationActionMapper
+
+
+logger = logging.getLogger("temperature_monitor")
 
 
 class OperationStateProvider(Protocol):
@@ -138,6 +142,17 @@ class MonitorApplicationService:
             standard=standard,
             operation_state=operation_state,
         )
+        if monitor_result.control_type_consistency == "mismatch" and standard is not None:
+            legacy_control = getattr(device.control_type, "value", device.control_type)
+            logger.warning(
+                "control_type mismatch | device_id=%s | standard_id=%s | revision=%s "
+                "| standard_control_type=%s | legacy_control_type=%s | source=standard_table",
+                device.device_id,
+                standard.standard_id,
+                standard.revision,
+                standard.control_type.value if standard.control_type is not None else None,
+                legacy_control,
+            )
         current_state = self.alarm_state_repository.get(device.device_id)
         if current_state is None:
             current_state = AlarmState.normal(device.device_id)
@@ -335,6 +350,13 @@ def _monitor_result_dict(result: MonitorResult) -> dict[str, Any]:
         "standard_revision": result.standard_revision,
         "applicability": result.applicability.value,
         "data_quality": result.data_quality.value,
+        "resolved_control_type": (
+            result.resolved_control_type.value
+            if result.resolved_control_type is not None
+            else None
+        ),
+        "control_type_source": result.control_type_source,
+        "control_type_consistency": result.control_type_consistency,
         "reasons": result.reasons,
     }
 

@@ -540,9 +540,14 @@ Python 的 expected 由 `StandardResolver + monitor_engine + AlarmStateMachine` 
 | `STANDARD_MISMATCH` | 标准编号/版本不同，或上下限不同，或一边有标准另一边为 `NO_STANDARD` |
 | `OPERATION_STATE_MISMATCH` | `OPERATING/IDLE/NOT_APPLICABLE` 不一致，或工艺上下文不同 |
 | `ALARM_STATE_MISMATCH` | `NORMAL/PENDING/ALARM` 不一致，且不是可解释的时间窗口延迟 |
+| `OVERALL_STATUS_MISMATCH` | 总体判定 `NORMAL/VIOLATION/UNKNOWN` 不一致 |
+| `APPLICABILITY_MISMATCH` | 标准适用性 `APPLICABLE/NOT_APPLICABLE/NO_STANDARD` 不一致 |
+| `DATA_QUALITY_MISMATCH` | 数据质量 `GOOD/OFFLINE/MISSING/ERROR` 不一致 |
+| `TEMPERATURE_STATUS_MISMATCH` | 温度分项判定不一致 |
+| `HUMIDITY_STATUS_MISMATCH` | 湿度分项判定不一致 |
 | `EVENT_MISSING` | Python 期望 `ALARM`，但飞书没有对应未关闭事件 |
 | `EVENT_DUPLICATED` | 对同一设备/异常轮次，飞书存在两个或以上未关闭事件 |
-| `FEISHU_DELAY` | Python 已进入新状态，飞书仍是旧状态，但旧状态的时间戳在允许同步窗口内 |
+| `FEISHU_DELAY` | Python 已进入新状态，飞书仍等于上一份 Python expected，且两侧记录时间的绝对偏差在允许同步窗口内 |
 | `UNKNOWN` | 缺设备映射、缺标准、缺时间、字段类型错误或无法确定观察结果 |
 
 优先记录 `EVENT_DUPLICATED` 和 `EVENT_MISSING`，再记录状态差异；否则一个重复事件可能同时制造很多无效的 `ALARM_STATE_MISMATCH`。
@@ -577,7 +582,7 @@ Python 的 expected 由 `StandardResolver + monitor_engine + AlarmStateMachine` 
 5. 工单号选填；当前物理试验表尚无该字段时保留为空。
 6. 作业登记按记录创建时间判断新旧；旧记录只记录审计，不覆盖当前状态。
 7. 同一设备同时最多一个未关闭 ENV 事件；Python/SQLite 用数据库约束保证。
-8. Shadow 状态更新延迟阈值为 60 秒，≤60 秒记 `FEISHU_DELAY`，>60 秒才记真实 mismatch。
+8. Shadow 状态更新延迟阈值为 60 秒；observed 等于上一份 Python expected 且双向时间偏差 ≤60 秒时记 `FEISHU_DELAY`，否则记真实 mismatch。
 9. `EVENT_DUPLICATED` 与 `EVENT_MISSING` 优先于普通 `ALARM_STATE_MISMATCH`。
 10. 本轮不修改既有飞书事件、工作流和正式业务状态；代码已提供受开关保护的写入能力，默认不执行。
 

@@ -13,11 +13,13 @@ from datetime import datetime
 from domain.models import (
     AlarmLifecycleState,
     AlarmState,
+    ControlType,
     DataQualityStatus,
     DeviceContext,
     MonitorSample,
     OperationState,
     OperationStatus,
+    parse_control_type,
 )
 from domain.operation import OperationAction, OperationObservation
 
@@ -318,17 +320,12 @@ class SQLiteOperationRepository:
             "SELECT * FROM operation_states WHERE device_id = ?", (device.device_id,)
         ).fetchone()
         if row is None:
-            control_type = (
-                device.control_type.value
-                if hasattr(device.control_type, "value")
-                else str(device.control_type or "")
-            )
+            control_type = parse_control_type(device.control_type)
             default_status = (
                 OperationStatus.NOT_APPLICABLE
                 # ALL_DAY has no operation context; MONITOR_ONLY is outside
                 # operation-gated control.  Only OPERATION_PERIOD can be IDLE.
-                if control_type
-                in {"ALL_DAY", "全天控制", "MONITOR_ONLY", "仅监测"}
+                if control_type in {ControlType.ALL_DAY, ControlType.MONITOR_ONLY}
                 else OperationStatus.IDLE
             )
             return OperationState(

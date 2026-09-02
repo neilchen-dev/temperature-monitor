@@ -26,6 +26,9 @@ class ExpectedAutomationState:
     humidity_status: str | None = None
     active_event_ids: tuple[str, ...] = ()
     operation_type: str | None = None
+    resolved_control_type: str | None = None
+    control_type_source: str | None = None
+    control_type_consistency: str | None = None
     # The immediately preceding Python projection proves that a differing
     # Feishu value is stale, rather than merely different under a business rule.
     previous_state: Mapping[str, Any] | None = None
@@ -95,6 +98,9 @@ def expected_state_from(
     humidity_status: str | None = None,
     active_event_ids: tuple[str, ...] = (),
     operation_type: str | None = None,
+    resolved_control_type: str | None = None,
+    control_type_source: str | None = None,
+    control_type_consistency: str | None = None,
     previous_state: Mapping[str, Any] | None = None,
 ) -> ExpectedAutomationState:
     normalized_alarm_state = AlarmLifecycleState(alarm_state).value
@@ -120,6 +126,9 @@ def expected_state_from(
         humidity_status=humidity_status,
         active_event_ids=active_event_ids,
         operation_type=operation_type,
+        resolved_control_type=resolved_control_type,
+        control_type_source=control_type_source,
+        control_type_consistency=control_type_consistency,
         previous_state=previous_state,
     )
 
@@ -481,6 +490,9 @@ def _state_dict(state: ExpectedAutomationState | ObservedAutomationState) -> dic
         "temperature_status",
         "humidity_status",
         "operation_type",
+        "resolved_control_type",
+        "control_type_source",
+        "control_type_consistency",
         "pending_closure_count",
     ):
         value = getattr(state, field_name, None)

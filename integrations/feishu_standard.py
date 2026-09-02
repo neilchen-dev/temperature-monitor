@@ -9,7 +9,7 @@ from typing import Any, Iterable, Protocol
 from zoneinfo import ZoneInfo
 
 import config
-from domain.models import EnvironmentStandard
+from domain.models import EnvironmentStandard, parse_control_type
 
 from .feishu_records import FeishuRawRecord
 
@@ -40,6 +40,7 @@ class FeishuStandardFieldMap:
     source_document: str
     clause: str
     device_id: str | None = None
+    control_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,15 @@ class FeishuStandardAdapter:
                 else None
             ),
             operation_type=_optional_text(values, self.fields.operation_type),
+            control_type=(
+                _standard_control_type(
+                    values,
+                    self.fields.control_type,
+                    source_record_id=record.record_id,
+                )
+                if self.fields.control_type is not None
+                else None
+            ),
             temperature_min=_optional_number(values, self.fields.temperature_min),
             temperature_max=_optional_number(values, self.fields.temperature_max),
             humidity_min=_optional_number(values, self.fields.humidity_min),
@@ -139,6 +149,21 @@ def _optional_text(values: dict[str, Any] | Any, field_name: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _standard_control_type(
+    values: dict[str, Any] | Any,
+    field_name: str,
+    *,
+    source_record_id: str,
+):
+    try:
+        return parse_control_type(_optional_text(values, field_name))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid Feishu standard record {source_record_id}, "
+            f"field {field_name}: {exc}"
+        ) from exc
 
 
 def _optional_number(values: dict[str, Any] | Any, field_name: str) -> float | None:

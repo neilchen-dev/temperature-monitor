@@ -16,6 +16,7 @@ FEISHU_STANDARD_FIELD_MAP = FeishuStandardFieldMap(
     area="适用区域",
     device_id="适用设备",
     operation_type="适用作业类型",
+    control_type="控制类型",
     temperature_min="温度下限（°C）",
     temperature_max="温度上限（°C）",
     humidity_min="湿度下限（%RH）",

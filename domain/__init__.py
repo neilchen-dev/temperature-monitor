@@ -26,6 +26,7 @@ from .models import (
     StateTransition,
     TemperatureStatus,
     MonitoringControlType,
+    parse_control_type,
 )
 from .monitor_engine import MonitorEngine, evaluate_monitor_state
 from .operation import OperationAction, OperationObservation, is_newer_operation
@@ -67,6 +68,7 @@ __all__ = [
     "StaticStandardResolver",
     "TemperatureStatus",
     "MonitoringControlType",
+    "parse_control_type",
     "is_newer_operation",
     "evaluate_monitor_state",
     "select_standard",

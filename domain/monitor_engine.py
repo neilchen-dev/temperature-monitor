@@ -17,6 +17,7 @@ from .models import (
     OperationStatus,
     OverallStatus,
     TemperatureStatus,
+    parse_control_type,
 )
 
 
@@ -106,29 +107,33 @@ def _quality_from_sample(
     return DataQualityStatus.GOOD
 
 
-def _control_type(value: ControlType | str | None) -> ControlType | None:
-    if value is None:
-        return None
-    if isinstance(value, ControlType):
-        return value
-    normalized = str(value).strip()
-    aliases = {
-        "全天控制": ControlType.ALL_DAY,
-        "作业期间控制": ControlType.OPERATION_PERIOD,
-        "仅监测": ControlType.MONITOR_ONLY,
-        "ALL_DAY": ControlType.ALL_DAY,
-        "OPERATION_PERIOD": ControlType.OPERATION_PERIOD,
-        "MONITOR_ONLY": ControlType.MONITOR_ONLY,
-    }
-    return aliases.get(normalized)
+def resolve_control_type(
+    *, device: DeviceContext, standard: EnvironmentStandard | None
+) -> tuple[ControlType | None, str, str]:
+    """Resolve one authoritative control type plus migration diagnostics."""
+    standard_control = standard.control_type if standard is not None else None
+    legacy_control = parse_control_type(device.control_type)
+    if standard_control is not None:
+        consistency = (
+            "match"
+            if legacy_control is standard_control
+            else "mismatch"
+            if legacy_control is not None
+            else "legacy_missing"
+        )
+        return standard_control, "standard", consistency
+    if legacy_control is not None:
+        return legacy_control, "device_context_fallback", "standard_missing"
+    return None, "configuration_error", "standard_missing"
 
 
 def _is_not_applicable(
     *,
-    device: DeviceContext,
+    control_type: ControlType | None,
     operation_state: OperationState | None,
 ) -> bool:
-    control_type = _control_type(device.control_type)
+    if control_type is None:
+        return True
     operation_status = None
     if operation_state is not None:
         operation_status = OperationStatus(operation_state.state)
@@ -163,6 +168,9 @@ def evaluate_monitor_state(
         raise ValueError("sample.device_id must match device.device_id")
 
     quality = _quality_from_sample(sample=sample, standard=standard)
+    resolved_control_type, control_type_source, control_type_consistency = (
+        resolve_control_type(device=device, standard=standard)
+    )
     if standard is None:
         temperature_status = TemperatureStatus.UNKNOWN
         humidity_status = TemperatureStatus.UNKNOWN
@@ -189,10 +197,15 @@ def evaluate_monitor_state(
         if standard is None
         else (
             ApplicabilityStatus.NOT_APPLICABLE
-            if _is_not_applicable(device=device, operation_state=operation_state)
+            if _is_not_applicable(
+                control_type=resolved_control_type,
+                operation_state=operation_state,
+            )
             else ApplicabilityStatus.APPLICABLE
         )
     )
+    if standard is not None and resolved_control_type is None:
+        reasons = ("control_type_configuration_error",) + reasons
     if quality is DataQualityStatus.OFFLINE:
         reasons = ("device_offline",) + reasons
     elif quality is DataQualityStatus.MISSING:
@@ -224,6 +237,9 @@ def evaluate_monitor_state(
         reasons=reasons,
         applicability=applicability,
         data_quality=quality,
+        resolved_control_type=resolved_control_type,
+        control_type_source=control_type_source,
+        control_type_consistency=control_type_consistency,
     )
 
 

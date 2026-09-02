@@ -17,3 +17,5 @@ data/
 .DS_Store
 .venv/
 .runtime-tmp/
+.workbuddy/
+.zcode/

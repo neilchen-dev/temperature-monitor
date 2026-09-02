@@ -24,6 +24,29 @@ class ControlType(str, Enum):
     MONITOR_ONLY = "MONITOR_ONLY"
 
 
+_CONTROL_TYPE_ALIASES = {
+    "全天控制": ControlType.ALL_DAY,
+    "作业期间控制": ControlType.OPERATION_PERIOD,
+    "仅监测": ControlType.MONITOR_ONLY,
+}
+
+
+def parse_control_type(value: ControlType | str | None) -> ControlType | None:
+    """Normalize standard/device control types; reject unknown non-empty values."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, ControlType):
+        return value
+    normalized = str(value).strip()
+    try:
+        return ControlType(normalized)
+    except ValueError:
+        parsed = _CONTROL_TYPE_ALIASES.get(normalized)
+        if parsed is None:
+            raise ValueError(f"unsupported control_type: {value!r}") from None
+        return parsed
+
+
 # A descriptive alias for callers that prefer the longer name.
 MonitoringControlType = ControlType
 
@@ -120,8 +143,10 @@ class EnvironmentStandard:
     priority: int = 0
     enabled: bool = True
     device_id: str | None = None
+    control_type: ControlType | str | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "control_type", parse_control_type(self.control_type))
         if not self.standard_id.strip():
             raise ValueError("standard_id cannot be empty")
         if not self.revision.strip():
@@ -206,6 +231,9 @@ class MonitorResult:
     reasons: tuple[str, ...]
     applicability: ApplicabilityStatus = ApplicabilityStatus.APPLICABLE
     data_quality: DataQualityStatus = DataQualityStatus.GOOD
+    resolved_control_type: ControlType | None = None
+    control_type_source: str = "configuration_error"
+    control_type_consistency: str = "standard_missing"
 
 
 @dataclass(frozen=True)

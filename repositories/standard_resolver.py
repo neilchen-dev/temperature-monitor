@@ -7,7 +7,7 @@ import json
 import uuid
 from datetime import datetime
 
-from domain.models import EnvironmentStandard
+from domain.models import EnvironmentStandard, parse_control_type
 from domain.standard_resolver import select_standard
 
 
@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS standard_versions (
     area TEXT NOT NULL,
     device_id TEXT,
     operation_type TEXT,
+    control_type TEXT,
     temperature_min REAL,
     temperature_max REAL,
     humidity_min REAL,
@@ -73,6 +74,10 @@ class SQLiteStandardRepository:
         if "device_id" not in columns:
             self.connection.execute(
                 "ALTER TABLE standard_versions ADD COLUMN device_id TEXT"
+            )
+        if "control_type" not in columns:
+            self.connection.execute(
+                "ALTER TABLE standard_versions ADD COLUMN control_type TEXT"
             )
         self.connection.execute(
             """
@@ -199,15 +204,16 @@ class SQLiteStandardRepository:
         self.connection.execute(
             """
             INSERT INTO standard_versions (
-                standard_id, revision, area, device_id, operation_type,
+                standard_id, revision, area, device_id, operation_type, control_type,
                 temperature_min, temperature_max, humidity_min, humidity_max,
                 effective_from, effective_to, source_document, clause,
                 priority, enabled, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(standard_id, revision) DO UPDATE SET
                 area = excluded.area,
                 device_id = excluded.device_id,
                 operation_type = excluded.operation_type,
+                control_type = excluded.control_type,
                 temperature_min = excluded.temperature_min,
                 temperature_max = excluded.temperature_max,
                 humidity_min = excluded.humidity_min,
@@ -226,6 +232,7 @@ class SQLiteStandardRepository:
                 standard.area,
                 standard.device_id,
                 standard.operation_type,
+                standard.control_type.value if standard.control_type is not None else None,
                 standard.temperature_min,
                 standard.temperature_max,
                 standard.humidity_min,
@@ -259,6 +266,7 @@ class SQLiteStandardRepository:
             area=row["area"],
             device_id=row["device_id"],
             operation_type=row["operation_type"],
+            control_type=parse_control_type(row["control_type"]),
             temperature_min=row["temperature_min"],
             temperature_max=row["temperature_max"],
             humidity_min=row["humidity_min"],

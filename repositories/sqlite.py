@@ -47,6 +47,7 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "standard_versions": (
         "standard_id", "revision", "area", "device_id", "operation_type",
+        "control_type",
         "temperature_min", "temperature_max", "humidity_min", "humidity_max",
         "effective_from", "effective_to", "source_document", "clause",
         "priority", "enabled", "created_at", "updated_at",

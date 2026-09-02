@@ -11,6 +11,7 @@ from application.shadow import expected_state_from
 from domain.alarm_state_machine import AlarmStateMachine
 from domain.models import (
     AlarmState,
+    ControlType,
     DeviceContext,
     EnvironmentStandard,
     MonitorSample,
@@ -61,6 +62,7 @@ class MonitorApplicationServiceTests(unittest.TestCase):
             effective_to=None,
             source_document="SOP-001",
             clause="5.2.3",
+            control_type=ControlType.ALL_DAY,
         )
         connection = sqlite3.connect(":memory:")
         recorder = SQLiteAutomationRunRepository(connection)

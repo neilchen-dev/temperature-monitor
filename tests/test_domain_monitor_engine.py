@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from domain.models import (
@@ -32,6 +33,7 @@ class MonitorEngineTests(unittest.TestCase):
             effective_to=None,
             source_document="test-standard",
             clause="5.2.3",
+            control_type=ControlType.ALL_DAY,
         )
         self.sample_time = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
 
@@ -88,6 +90,7 @@ class MonitorEngineTests(unittest.TestCase):
             effective_to=None,
             source_document="test-standard",
             clause=None,
+            control_type=ControlType.ALL_DAY,
         )
         result = evaluate_monitor_state(
             device=self.device,
@@ -105,7 +108,7 @@ class MonitorEngineTests(unittest.TestCase):
                 control_type=ControlType.MONITOR_ONLY,
             ),
             sample=MonitorSample("TH-01", self.sample_time, 24.0, 50.0),
-            standard=self.standard,
+            standard=replace(self.standard, control_type=None),
         )
         self.assertEqual(result.applicability, ApplicabilityStatus.NOT_APPLICABLE)
         self.assertEqual(result.overall_status, OverallStatus.UNKNOWN)
@@ -120,7 +123,7 @@ class MonitorEngineTests(unittest.TestCase):
                 control_type=ControlType.OPERATION_PERIOD,
             ),
             sample=MonitorSample("TH-03", self.sample_time, 24.0, 50.0),
-            standard=self.standard,
+            standard=replace(self.standard, control_type=None),
             operation_state=OperationState(
                 area_id="仓库",
                 state=OperationStatus.IDLE,
