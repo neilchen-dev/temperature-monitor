@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import threading
 import time
@@ -24,13 +23,6 @@ _record_id_lock = threading.Lock()
 _RECORD_ID_CACHE_TTL_SECONDS = 3600
 _RECORD_NOT_FOUND_TTL_SECONDS = 300
 _TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
-_CLIENT_TOKEN_LENGTH = 40
-
-
-class _NormalizedClientToken(str):
-    """Marker type that prevents hashing a token twice across adapter layers."""
-
-
 def _resource_lock(key: str) -> threading.RLock:
     with _resource_locks_guard:
         lock = _resource_locks.get(key)
@@ -50,24 +42,18 @@ def _validate_bitable_config(*, require_default_table: bool = False) -> None:
 def normalize_client_token(client_token: Any | None) -> str:
     """Return one stable, Feishu-compatible idempotency token.
 
-    Every caller-owned business key is represented by the first 40 lowercase
-    hexadecimal characters of its SHA-256 digest.  This is deterministic and
-    stays below Bitable's 50-character limit regardless of the input's length,
-    language, whitespace, or punctuation.
-
-    The marker subtype keeps normalization idempotent inside the write stack:
-    domain adapters normalize before ``writer.create`` and the HTTP boundary
-    normalizes again as a final safeguard, without changing the resulting
-    token.  A missing key receives a fresh UUID before hashing because it does
-    not represent a retryable business identity.
+    Caller-owned business keys map deterministically to UUIDv5 values.  A UUID
+    that has already been normalized remains unchanged when it crosses another
+    adapter layer.  A missing key receives a fresh UUIDv4 because it does not
+    represent a retryable business identity.
     """
-    if isinstance(client_token, _NormalizedClientToken):
-        return client_token
     token = "" if client_token is None else str(client_token)
     if not token:
-        token = str(uuid.uuid4())
-    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    return _NormalizedClientToken(digest[:_CLIENT_TOKEN_LENGTH])
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(token))
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, token))
 
 
 def normalize_field_value(value: Any) -> str:

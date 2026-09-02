@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import hashlib
-import re
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -154,14 +153,22 @@ class RecordDiscoveryTests(unittest.TestCase):
                 token = feishu.normalize_client_token(business_key)
                 self.assertEqual(
                     token,
-                    hashlib.sha256(business_key.encode("utf-8")).hexdigest()[:40],
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, business_key)),
                 )
-                self.assertRegex(token, r"^[0-9a-f]{40}$")
-                self.assertLessEqual(len(token), 50)
+                self.assertEqual(str(uuid.UUID(token)), token)
+                self.assertEqual(len(token), 36)
                 self.assertEqual(token, feishu.normalize_client_token(business_key))
                 tokens.append(token)
 
         self.assertEqual(len(tokens), len(set(tokens)))
+
+    def test_normalized_uuid_is_unchanged_and_missing_key_gets_uuid4(self) -> None:
+        normalized = "12345678-1234-5678-9234-567812345678"
+
+        self.assertEqual(feishu.normalize_client_token(normalized), normalized)
+        generated = feishu.normalize_client_token(None)
+        self.assertEqual(str(uuid.UUID(generated)), generated)
+        self.assertEqual(uuid.UUID(generated).version, 4)
 
     def test_create_never_sends_raw_business_key_as_client_token(self) -> None:
         response = Mock(status_code=200)
@@ -185,7 +192,7 @@ class RecordDiscoveryTests(unittest.TestCase):
         ]
         self.assertEqual(tokens[0], tokens[1])
         self.assertNotEqual(tokens[0], business_key)
-        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", tokens[0]))
+        self.assertEqual(str(uuid.UUID(tokens[0])), tokens[0])
 
     def test_reads_latest_history_timestamp_with_descending_sort(self) -> None:
         response = Mock(status_code=200)

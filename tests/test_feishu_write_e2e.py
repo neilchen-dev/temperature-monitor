@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 import sqlite3
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -468,7 +468,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(len(event_tokens), 3)
         self.assertEqual(len(set(event_tokens)), 1)
-        self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", event_tokens[0] or ""))
+        self.assertEqual(str(uuid.UUID(event_tokens[0] or "")), event_tokens[0])
 
         # The next ALARM sample is a normal UPDATE of the recovered event;
         # repeated retries remain idempotent and never create a second row.
