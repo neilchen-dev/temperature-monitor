@@ -74,6 +74,11 @@ def _load_hassio_options() -> None:
         "runtime_shutdown_timeout_seconds": "RUNTIME_SHUTDOWN_TIMEOUT_SECONDS",
         "automation_run_retention_days": "AUTOMATION_RUN_RETENTION_DAYS",
         "device_model_stale_seconds": "DEVICE_MODEL_STALE_SECONDS",
+        "temperature_dedupe_window_ms": "TEMPERATURE_DEDUPE_WINDOW_MS",
+        "feishu_projection_max_retries": "FEISHU_PROJECTION_MAX_RETRIES",
+        "feishu_projection_backoff_seconds": "FEISHU_PROJECTION_BACKOFF_SECONDS",
+        "feishu_projection_inline_suppress_seconds": "FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS",
+        "feishu_projection_attempt_timeout_seconds": "FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -352,6 +357,40 @@ AUTOMATION_RUN_RETENTION_DAYS = max(
 # 时间没有成功落库时，/api/system/status 标记 degraded。
 DEVICE_MODEL_STALE_SECONDS = max(
     60, _get_int("DEVICE_MODEL_STALE_SECONDS", 300)
+)
+# ---- /temperature 可靠性（飞书投影解耦）----
+# 同一 (device, source) 在该时间窗内提交内容完全相同（温度/湿度/在线状态）
+# 的重复上报视为同一业务样本（HTTP retry / HA 重复触发），不重复落库、
+# 不重复触发 Shadow。HA payload 无源端时间戳，只能用「内容 + 窗口」做
+# 请求级去重；0 表示关闭。真实 HA 上报由状态变化触发，两个内容完全相同
+# 且间隔数秒的请求几乎必然是重试而非两次真实采样。
+TEMPERATURE_DEDUPE_WINDOW_MS = max(
+    0, _get_int("TEMPERATURE_DEDUPE_WINDOW_MS", 5000)
+)
+# 飞书投影重试（scheduler 任务 FEISHU_PROJECTION）：
+# - 最多重试次数（超过后状态置 failed，可被巡检发现；下一次 /temperature
+#   在线投影成功即自动恢复）
+# - 基础退避秒数，指数增长：30s, 60s, 120s, ...，上限 600s
+# - 内联抑制窗口（秒）：投影刚失败后，短时间内到达的新上报不再同步等待
+#   飞书（避免 Waitress 线程被连续失败拖满），直接返回 deferred
+FEISHU_PROJECTION_MAX_RETRIES = max(
+    1, _get_int("FEISHU_PROJECTION_MAX_RETRIES", 5)
+)
+FEISHU_PROJECTION_BACKOFF_SECONDS = max(
+    1.0, _get_float("FEISHU_PROJECTION_BACKOFF_SECONDS", 30.0)
+)
+FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = max(
+    0.0, _get_float("FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS", 30.0)
+)
+# 单个 FEISHU_PROJECTION 任务内每次网络尝试的硬上限（秒）。
+# Scheduler 是单线程串行执行：一个 projection handler 禁止内部再做
+# 多轮长 retry loop（否则 11 台设备故障时 SHADOW_COMPARE / SYNC 会被
+# 饿死）。有界模式下每次飞书调用恰好 1 次请求、该超时封顶；handler
+# 最坏 = token + resolve + update 共 3 次有界调用（token 缓存命中时
+# ≤ 2 次），失败立即返回，由 automation_tasks + exponential backoff
+# 调度下一次尝试。普通 /temperature 内联路径不受影响（仍用完整重试）。
+FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS = max(
+    1.0, _get_float("FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS", 5.0)
 )
 # Active 切换三开关确认：AUTOMATION_MODE=active + FEISHU_WRITE_ENABLED=true
 # + ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足

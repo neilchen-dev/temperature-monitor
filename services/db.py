@@ -113,12 +113,32 @@ CREATE TABLE IF NOT EXISTS device_thresholds (
     humidity_max REAL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sample_projection_state (
+    device TEXT PRIMARY KEY,
+    last_sample_time_ms INTEGER,
+    last_projected_sample_time_ms INTEGER,
+    last_dispatched_sample_time_ms INTEGER,
+    projection_status TEXT NOT NULL DEFAULT 'ok',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TEXT,
+    projected_at TEXT,
+    updated_at TEXT NOT NULL
+);
 """
 
 # 加性列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列。
 # 旧版本建的库（例如 device_events 缺 source 列）在连接初始化时逐列补齐。
 _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("device_events", "source", "ALTER TABLE device_events ADD COLUMN source TEXT"),
+    # crash-consistency：投影水位与派发水位分离（旧部署的表增量补列）
+    (
+        "sample_projection_state",
+        "last_projected_sample_time_ms",
+        "ALTER TABLE sample_projection_state"
+        " ADD COLUMN last_projected_sample_time_ms INTEGER",
+    ),
 )
 
 
@@ -526,11 +546,15 @@ def save_device_sample(
     temperature: Any,
     humidity: Any,
     status: str,
-) -> None:
-    """Insert one unified sample; (device, source, ts) makes retries idempotent."""
+) -> bool:
+    """Insert one unified sample; (device, source, ts) makes retries idempotent.
+
+    Returns True when the row was committed (or the mirror is disabled and
+    callers must not treat the sample as durably persisted).
+    """
     connection = _get_connection()
     if connection is None:
-        return
+        return False
 
     try:
         with _lock:
@@ -551,10 +575,12 @@ def save_device_sample(
                 ),
             )
             connection.commit()
+        return True
     except sqlite3.Error:
         global _write_failures
         _write_failures += 1
         logger.exception("SQLite 写入统一设备样本失败 | device=%s", device)
+        return False
 
 
 def fetch_previous_device_sample(
@@ -827,3 +853,339 @@ def fetch_device_thresholds(device: str | None = None) -> list[dict[str, Any]]:
     except sqlite3.Error:
         logger.exception("SQLite 查询设备阈值失败 | device=%s", device)
         return []
+
+
+# ---- 飞书投影状态（/temperature 可靠性解耦）----
+# sample_projection_state 记录每个设备「本地已持久化样本」与「飞书投影 /
+# Shadow 派发」的相对进度。它不是业务数据的镜像，而是 projection 重试的
+# durable 状态机：服务重启后由 scheduler 扫描 pending 设备重建重试任务。
+
+_PROJECTION_STATE_COLUMNS = (
+    " device, last_sample_time_ms, last_projected_sample_time_ms,"
+    " last_dispatched_sample_time_ms, projection_status, retry_count,"
+    " last_error, last_attempt_at, projected_at, updated_at"
+)
+
+
+def is_mirror_available() -> bool:
+    """True when the local SQLite mirror is usable (watermark bookkeeping)."""
+    return _get_connection() is not None
+
+
+def fetch_projection_state(device: str) -> dict[str, Any] | None:
+    """One device's projection state row, or None when never tracked."""
+    connection = _get_connection()
+    if connection is None:
+        return None
+
+    try:
+        with _lock:
+            row = connection.execute(
+                f"SELECT{_PROJECTION_STATE_COLUMNS} FROM sample_projection_state"
+                " WHERE device = ?",
+                (device,),
+            ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        logger.exception("SQLite 查询投影状态失败 | device=%s", device)
+        return None
+
+
+def fetch_projection_states(
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """All projection states, optionally filtered by status (ok/pending/failed)."""
+    connection = _get_connection()
+    if connection is None:
+        return []
+
+    query = f"SELECT{_PROJECTION_STATE_COLUMNS} FROM sample_projection_state"
+    params: list[Any] = []
+    if status:
+        query += " WHERE projection_status = ?"
+        params.append(status)
+    query += " ORDER BY device"
+
+    try:
+        with _lock:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询投影状态列表失败")
+        return []
+
+
+def save_projection_state(state: dict[str, Any]) -> bool:
+    """Upsert one device's projection state (full-row replace)."""
+    connection = _get_connection()
+    if connection is None:
+        return False
+
+    try:
+        with _lock:
+            connection.execute(
+                "INSERT OR REPLACE INTO sample_projection_state ("
+                " device, last_sample_time_ms, last_projected_sample_time_ms,"
+                " last_dispatched_sample_time_ms, projection_status,"
+                " retry_count, last_error, last_attempt_at, projected_at,"
+                " updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    state["device"],
+                    state.get("last_sample_time_ms"),
+                    state.get("last_projected_sample_time_ms"),
+                    state.get("last_dispatched_sample_time_ms"),
+                    state.get("projection_status") or "ok",
+                    int(state.get("retry_count") or 0),
+                    state.get("last_error"),
+                    state.get("last_attempt_at"),
+                    state.get("projected_at"),
+                    _now_text(),
+                ),
+            )
+            connection.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception(
+            "SQLite 写入投影状态失败 | device=%s", state.get("device")
+        )
+        return False
+
+
+def note_projection_sample(device: str, sample_time_ms: int) -> bool:
+    """Advance ``last_sample_time_ms`` only (monotonic, targeted UPDATE).
+
+    Never touches projection_status/retry_count: a concurrent failure
+    marker from another thread must not be clobbered by a full-row
+    replace. Creates the default row on first sight.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return False
+
+    sample_time_ms = int(sample_time_ms)
+    try:
+        with _lock:
+            cursor = connection.execute(
+                "UPDATE sample_projection_state SET last_sample_time_ms = ?,"
+                " updated_at = ? WHERE device = ?"
+                " AND (last_sample_time_ms IS NULL OR last_sample_time_ms < ?)",
+                (sample_time_ms, _now_text(), device, sample_time_ms),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM sample_projection_state WHERE device = ?",
+                    (device,),
+                ).fetchone()
+                if exists is None:
+                    connection.execute(
+                        "INSERT INTO sample_projection_state ("
+                        " device, last_sample_time_ms, projection_status,"
+                        " retry_count, updated_at"
+                        ") VALUES (?, ?, 'ok', 0, ?)",
+                        (device, sample_time_ms, _now_text()),
+                    )
+            connection.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception("SQLite 更新投影样本时间失败 | device=%s", device)
+        return False
+
+
+def mark_projection_projected(device: str, sample_time_ms: int) -> bool:
+    """Advance ``last_projected_sample_time_ms`` only (monotonic, targeted).
+
+    Called immediately after a successful Feishu write, *before* dispatch —
+    this is the crash-consistency watermark: if the process dies between
+    the Feishu write and the Runtime dispatch, recovery can detect
+    ``last_projected > last_dispatched`` and finish the dispatch.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return False
+
+    sample_time_ms = int(sample_time_ms)
+    try:
+        with _lock:
+            cursor = connection.execute(
+                "UPDATE sample_projection_state"
+                " SET last_projected_sample_time_ms = ?, updated_at = ?"
+                " WHERE device = ?"
+                " AND (last_projected_sample_time_ms IS NULL"
+                "      OR last_projected_sample_time_ms < ?)",
+                (sample_time_ms, _now_text(), device, sample_time_ms),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM sample_projection_state WHERE device = ?",
+                    (device,),
+                ).fetchone()
+                if exists is None:
+                    connection.execute(
+                        "INSERT INTO sample_projection_state ("
+                        " device, last_projected_sample_time_ms,"
+                        " projection_status, retry_count, updated_at"
+                        ") VALUES (?, ?, 'ok', 0, ?)",
+                        (device, sample_time_ms, _now_text()),
+                    )
+            connection.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception("SQLite 更新投影成功水位失败 | device=%s", device)
+        return False
+
+
+def fetch_undispatched_projection_states() -> list[dict[str, Any]]:
+    """Devices with a projected sample that never reached the Runtime.
+
+    Recovery invariant: ``last_projected_sample_time_ms >
+    last_dispatched_sample_time_ms`` ⇒ unfinished dispatch work, regardless
+    of ``projection_status`` (a crash between the Feishu write success and
+    the dispatch watermark leaves status 'ok' with the gap).
+    """
+    connection = _get_connection()
+    if connection is None:
+        return []
+
+    try:
+        with _lock:
+            rows = connection.execute(
+                f"SELECT{_PROJECTION_STATE_COLUMNS} FROM sample_projection_state"
+                " WHERE last_projected_sample_time_ms IS NOT NULL"
+                " AND (last_dispatched_sample_time_ms IS NULL"
+                "      OR last_dispatched_sample_time_ms"
+                "          < last_projected_sample_time_ms)"
+                " ORDER BY device"
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询未派发投影状态失败")
+        return []
+
+
+def fetch_device_sample_at(
+    device: str, source: str, sample_time_ms: int
+) -> dict[str, Any] | None:
+    """The exact persisted sample row for (device, source, sample_time_ms).
+
+    Raises sqlite3.Error on storage failure so callers can distinguish
+    "row genuinely missing" (None) from "cannot read" (exception) —
+    recovery must never skip a dispatch because of a transient read error.
+    """
+    connection = _get_connection()
+    if connection is None:
+        raise sqlite3.OperationalError("SQLite mirror is not available")
+
+    with _lock:
+        row = connection.execute(
+            "SELECT device, source, sample_time_ms, sample_time_iso,"
+            " temperature, humidity, status, created_at FROM device_samples"
+            " WHERE device = ? AND source = ? AND sample_time_ms = ?",
+            (device, source, int(sample_time_ms)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_projection_dispatched(device: str, sample_time_ms: int) -> bool:
+    """Advance ``last_dispatched_sample_time_ms`` only (monotonic, targeted).
+
+    Returns False when the sample was already dispatched or superseded.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return False
+
+    sample_time_ms = int(sample_time_ms)
+    try:
+        with _lock:
+            cursor = connection.execute(
+                "UPDATE sample_projection_state"
+                " SET last_dispatched_sample_time_ms = ?, updated_at = ?"
+                " WHERE device = ?"
+                " AND (last_dispatched_sample_time_ms IS NULL"
+                "      OR last_dispatched_sample_time_ms < ?)",
+                (sample_time_ms, _now_text(), device, sample_time_ms),
+            )
+            advanced = cursor.rowcount > 0
+            if not advanced:
+                exists = connection.execute(
+                    "SELECT 1 FROM sample_projection_state WHERE device = ?",
+                    (device,),
+                ).fetchone()
+                if exists is None:
+                    connection.execute(
+                        "INSERT INTO sample_projection_state ("
+                        " device, last_dispatched_sample_time_ms,"
+                        " projection_status, retry_count, updated_at"
+                        ") VALUES (?, ?, 'ok', 0, ?)",
+                        (device, sample_time_ms, _now_text()),
+                    )
+                    advanced = True
+            connection.commit()
+        return advanced
+    except sqlite3.Error:
+        logger.exception("SQLite 更新投影派发时间失败 | device=%s", device)
+        return False
+
+
+def update_projection_status(
+    device: str,
+    *,
+    projection_status: str,
+    retry_count: int,
+    last_error: str | None,
+    last_attempt_at: str | None,
+    projected_at: str | None,
+) -> bool:
+    """Targeted status UPDATE for the projection state machine.
+
+    Never touches ``last_sample_time_ms`` / ``last_dispatched_sample_time_ms``
+    (owned by the monotonic helpers above), so a concurrent dispatch/sample
+    watermark advance can never be clobbered by a status transition.
+    """
+    connection = _get_connection()
+    if connection is None:
+        return False
+
+    try:
+        with _lock:
+            cursor = connection.execute(
+                "UPDATE sample_projection_state SET projection_status = ?,"
+                " retry_count = ?, last_error = ?, last_attempt_at = ?,"
+                " projected_at = ?, updated_at = ? WHERE device = ?",
+                (
+                    projection_status,
+                    int(retry_count),
+                    last_error,
+                    last_attempt_at,
+                    projected_at,
+                    _now_text(),
+                    device,
+                ),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM sample_projection_state WHERE device = ?",
+                    (device,),
+                ).fetchone()
+                if exists is None:
+                    connection.execute(
+                        "INSERT INTO sample_projection_state ("
+                        " device, projection_status, retry_count, last_error,"
+                        " last_attempt_at, projected_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            device,
+                            projection_status,
+                            int(retry_count),
+                            last_error,
+                            last_attempt_at,
+                            projected_at,
+                            _now_text(),
+                        ),
+                    )
+            connection.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception("SQLite 更新投影状态失败 | device=%s", device)
+        return False

@@ -13,7 +13,7 @@ from services.token import clear_token, get_token
 
 
 logger = logging.getLogger("temperature_monitor")
-# 串行化粒度是“资源”（某张表或某条记录），而不是全局：不同设备写不同
+# 串行化粒度是"资源"（某张表或某条记录），而不是全局：不同设备写不同
 # record、不同历史表之间可以并行，慢请求的重试退避只阻塞同一资源。
 _resource_locks: dict[str, threading.RLock] = {}
 _resource_locks_guard = threading.Lock()
@@ -75,15 +75,27 @@ def _request_bitable_json(
     operation: str,
     json_data: dict[str, Any] | None = None,
     lock_key: str,
+    max_attempts: int | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
-    """Call Bitable serialized per resource; retry token, rate-limit, conflicts."""
-    max_attempts = max(1, config.REQUEST_RETRY_TIMES)
+    """Call Bitable serialized per resource; retry token, rate-limit, conflicts.
+
+    ``max_attempts``/``timeout`` bound the whole operation (token fetch
+    included) to a single short attempt — used by scheduler
+    FEISHU_PROJECTION handlers so one task can never run a long internal
+    retry loop on the single-threaded scheduler. Default (None) keeps the
+    legacy full-retry behaviour for the inline /temperature path.
+    """
+    attempts_limit = (
+        max_attempts if max_attempts is not None
+        else max(1, config.REQUEST_RETRY_TIMES)
+    )
     attempt = 1
     token_refreshed = False
 
     with _resource_lock(lock_key):
-        while attempt <= max_attempts:
-            token = get_token()
+        while attempt <= attempts_limit:
+            token = get_token(attempts=max_attempts, timeout=timeout)
             headers = {"Authorization": f"Bearer {token}"}
             if json_data is not None:
                 headers["Content-Type"] = "application/json; charset=utf-8"
@@ -93,6 +105,8 @@ def _request_bitable_json(
                 url,
                 headers=headers,
                 json_data=json_data,
+                attempts=max_attempts,
+                timeout=timeout,
             )
             try:
                 result = response.json()
@@ -104,7 +118,14 @@ def _request_bitable_json(
                 }
 
             code = int(result.get("code", -1))
-            if code == 99991663 and not token_refreshed:
+            if (
+                code == 99991663
+                and not token_refreshed
+                and (max_attempts is None or attempt < attempts_limit)
+            ):
+                # 有界模式（max_attempts=1）下不做 token 刷新重试：刷新
+                # 会额外增加一次网络调用，破坏单次 handler 的耗时可预算
+                # 性；token 失效直接按失败返回，交给 backoff 调度下一次。
                 logger.warning("Token 无效，清空缓存后重试 | operation=%s", operation)
                 clear_token()
                 token_refreshed = True
@@ -115,7 +136,7 @@ def _request_bitable_json(
                 or response.status_code >= 500
                 or code in _TRANSIENT_BITABLE_CODES
             )
-            if transient and attempt < max_attempts:
+            if transient and attempt < attempts_limit:
                 delay = config.REQUEST_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 logger.warning(
                     "飞书业务暂时异常，准备重试 | operation=%s | HTTP=%s | "
@@ -124,7 +145,7 @@ def _request_bitable_json(
                     response.status_code,
                     code,
                     attempt,
-                    max_attempts,
+                    attempts_limit,
                 )
                 time.sleep(delay)
                 attempt += 1
@@ -188,8 +209,18 @@ def list_bitable_records(
             raise RuntimeError("飞书 Base 记录分页响应缺少 page_token")
 
 
-def resolve_record_id(device: str, configured_record_id: str | None = None) -> str:
-    """Return a mapped record ID or discover it from the Bitable device field."""
+def resolve_record_id(
+    device: str,
+    configured_record_id: str | None = None,
+    *,
+    attempt_timeout: float | None = None,
+) -> str:
+    """Return a mapped record ID or discover it from the Bitable device field.
+
+    ``attempt_timeout`` bounds each network call to a single short attempt
+    (scheduler FEISHU_PROJECTION handlers only); the inline /temperature
+    path keeps the full retry behaviour.
+    """
     if configured_record_id:
         return configured_record_id
 
@@ -222,6 +253,8 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
                 f"{base_url}?{urlencode(query)}",
                 operation="查询记录",
                 lock_key=f"table:{config.TABLE_ID}",
+                max_attempts=1 if attempt_timeout is not None else None,
+                timeout=attempt_timeout,
             ),
             "查询记录",
         )
@@ -271,11 +304,17 @@ def resolve_record_id(device: str, configured_record_id: str | None = None) -> s
             raise RuntimeError("飞书记录分页响应缺少 page_token")
 
 
-def update_feishu_fields(record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+def update_feishu_fields(
+    record_id: str,
+    fields: dict[str, Any],
+    *,
+    attempt_timeout: float | None = None,
+) -> dict[str, Any]:
     return update_bitable_record(
         config.TABLE_ID,
         record_id,
         fields,
+        attempt_timeout=attempt_timeout,
     )
 
 
@@ -314,8 +353,14 @@ def update_bitable_record(
     table_id: str,
     record_id: str,
     fields: dict[str, Any],
+    *,
+    attempt_timeout: float | None = None,
 ) -> dict[str, Any]:
-    """Update one Base record in an explicitly configured table."""
+    """Update one Base record in an explicitly configured table.
+
+    ``attempt_timeout`` bounds the update to a single short network attempt
+    (scheduler FEISHU_PROJECTION handlers only).
+    """
     _validate_bitable_config()
     normalized_table_id = str(table_id).strip()
     normalized_record_id = str(record_id).strip()
@@ -335,6 +380,8 @@ def update_bitable_record(
             operation="更新 Base 记录",
             json_data={"fields": dict(fields)},
             lock_key=f"record:{normalized_record_id}",
+            max_attempts=1 if attempt_timeout is not None else None,
+            timeout=attempt_timeout,
         ),
         "更新 Base 记录",
     )

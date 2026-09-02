@@ -24,7 +24,16 @@ def is_token_cached() -> bool:
     return bool(_token_cache["token"])
 
 
-def get_token(force_refresh: bool = False) -> str:
+def get_token(
+    force_refresh: bool = False,
+    *,
+    attempts: int | None = None,
+    timeout: float | None = None,
+) -> str:
+    # attempts/timeout 透传给 request_with_retry：scheduler 的
+    # FEISHU_PROJECTION 有界尝试（attempts=1）必须覆盖 token 获取，
+    # 否则 token 冷缓存时一次 get_token 就可能占用 ~REQUEST_RETRY_TIMES
+    # × timeout 的调度线程时间。
     now = time.time()
 
     with _token_lock:
@@ -42,6 +51,8 @@ def get_token(force_refresh: bool = False) -> str:
             "POST",
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
             json_data={"app_id": config.APP_ID, "app_secret": config.APP_SECRET},
+            attempts=attempts,
+            timeout=timeout,
         )
 
         try:

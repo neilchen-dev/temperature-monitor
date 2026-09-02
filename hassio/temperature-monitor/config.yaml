@@ -41,6 +41,11 @@ options:
   shadow_standard_sync_seconds: 300
   shadow_feishu_delay_seconds: 60
   runtime_shutdown_timeout_seconds: 15
+  temperature_dedupe_window_ms: 5000
+  feishu_projection_max_retries: 5
+  feishu_projection_backoff_seconds: 30
+  feishu_projection_inline_suppress_seconds: 30
+  feishu_projection_attempt_timeout_seconds: 5
   history_api_key: ""
   temperature_api_key: ""
   history_devices: ""
@@ -94,6 +99,11 @@ schema:
   shadow_standard_sync_seconds: int(30,86400)
   shadow_feishu_delay_seconds: int(0,3600)
   runtime_shutdown_timeout_seconds: int(1,300)
+  temperature_dedupe_window_ms: int(0,3600000)
+  feishu_projection_max_retries: int(1,20)
+  feishu_projection_backoff_seconds: int(1,3600)
+  feishu_projection_inline_suppress_seconds: int(0,3600)
+  feishu_projection_attempt_timeout_seconds: int(1,60)
   history_api_key: password
   temperature_api_key: password
   history_devices: str

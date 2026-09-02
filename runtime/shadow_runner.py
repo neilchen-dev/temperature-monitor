@@ -240,6 +240,7 @@ class ShadowRuntime:
                         # run_once marks it terminal before this point.  Only
                         # then may the next recurring cycle be created.
                         self._ensure_periodic_tasks(now=self.now_provider())
+                        self._ensure_projection_tasks(now=self.now_provider())
                 if stop_event.wait(self.scheduler.poll_interval):
                     return
         finally:
@@ -467,6 +468,20 @@ class ShadowRuntime:
     def handle_verify_recovery(self, task: Any) -> None:
         self._handle_verification_task(task)
 
+    def handle_feishu_projection(self, task: Any) -> None:
+        """Retry a deferred Feishu projection for one device.
+
+        Business logic lives in ``services.projection``: project the latest
+        persisted sample, then dispatch it to the Shadow pipeline exactly
+        once. Raises on failure so the task is recorded FAILED (visible
+        evidence) while the pending state drives the next backoff retry.
+        """
+        from services import projection
+
+        projection.retry_device_projection(
+            str(task.entity_id), now=self.now_provider()
+        )
+
     def handle_shadow_compare(self, task: Any) -> None:
         expected = _expected_from_payload(task.payload["expected"])
         try:
@@ -632,6 +647,23 @@ class ShadowRuntime:
             "SYNC_OPERATIONS",
             now if immediate else now + timedelta(seconds=self.operation_sync_interval),
         )
+
+    def _ensure_projection_tasks(self, *, now: datetime) -> None:
+        """Per-tick projection maintenance: crash recovery + retry scheduling.
+
+        1. ``recover_pending_dispatches`` finishes Shadow dispatches that a
+           crash left unfinished (projected > dispatched watermark).
+        2. ``ensure_projection_tasks`` (re)creates durable, staggered
+           FEISHU_PROJECTION retry tasks for pending devices.
+
+        Business logic lives in ``services.projection`` (mirror-DB state
+        machine); this keeps the runtime a thin orchestrator. Both are
+        best-effort: failures are logged and retried next tick.
+        """
+        from services import projection
+
+        projection.recover_pending_dispatches(now=now)
+        projection.ensure_projection_tasks(self.task_repository, now=now)
 
 
 def _iso(value: datetime | None) -> str | None:
