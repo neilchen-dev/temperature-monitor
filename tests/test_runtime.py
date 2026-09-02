@@ -246,6 +246,51 @@ class RuntimeTests(unittest.TestCase):
         finally:
             components.stop()
 
+    def test_global_sync_tasks_recur_with_one_unfinished_task_each(self) -> None:
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        components = build_runtime(
+            connection=sqlite3.connect(":memory:", check_same_thread=False),
+            record_source=_ReadOnlySource(),
+            now_provider=lambda: now,
+        )
+        try:
+            components.runtime._ensure_periodic_tasks(now=now, immediate=True)
+            report = components.scheduler.run_once(now=now)
+            self.assertEqual(report.succeeded, 2)
+
+            components.runtime._ensure_periodic_tasks(now=now)
+            rows = components.connection.execute(
+                """
+                SELECT task_type, entity_id, status, dedupe_key, COUNT(*)
+                FROM automation_tasks
+                WHERE status IN ('PENDING', 'RUNNING')
+                  AND task_type IN ('SYNC_STANDARD', 'SYNC_OPERATIONS')
+                GROUP BY task_type, entity_id, status, dedupe_key
+                ORDER BY task_type
+                """
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [
+                    (
+                        "SYNC_OPERATIONS",
+                        "operations",
+                        "PENDING",
+                        "RUNTIME:SYNC_OPERATIONS:operations",
+                        1,
+                    ),
+                    (
+                        "SYNC_STANDARD",
+                        "standards",
+                        "PENDING",
+                        "RUNTIME:SYNC_STANDARD:standards",
+                        1,
+                    ),
+                ],
+            )
+        finally:
+            components.stop()
+
     def test_scheduler_executes_compare_and_records_shadow_run(self) -> None:
         now = datetime(2026, 8, 31, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         source = _ReadOnlySource()

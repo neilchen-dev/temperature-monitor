@@ -171,8 +171,7 @@ class ShadowRuntime:
             device_service.register_sample_listener(self.handle_sample)
             now = self.now_provider()
             with self._execution_lock:
-                self._schedule_periodic("SYNC_STANDARD", now)
-                self._schedule_periodic("SYNC_OPERATIONS", now)
+                self._ensure_periodic_tasks(now=now, immediate=True)
             self._scheduler_thread = threading.Thread(
                 target=self._run_scheduler,
                 args=(self._stop_event,),
@@ -236,6 +235,11 @@ class ShadowRuntime:
                         logger.exception(
                             "Shadow scheduler tick failed; continuing next poll"
                         )
+                    finally:
+                        # Handlers return while their task is still RUNNING;
+                        # run_once marks it terminal before this point.  Only
+                        # then may the next recurring cycle be created.
+                        self._ensure_periodic_tasks(now=self.now_provider())
                 if stop_event.wait(self.scheduler.poll_interval):
                     return
         finally:
@@ -530,10 +534,6 @@ class ShadowRuntime:
                 )
             else:
                 logger.info("Shadow 标准同步完成 | enabled=%s", self._enabled_standard_count)
-            self._schedule_periodic(
-                "SYNC_STANDARD",
-                self.now_provider() + timedelta(seconds=self.standard_sync_interval),
-            )
 
     def handle_operation_sync(self, task: Any) -> None:
         with self._execution_lock:
@@ -553,11 +553,6 @@ class ShadowRuntime:
                 self._last_operation_sync_time = self.now_provider()
             except Exception:
                 logger.exception("Shadow 作业状态同步失败，保留上一版状态")
-            finally:
-                self._schedule_periodic(
-                    "SYNC_OPERATIONS",
-                    self.now_provider() + timedelta(seconds=self.operation_sync_interval),
-                )
 
     def _handle_verification_task(self, task: Any) -> None:
         with self._execution_lock:
@@ -618,14 +613,24 @@ class ShadowRuntime:
 
     def _schedule_periodic(self, task_type: str, due_at: datetime) -> None:
         entity_id = "standards" if task_type == "SYNC_STANDARD" else "operations"
-        self.task_repository.create_or_get(
+        self.task_repository.create_or_get_unfinished(
             task_type=task_type,
             entity_type="RUNTIME",
             entity_id=entity_id,
             due_at=due_at,
             payload={"runtime_worker_id": self.worker_id},
-            dedupe_key=f"RUNTIME:{task_type}:{due_at.isoformat()}",
+            dedupe_key=f"RUNTIME:{task_type}:{entity_id}",
             created_at=self.now_provider(),
+        )
+
+    def _ensure_periodic_tasks(self, *, now: datetime, immediate: bool = False) -> None:
+        self._schedule_periodic(
+            "SYNC_STANDARD",
+            now if immediate else now + timedelta(seconds=self.standard_sync_interval),
+        )
+        self._schedule_periodic(
+            "SYNC_OPERATIONS",
+            now if immediate else now + timedelta(seconds=self.operation_sync_interval),
         )
 
 

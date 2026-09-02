@@ -146,6 +146,166 @@ class SQLiteAutomationTaskRepository:
                 raise RuntimeError("created task could not be read back")
             return self._from_row(row)
 
+    def create_or_get_unfinished(
+        self,
+        *,
+        task_type: str,
+        entity_type: str,
+        entity_id: str,
+        due_at: datetime,
+        payload: Mapping[str, Any] | None = None,
+        dedupe_key: str,
+        created_at: datetime,
+    ) -> AutomationTask:
+        """Create or reuse the sole unfinished task for a business identity.
+
+        The stable ``dedupe_key`` belongs to the PENDING/RUNNING task only.
+        When a new cycle starts, a terminal row that still owns that key is
+        archived under a history-only key.  ``BEGIN IMMEDIATE`` serializes
+        separate SQLite connections, so concurrent schedulers cannot both
+        observe an empty active set and insert a task.
+
+        Legacy duplicate PENDING rows are cancelled while adopting this
+        invariant.  A RUNNING row always wins and is never modified or
+        cancelled.  An existing PENDING task may move earlier, but never later.
+        """
+        if not task_type.strip():
+            raise ValueError("task_type cannot be empty")
+        if not entity_id.strip():
+            raise ValueError("entity_id cannot be empty")
+        if not dedupe_key.strip():
+            raise ValueError("dedupe_key cannot be empty")
+
+        payload_json = json.dumps(
+            dict(payload or {}),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                active_rows = self.connection.execute(
+                    """
+                    SELECT * FROM automation_tasks
+                    WHERE task_type = ? AND entity_id = ?
+                      AND status IN (?, ?)
+                    ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                             due_at, id
+                    """,
+                    (
+                        task_type,
+                        entity_id,
+                        AutomationTaskStatus.PENDING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                    ),
+                ).fetchall()
+
+                winner = active_rows[0] if active_rows else None
+                if winner is not None:
+                    duplicate_pending_ids = [
+                        row["id"]
+                        for row in active_rows[1:]
+                        if row["status"] == AutomationTaskStatus.PENDING.value
+                    ]
+                    if duplicate_pending_ids:
+                        placeholders = ",".join("?" for _ in duplicate_pending_ids)
+                        self.connection.execute(
+                            f"""
+                            UPDATE automation_tasks
+                            SET status = ?, updated_at = ?, finished_at = ?,
+                                lease_until = NULL, worker_id = NULL
+                            WHERE id IN ({placeholders}) AND status = ?
+                            """,
+                            (
+                                AutomationTaskStatus.CANCELLED.value,
+                                _datetime_text(created_at),
+                                _datetime_text(created_at),
+                                *duplicate_pending_ids,
+                                AutomationTaskStatus.PENDING.value,
+                            ),
+                        )
+
+                    self._release_dedupe_key_from_other_row(
+                        dedupe_key=dedupe_key,
+                        winner_id=winner["id"],
+                    )
+                    if winner["dedupe_key"] != dedupe_key:
+                        self.connection.execute(
+                            "UPDATE automation_tasks SET dedupe_key = ? WHERE id = ?",
+                            (dedupe_key, winner["id"]),
+                        )
+                    if (
+                        winner["status"] == AutomationTaskStatus.PENDING.value
+                        and due_at < datetime.fromisoformat(winner["due_at"])
+                    ):
+                        self.connection.execute(
+                            """
+                            UPDATE automation_tasks
+                            SET due_at = ?, updated_at = ?
+                            WHERE id = ? AND status = ? AND due_at > ?
+                            """,
+                            (
+                                _datetime_text(due_at),
+                                _datetime_text(created_at),
+                                winner["id"],
+                                AutomationTaskStatus.PENDING.value,
+                                _datetime_text(due_at),
+                            ),
+                        )
+                    self.connection.commit()
+                    return self._require(winner["id"])
+
+                self._release_dedupe_key_from_other_row(
+                    dedupe_key=dedupe_key,
+                    winner_id=None,
+                )
+                task_id = uuid.uuid4().hex
+                self.connection.execute(
+                    """
+                    INSERT INTO automation_tasks (
+                        id, task_type, entity_type, entity_id, due_at, status,
+                        payload_json, dedupe_key, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        task_type,
+                        entity_type,
+                        entity_id,
+                        _datetime_text(due_at),
+                        AutomationTaskStatus.PENDING.value,
+                        payload_json,
+                        dedupe_key,
+                        _datetime_text(created_at),
+                        _datetime_text(created_at),
+                    ),
+                )
+                self.connection.commit()
+                return self._require(task_id)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
+    def _release_dedupe_key_from_other_row(
+        self,
+        *,
+        dedupe_key: str,
+        winner_id: str | None,
+    ) -> None:
+        owner = self.connection.execute(
+            "SELECT id FROM automation_tasks WHERE dedupe_key = ?",
+            (dedupe_key,),
+        ).fetchone()
+        if owner is None or owner["id"] == winner_id:
+            return
+        self.connection.execute(
+            "UPDATE automation_tasks SET dedupe_key = ? WHERE id = ?",
+            (f"{dedupe_key}:HISTORY:{owner['id']}", owner["id"]),
+        )
+
     def get(self, task_id: str) -> AutomationTask | None:
         row = self.connection.execute(
             "SELECT * FROM automation_tasks WHERE id = ?", (task_id,)
