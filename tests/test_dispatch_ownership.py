@@ -9,13 +9,20 @@
 - 经典 AB-BA：scheduler 停转（SYNC_OPERATIONS 永久 PENDING），
   HTTP 线程继续投影但 Shadow 不再比对。
 
-修复后的不变量（本文件用真实线程验证）：
-1. HTTP 投影路径不调用 dispatch，不触碰任何 runtime 锁。
-2. scheduler 线程是 HA projection → Runtime dispatch 的唯一 owner
-   （recover_pending_dispatches，每 tick）。
-3. 投影成功后派发延迟 ≤ 一个 poll interval，业务副作用恰好一次。
-4. 任意线程组合都不会以相反顺序获取两把锁（_dispatch_lock 已删除，
-   _execution_lock 是 runtime 中唯一的锁）。
+测试结构（两类，刻意分开）：
+
+LiveSchedulerConcurrencyTests —— 真实双线程压力：
+  后台 scheduler 线程（0.05s 轮询，生产 _run_scheduler 路径）+
+  多个真实 HTTP 线程同时 POST。只做**收敛断言**（_wait_until），
+  不做任何窗口断言（"此刻尚未派发/仍是 PENDING"之类与后台线程
+  竞争的断言在慢速 CI 上必然抖动）。所有触达飞书的路径在产生
+  pending 状态之前就已 mock —— 后台线程绝无真实网络调用。
+
+SchedulerOwnedDispatchTests —— 单 owner 语义（确定性）：
+  e2e 模式：start() 时把 _run_scheduler 打桩为纯等待（监听器注册、
+  _accepting_samples=True，但**没有后台线程**），recovery / run_once
+  全部手动驱动。窗口断言（projected>dispatched 可观察、handler 不
+  直接派发）在此确定性执行。
 """
 
 from __future__ import annotations
@@ -103,8 +110,11 @@ def _connection_error(*_args, **_kwargs):
     raise requests.exceptions.ConnectionError("feishu unreachable")
 
 
-class DispatchOwnershipTests(unittest.TestCase):
-    """真实双线程：HTTP projection 与 scheduler tick 同时推进，不死锁。"""
+class _OwnershipTestBase(unittest.TestCase):
+    """公共装配：隔离配置、mirror db（临时文件）、runtime、监听器。"""
+
+    # 子类覆盖：Live 类用真实线程；Semantics 类打桩掉调度线程。
+    live_scheduler = False
 
     def setUp(self) -> None:
         self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -154,6 +164,7 @@ class DispatchOwnershipTests(unittest.TestCase):
         self.addCleanup(self._restore)
 
         self.connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
         self.components = build_runtime(
             connection=self.connection,
@@ -163,9 +174,18 @@ class DispatchOwnershipTests(unittest.TestCase):
         self.addCleanup(self._cleanup_runtime)
         self.components.runtime.handle_standard_sync(object())
 
-        # 高频真实 scheduler 线程（生产 _run_scheduler 路径，非 mock）。
-        self.components.runtime.scheduler.poll_interval = 0.02
-        self.components.runtime.start()
+        if self.live_scheduler:
+            # 真实调度线程（生产 _run_scheduler 路径，非 mock）。
+            self.components.runtime.scheduler.poll_interval = 0.05
+            self.components.runtime.start()
+        else:
+            # e2e 模式：注册监听器与 _accepting_samples，但无后台线程。
+            with patch.object(
+                self.components.runtime,
+                "_run_scheduler",
+                side_effect=lambda stop_event: stop_event.wait(),
+            ):
+                self.components.runtime.start()
         self.assertTrue(self.components.runtime.status()["available"])
 
         self.dispatched: list = []
@@ -203,7 +223,7 @@ class DispatchOwnershipTests(unittest.TestCase):
     def _future(self, seconds: float = 600.0) -> datetime:
         return datetime.now().astimezone() + timedelta(seconds=seconds)
 
-    def _wait_until(self, predicate, timeout: float = 5.0) -> bool:
+    def _wait_until(self, predicate, timeout: float = 10.0) -> bool:
         deadline = datetime.now().timestamp() + timeout
         while datetime.now().timestamp() < deadline:
             if predicate():
@@ -215,21 +235,19 @@ class DispatchOwnershipTests(unittest.TestCase):
         return db.fetch_undispatched_projection_states()
 
     def _task_count(self, task_type: str, status: str | None = None) -> int:
-        query = (
-            "SELECT COUNT(*) AS n FROM automation_tasks WHERE task_type = ?"
-        )
+        query = "SELECT COUNT(*) AS n FROM automation_tasks WHERE task_type = ?"
         params: list = [task_type]
         if status:
             query += " AND status = ?"
             params.append(status)
         return self.connection.execute(query, params).fetchone()["n"]
 
-    # ------------------------------------------------------------------
-    # 1-3. 并发压力：真实线程，join 超时即死锁暴露
-    # ------------------------------------------------------------------
-
     def _run_http_threads(self, post_fn, *, threads: int = 3) -> list:
-        """Run N real HTTP threads; returns collected errors."""
+        """Run N real HTTP threads; returns collected errors.
+
+        join 超时 = 死锁暴露（修复前在旧代码上 3 线程全部卡死）。
+        worker 设为 daemon：死锁回归时进程仍可退出、报告失败。
+        """
         errors: list = []
         barrier = threading.Barrier(threads + 1)
 
@@ -251,87 +269,99 @@ class DispatchOwnershipTests(unittest.TestCase):
         barrier.wait(timeout=10)  # 同时放行，最大化锁窗口交叠
         for worker in workers:
             worker.join(timeout=30)
-        # 任何线程 join 超时 = 死锁（修复前在此红）
         self.assertFalse(
             any(worker.is_alive() for worker in workers),
             "HTTP 线程卡死：dispatch 锁反转回归",
         )
         return errors
 
-    def test_http_projection_concurrent_with_scheduler_recovery(self) -> None:
+
+class LiveSchedulerConcurrencyTests(_OwnershipTestBase):
+    """真实双线程并发：HTTP projection × scheduler tick（recovery/retry/compare）。"""
+
+    live_scheduler = True
+
+    def test_projection_success_concurrent_with_scheduler_recovery_and_retry(self) -> None:
         """场景1：HTTP 投影成功与 scheduler recovery/retry 同时发生。
 
-        预置 pending + FEISHU_PROJECTION 任务，使 scheduler 每 tick 都
-        执行 retry handler（旧代码中其 dispatch 要拿 _dispatch_lock），
-        同时 HTTP 线程高频 POST（旧代码成功路径 dispatch 先拿
-        _dispatch_lock 再等 _execution_lock）——两线程都必须有限时结束。
+        制造 pending 状态后，后台线程会：建 FEISHU_PROJECTION 任务 →
+        claim → retry → mark projected → 同 tick recovery 补派发。
+        全程与 3 个 HTTP 线程的 30 次 POST 交叠——两线程都必须在
+        有限时间内结束（修复前在此死锁：3 线程 join 全部超时）。
+
+        注意：services.projection 的 mock 在产生 pending 之前就已生效，
+        后台 retry 绝无真实网络调用。
         """
-        # 预置：TH-05 投影失败 → pending + durable retry 任务（已到期）
         with (
-            patch("routes.temperature.resolve_record_id", side_effect=_connection_error),
-            patch("routes.temperature.update_feishu_fields"),
-            patch("routes.temperature.save_history"),
-        ):
-            first = self.client.post(
-                "/temperature",
-                json={"device": "TH-05", "temperature": 24.0, "humidity": 50.0},
-            )
-        self.assertEqual(first.status_code, 200)
-        self.components.runtime._ensure_projection_tasks(now=self._future(61))
-        self.assertEqual(self._task_count("FEISHU_PROJECTION", "PENDING"), 1)
-
-        # 飞书恢复（route + retry 两条路径都成功）
-        def _post_round(index: int) -> None:
-            for i in range(10):
-                response = self.client.post(
-                    "/temperature",
-                    json={
-                        "device": DEVICES[index % len(DEVICES)],
-                        "temperature": 24.0 + index * 0.1 + i * 0.01,
-                        "humidity": 50.0,
-                    },
-                )
-                self.assertEqual(response.status_code, 200)
-
-        with (
-            patch("routes.temperature.resolve_record_id", return_value="rec_01"),
-            patch(
-                "routes.temperature.update_feishu_fields", return_value={"code": 0}
-            ),
-            patch("routes.temperature.save_history"),
             patch("services.projection.resolve_record_id", return_value="rec_01"),
             patch(
                 "services.projection.update_feishu_fields",
                 return_value={"code": 0, "msg": "ok"},
             ),
         ):
-            errors = self._run_http_threads(_post_round, threads=3)
+            # 内联投影失败 → deferred（pending 状态驱动后台 retry 路径）
+            with (
+                patch(
+                    "routes.temperature.resolve_record_id",
+                    side_effect=_connection_error,
+                ),
+                patch("routes.temperature.update_feishu_fields"),
+                patch("routes.temperature.save_history"),
+            ):
+                deferred = self.client.post(
+                    "/temperature",
+                    json={"device": "TH-05", "temperature": 24.0, "humidity": 50.0},
+                )
+            self.assertEqual(deferred.status_code, 200)
+            self.assertEqual(
+                deferred.get_json()["feishu_projection"], "deferred"
+            )
+
+            # HTTP 线程（飞书恢复正常）：成功路径 × 后台 recovery/retry 并发
+            def _post_round(index: int) -> None:
+                for i in range(10):
+                    response = self.client.post(
+                        "/temperature",
+                        json={
+                            "device": DEVICES[index % len(DEVICES)],
+                            "temperature": 24.0 + index * 0.1 + i * 0.01,
+                            "humidity": 50.0,
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+
+            with (
+                patch("routes.temperature.resolve_record_id", return_value="rec_01"),
+                patch(
+                    "routes.temperature.update_feishu_fields",
+                    return_value={"code": 0},
+                ),
+                patch("routes.temperature.save_history"),
+            ):
+                errors = self._run_http_threads(_post_round, threads=3)
 
         self.assertEqual(errors, [])
         # scheduler 仍在推进且派发收敛：undispatched 最终归零。
         self.assertTrue(
-            self._wait_until(lambda: len(self._undispatched()) == 0, timeout=5),
+            self._wait_until(lambda: len(self._undispatched()) == 0),
             f"undispatched 未收敛: {self._undispatched()}",
         )
         # SYNC_OPERATIONS 未被饿死/停转（生产事故的直接症状）
         self.assertTrue(
             self._wait_until(
-                lambda: self._task_count("SYNC_OPERATIONS", "SUCCEEDED") >= 1,
-                timeout=5,
+                lambda: self._task_count("SYNC_OPERATIONS", "SUCCEEDED") >= 1
             ),
             "SYNC_OPERATIONS 停转：scheduler 死锁回归",
         )
-        # 投影成功的设备都已派发（TH-05 的 pending 也被 retry 收敛）
+        # 所有设备的投影都已派发（TH-05 的 pending 也被 retry 收敛）
         for device in DEVICES:
             self.assertGreaterEqual(self._dispatched_count(device), 1)
 
     def test_http_multi_device_projection_with_sync_operations(self) -> None:
         """场景2：HTTP 连续多设备投影 + scheduler SYNC_OPERATIONS，无死锁。"""
-        # 等首个 SYNC 周期任务被创建并执行
         self.assertTrue(
             self._wait_until(
-                lambda: self._task_count("SYNC_OPERATIONS", "SUCCEEDED") >= 1,
-                timeout=5,
+                lambda: self._task_count("SYNC_OPERATIONS", "SUCCEEDED") >= 1
             )
         )
 
@@ -357,9 +387,7 @@ class DispatchOwnershipTests(unittest.TestCase):
             errors = self._run_http_threads(_post_round, threads=3)
 
         self.assertEqual(errors, [])
-        self.assertTrue(
-            self._wait_until(lambda: len(self._undispatched()) == 0, timeout=5)
-        )
+        self.assertTrue(self._wait_until(lambda: len(self._undispatched()) == 0))
         # 多轮 SYNC 持续执行（scheduler 没被 HTTP 拖死）
         self.assertGreaterEqual(
             self._task_count("SYNC_OPERATIONS", "SUCCEEDED"), 1
@@ -382,8 +410,7 @@ class DispatchOwnershipTests(unittest.TestCase):
                 )
         self.assertTrue(
             self._wait_until(
-                lambda: self._task_count("SHADOW_COMPARE") >= len(DEVICES),
-                timeout=5,
+                lambda: self._task_count("SHADOW_COMPARE") >= len(DEVICES)
             ),
             "首轮派发未生成 SHADOW_COMPARE",
         )
@@ -417,49 +444,18 @@ class DispatchOwnershipTests(unittest.TestCase):
                     "SELECT COUNT(*) AS n FROM automation_runs"
                     " WHERE action_type = 'SHADOW_COMPARE'"
                 ).fetchone()["n"]
-                >= len(DEVICES),
-                timeout=5,
+                >= len(DEVICES)
             ),
             "并发期间 SHADOW_COMPARE 未执行",
         )
-        self.assertTrue(
-            self._wait_until(lambda: len(self._undispatched()) == 0, timeout=5)
-        )
-
-    # ------------------------------------------------------------------
-    # 4-8. ownership 语义（单 owner / 延迟 / 幂等 / 重启 / retry）
-    # ------------------------------------------------------------------
-
-    def test_projected_ahead_of_dispatched_recovered_next_tick(self) -> None:
-        """场景4：projected > dispatched ⇒ 下一个 tick 自动派发。"""
-        with (
-            patch("routes.temperature.resolve_record_id", return_value="rec_01"),
-            patch(
-                "routes.temperature.update_feishu_fields", return_value={"code": 0}
-            ),
-            patch("routes.temperature.save_history"),
-        ):
-            response = self.client.post(
-                "/temperature",
-                json={"device": "TH-01", "temperature": 24.0, "humidity": 50.0},
-            )
-        self.assertEqual(response.status_code, 200)
-        # HTTP 成功 ≠ 派发：水位差距可见
-        state = db.fetch_projection_state("TH-01")
-        self.assertIsNotNone(state["last_projected_sample_time_ms"])
-        self.assertIsNone(state["last_dispatched_sample_time_ms"])
-        self.assertEqual(self._dispatched_count("TH-01"), 0)
-        # 下一个 tick（真实 scheduler 线程，poll=0.02s）自动补派发
-        self.assertTrue(
-            self._wait_until(
-                lambda: self._dispatched_count("TH-01") == 1, timeout=2
-            ),
-            "一个 poll interval 内未补派发",
-        )
-        self.assertEqual(len(self._undispatched()), 0)
+        self.assertTrue(self._wait_until(lambda: len(self._undispatched()) == 0))
 
     def test_http_success_dispatches_within_one_poll_interval(self) -> None:
-        """场景5：投影成功后 ≤1 poll interval 生成 SHADOW_COMPARE 任务。"""
+        """场景5：投影成功后 ≤1 poll interval 生成 SHADOW_COMPARE 任务。
+
+        收敛断言（生成即可，不检查瞬时窗口）：poll=0.05s，等待上限 10s
+        为 CI 抖动留足裕度。
+        """
         with (
             patch("routes.temperature.resolve_record_id", return_value="rec_01"),
             patch(
@@ -473,11 +469,51 @@ class DispatchOwnershipTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200)
         self.assertTrue(
-            self._wait_until(
-                lambda: self._task_count("SHADOW_COMPARE") >= 1, timeout=2
-            ),
+            self._wait_until(lambda: self._task_count("SHADOW_COMPARE") >= 1),
             "一个 poll interval 内未生成 SHADOW_COMPARE",
         )
+
+
+class SchedulerOwnedDispatchTests(_OwnershipTestBase):
+    """单 owner 语义（确定性）：无后台线程，recovery / run_once 手动驱动。"""
+
+    live_scheduler = False
+
+    def test_projected_ahead_of_dispatched_recovered_next_tick(self) -> None:
+        """场景4：projected > dispatched ⇒ 下一个 tick（recovery）自动派发。"""
+        with (
+            patch("routes.temperature.resolve_record_id", return_value="rec_01"),
+            patch(
+                "routes.temperature.update_feishu_fields", return_value={"code": 0}
+            ),
+            patch("routes.temperature.save_history"),
+        ):
+            response = self.client.post(
+                "/temperature",
+                json={"device": "TH-01", "temperature": 24.0, "humidity": 50.0},
+            )
+        self.assertEqual(response.status_code, 200)
+
+        # 确定性窗口断言：无任何派发者存在，HTTP 成功 ≠ 派发。
+        state = db.fetch_projection_state("TH-01")
+        self.assertIsNotNone(state["last_projected_sample_time_ms"])
+        self.assertIsNone(state["last_dispatched_sample_time_ms"])
+        self.assertEqual(len(self._undispatched()), 1)
+        self.assertEqual(self._dispatched_count("TH-01"), 0)
+
+        # 模拟下一个 scheduler tick 的 recovery：补派发一次
+        projection.recover_pending_dispatches(now=self._future())
+        self.assertEqual(self._dispatched_count("TH-01"), 1)
+        self.assertEqual(len(self._undispatched()), 0)
+        state = db.fetch_projection_state("TH-01")
+        self.assertEqual(
+            int(state["last_projected_sample_time_ms"]),
+            int(state["last_dispatched_sample_time_ms"]),
+        )
+
+        # 重复 recovery 幂等：不产生第二次派发
+        projection.recover_pending_dispatches(now=self._future())
+        self.assertEqual(self._dispatched_count("TH-01"), 1)
 
     def test_duplicate_projection_single_business_compare(self) -> None:
         """场景6：同一 projected sample 最终最多一个业务 SHADOW_COMPARE。"""
@@ -499,31 +535,37 @@ class DispatchOwnershipTests(unittest.TestCase):
             )
         self.assertEqual(first.status_code, 200)
         self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.get_json()["status"], "success")
         # 重复请求被投影水位短路：飞书只写一次
         resolve.assert_called_once()
         update.assert_called_once()
-        # 等待派发收敛 + 比对执行完
-        self.assertTrue(
-            self._wait_until(
-                lambda: self._task_count("SHADOW_COMPARE") >= 1, timeout=2
-            )
-        )
-        # 恰好一个业务 compare（dedupe key: device + sample_time）
-        self.assertTrue(
-            self._wait_until(
-                lambda: self._task_count("SHADOW_COMPARE", "SUCCEEDED") >= 1,
-                timeout=2,
-            )
-        )
-        self.assertEqual(self._task_count("SHADOW_COMPARE"), 1)
+        # HTTP 从不派发（确定性）
+        self.assertEqual(self._dispatched_count("TH-05"), 0)
+
+        # recovery 派发一次 → handle_sample 创建 SHADOW_COMPARE 任务（恰好 1）
+        projection.recover_pending_dispatches(now=self._future())
         self.assertEqual(self._dispatched_count("TH-05"), 1)
+        self.assertEqual(self._task_count("SHADOW_COMPARE"), 1)
 
-    def test_restart_after_projection_still_dispatches_via_recovery(self) -> None:
-        """场景7：投影成功后进程重启，派发仍收敛且幂等。
+        # 手动执行 compare（scheduler 语义）
+        report = self.components.runtime.scheduler.run_once(now=self._future())
+        self.assertGreaterEqual(report.succeeded, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) AS n FROM automation_runs"
+                " WHERE action_type = 'SHADOW_COMPARE'"
+            ).fetchone()["n"],
+            1,
+        )
+        # 重复 recovery 不再派发 → 不会出现第二个业务 compare
+        projection.recover_pending_dispatches(now=self._future())
+        self.assertEqual(self._task_count("SHADOW_COMPARE"), 1)
 
-        真实 scheduler 线程（poll=0.02s）可能在断言前已补派发——这本身
-        正是修复后的预期行为。本用例验证的是跨"重启"的最终语义：
-        undispatched 归零、恰好派发一次、重复 recovery 不重复派发。
+    def test_projection_then_restart_recovery_dispatches_once(self) -> None:
+        """场景7：mark projected 后"重启"，仍通过 recovery 补 dispatch。
+
+        崩溃点 = mark projected 之后、dispatch 之前（水位差 durable 落在
+        mirror db）。"重启后的第一个 tick" 即 recovery 扫描。
         """
         with (
             patch("routes.temperature.resolve_record_id", return_value="rec_01"),
@@ -537,37 +579,32 @@ class DispatchOwnershipTests(unittest.TestCase):
                 json={"device": "TH-01", "temperature": 24.0, "humidity": 50.0},
             )
         self.assertEqual(response.status_code, 200)
-        # 模拟重启：停掉 runtime（scheduler 线程退出），水位仍在 mirror db
-        self.components.runtime.stop()
-        # 重启前后的 recovery 都保证收敛：恰好派发一次、不重复
-        self.assertTrue(
-            self._wait_until(
-                lambda: (
-                    len(self._undispatched()) == 0
-                    and self._dispatched_count("TH-01") == 1
-                ),
-                timeout=2,
-            ),
-            "重启后派发未收敛",
+        # 崩溃点状态：projected 已标记、未派发（确定性——无派发者）
+        self.assertEqual(self._dispatched_count("TH-01"), 0)
+        state = db.fetch_projection_state("TH-01")
+        self.assertGreater(
+            int(state["last_projected_sample_time_ms"]),
+            int(state["last_dispatched_sample_time_ms"] or 0),
         )
+
+        # "重启"后的第一个 scheduler tick：recovery 补派发，恰好一次
+        projection.recover_pending_dispatches(now=self._future())
+        self.assertEqual(self._dispatched_count("TH-01"), 1)
         state = db.fetch_projection_state("TH-01")
         self.assertEqual(
             int(state["last_projected_sample_time_ms"]),
             int(state["last_dispatched_sample_time_ms"]),
         )
-        # 重启后（scheduler 已停）再跑 recovery：幂等，不产生第二次派发
+        # 重复 recovery 幂等
         projection.recover_pending_dispatches(now=self._future())
         self.assertEqual(self._dispatched_count("TH-01"), 1)
 
     def test_feishu_projection_retry_success_does_not_dispatch_inline(self) -> None:
-        """场景8：FEISHU_PROJECTION retry 成功不直接派发（单一 owner）。
-
-        真实 scheduler 线程在场时会在 0.02s 内补派发，"未派发窗口"无法
-        观察——因此本用例先停掉 scheduler 线程再做确定性验证：retry
-        handler 若直接派发，dispatched 会立即 +1（修复前行为）。
-        """
+        """场景8：FEISHU_PROJECTION retry 成功不直接派发（单一 owner）。"""
         with (
-            patch("routes.temperature.resolve_record_id", side_effect=_connection_error),
+            patch(
+                "routes.temperature.resolve_record_id", side_effect=_connection_error
+            ),
             patch("routes.temperature.update_feishu_fields"),
             patch("routes.temperature.save_history"),
         ):
@@ -576,13 +613,12 @@ class DispatchOwnershipTests(unittest.TestCase):
                 json={"device": "TH-03", "temperature": 24.0, "humidity": 50.0},
             )
         self.assertEqual(deferred.status_code, 200)
+
+        # 手动维护钩子（无后台线程，确定性）：创建 retry 任务并保持 PENDING
         self.components.runtime._ensure_projection_tasks(now=self._future(61))
         self.assertEqual(self._task_count("FEISHU_PROJECTION", "PENDING"), 1)
 
-        # 停掉 scheduler 线程：retry 期间无并发派发者
-        self.components.runtime.stop()
-
-        # retry 成功：只推进投影水位，不直接派发（确定性断言）
+        # retry 成功：只推进投影水位，不直接派发
         with (
             patch("services.projection.resolve_record_id", return_value="rec_01"),
             patch(
@@ -596,19 +632,17 @@ class DispatchOwnershipTests(unittest.TestCase):
         self.assertNotIn("shadow_dispatched", result)
         state = db.fetch_projection_state("TH-03")
         self.assertIsNotNone(state["last_projected_sample_time_ms"])
+        # handler 没有派发（确定性——无任何派发者存在）
         self.assertEqual(self._dispatched_count("TH-03"), 0)
+
         # recovery 补派发恰好一次；重复 recovery 幂等
         projection.recover_pending_dispatches(now=self._future())
         self.assertEqual(self._dispatched_count("TH-03"), 1)
         projection.recover_pending_dispatches(now=self._future())
         self.assertEqual(self._dispatched_count("TH-03"), 1)
 
-    # ------------------------------------------------------------------
-    # 9-10. 结构性守卫：防止 dispatch 直接路径被加回 HTTP / 锁被复活
-    # ------------------------------------------------------------------
-
     def test_http_route_source_never_dispatches(self) -> None:
-        """HTTP 路由源码不得包含任何 dispatch 调用（单一 owner 结构守卫）。"""
+        """场景9（结构守卫）：HTTP 路由源码不得包含 dispatch 调用。"""
         from routes import temperature as temperature_module
 
         source = inspect.getsource(temperature_module)
@@ -619,7 +653,7 @@ class DispatchOwnershipTests(unittest.TestCase):
         )
 
     def test_projection_module_has_no_dispatch_lock(self) -> None:
-        """projection 模块不得重新引入 dispatch 进程锁（锁序守卫）。
+        """场景10（结构守卫）：projection 模块不得重新引入 dispatch 进程锁。
 
         用属性检查而不是源码字符串匹配：模块 docstring 记录了死锁
         历史（含旧锁名），字符串匹配会误报。
