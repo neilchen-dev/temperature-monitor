@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from typing import Any, Callable, Mapping, Protocol
 
 from domain.models import (
+    AlarmAction,
+    AlarmActionType,
+    AlarmLifecycleState,
     AlarmState,
     DeviceContext,
     MonitorResult,
@@ -19,8 +22,14 @@ from domain.models import (
 from domain.monitor_engine import MonitorEngine
 from domain.standard_resolver import StandardNotFoundError, StandardResolver
 
-from .action_executor import ActionExecution, ActionExecutor
+from .action_executor import (
+    ActionExecution,
+    ActionExecutionStatus,
+    ActionExecutor,
+    AutomationMode,
+)
 from .actions import ApplicationAction, ApplicationActionMapper
+from .active_scope import active_scope_allows, normalize_device_id
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -60,6 +69,19 @@ class AutomationTaskRepository(Protocol):
 
     def cancel(self, task_id: str, *, updated_at: datetime) -> AutomationTask:
         """Cancel a pending task."""
+
+    def create_or_get_unfinished(
+        self,
+        *,
+        task_type: str,
+        entity_type: str,
+        entity_id: str,
+        due_at: datetime,
+        payload: Mapping[str, Any] | None = None,
+        dedupe_key: str,
+        created_at: datetime,
+    ) -> AutomationTask:
+        """Create or reuse one unfinished task for a business identity."""
 
 
 class LocalEnvironmentEventRepository(Protocol):
@@ -170,6 +192,14 @@ class MonitorApplicationService:
             created_at=evaluated_at,
             scheduler_task_id=scheduler_task_id,
         )
+        event_reconciliation_task_ids = self._prepare_event_reconciliation_tasks(
+            transition,
+            actions,
+            sample=sample,
+            monitor_result=monitor_result,
+            operation_state=operation_state,
+            created_at=evaluated_at,
+        )
         self.alarm_state_repository.save(transition.next)
         executions = self.action_executor.execute(
             actions,
@@ -184,12 +214,244 @@ class MonitorApplicationService:
             },
             created_at=evaluated_at,
         )
+        self._finish_successful_event_reconciliation_tasks(
+            event_reconciliation_task_ids,
+            executions,
+            updated_at=evaluated_at,
+        )
         return MonitorHandlingResult(
             operation_state=operation_state,
             monitor_result=monitor_result,
             transition=transition,
             actions=actions,
             executions=executions,
+        )
+
+    def reconcile_alarm_event_task(
+        self,
+        *,
+        task: AutomationTask,
+        device: DeviceContext,
+        now: datetime,
+    ) -> tuple[ActionExecution, ...]:
+        """Retry an Active Feishu event projection from durable task data.
+
+        This intentionally does not call ``handle_sample``: a later normal or
+        unknown sample must not advance the alarm state while an older failed
+        CREATE is being reconciled.  The persisted ALARM state is the guard;
+        the task payload is the last known violating snapshot used to create
+        the same business event.
+        """
+        device_id = normalize_device_id(task.entity_id)
+        if device_id is None or device_id != normalize_device_id(device.device_id):
+            raise ValueError("alarm event reconciliation device mismatch")
+        state = self.alarm_state_repository.get(device_id)
+        if state is None or AlarmLifecycleState(state.state) is not AlarmLifecycleState.ALARM:
+            return ()
+
+        expected_start = _parse_payload_datetime(task.payload.get("violation_started_at"))
+        current_start = state.violation_started_at or state.alarm_started_at
+        if expected_start is not None and current_start is not None:
+            if _same_instant(expected_start, current_start) is False:
+                # A retry from an older alarm must not create/update the new
+                # alarm event after a fast recover/re-alarm cycle.
+                return ()
+
+        source_action = AlarmAction(
+            action_type=AlarmActionType.UPDATE_ALARM_EVENT,
+            device_id=device_id,
+            alarm_id=state.active_alarm_id,
+        )
+        transition = StateTransition(
+            previous=state,
+            next=state,
+            actions=(source_action,),
+            reason="alarm_event_reconciliation",
+        )
+        actions = self.action_mapper.map(transition)
+        payload = task.payload
+        sample_time = str(payload.get("sample_time") or now.isoformat())
+        context = {
+            "device_id": device_id,
+            "created_at": now.isoformat(),
+            "sample_time": sample_time,
+            "sample": {
+                "device_id": device_id,
+                "sample_time": sample_time,
+                "temperature": payload.get("temperature"),
+                "humidity": payload.get("humidity"),
+                "online_status": payload.get("online_status"),
+                "data_quality": payload.get("data_quality"),
+            },
+            "python_monitor_result": {
+                "temperature_status": payload.get("temperature_status") or "",
+                "humidity_status": payload.get("humidity_status") or "",
+            },
+            "python_alarm_transition": {
+                "from": AlarmLifecycleState.ALARM.value,
+                "to": AlarmLifecycleState.ALARM.value,
+                "reason": "alarm_event_reconciliation",
+                "violation_started_at": (
+                    expected_start.isoformat() if expected_start is not None else None
+                ),
+                "alarm_started_at": payload.get("alarm_started_at"),
+                "active_alarm_id": state.active_alarm_id,
+            },
+            "operation_state": {"area_id": str(payload.get("area") or "").strip()},
+        }
+        executions = self.action_executor.execute(
+            actions,
+            context=context,
+            created_at=now,
+        )
+        failed = next(
+            (
+                execution
+                for execution in executions
+                if execution.status is ActionExecutionStatus.FAILED
+            ),
+            None,
+        )
+        if failed is not None:
+            self._schedule_event_reconciliation_retry(task, now=now)
+            raise RuntimeError(failed.error or "alarm event reconciliation failed")
+        return executions
+
+    def _prepare_event_reconciliation_tasks(
+        self,
+        transition: StateTransition,
+        actions: tuple[ApplicationAction, ...],
+        *,
+        sample: MonitorSample,
+        monitor_result: MonitorResult,
+        operation_state: OperationState,
+        created_at: datetime,
+    ) -> tuple[str, ...]:
+        """Durably arm a safety retry before invoking an external event write."""
+        if not self._active_event_writes_enabled(sample.device_id):
+            return ()
+        if self.task_repository is None:
+            return ()
+        event_actions = tuple(
+            action
+            for action in actions
+            if action.action_type
+            in {
+                AlarmActionType.CREATE_ALARM_EVENT,
+                AlarmActionType.UPDATE_ALARM_EVENT,
+            }
+        )
+        if not event_actions:
+            return ()
+        started_at = (
+            transition.next.violation_started_at
+            or transition.next.alarm_started_at
+            or created_at
+        )
+        normalized_device = normalize_device_id(sample.device_id) or sample.device_id
+        payload = {
+            "device_id": normalized_device,
+            "area": operation_state.area_id,
+            "sample_time": sample.sample_time.isoformat(),
+            "temperature": sample.temperature,
+            "humidity": sample.humidity,
+            "online_status": sample.online_status,
+            "data_quality": _enum_value(sample.data_quality),
+            "temperature_status": _enum_value(monitor_result.temperature_status),
+            "humidity_status": _enum_value(monitor_result.humidity_status),
+            "violation_started_at": started_at.isoformat(),
+            "alarm_started_at": (
+                transition.next.alarm_started_at.isoformat()
+                if transition.next.alarm_started_at is not None
+                else None
+            ),
+            "retry_attempt": 0,
+        }
+        task_ids: list[str] = []
+        for _ in event_actions:
+            task = self.task_repository.create_or_get_unfinished(
+                task_type="RECONCILE_ALARM_EVENT",
+                entity_type="DEVICE",
+                entity_id=normalized_device,
+                due_at=created_at,
+                payload=payload,
+                dedupe_key=_event_reconciliation_key(normalized_device, started_at),
+                created_at=created_at,
+            )
+            task_ids.append(task.task_id)
+        return tuple(task_ids)
+
+    def _finish_successful_event_reconciliation_tasks(
+        self,
+        task_ids: tuple[str, ...],
+        executions: tuple[ActionExecution, ...],
+        *,
+        updated_at: datetime,
+    ) -> None:
+        if self.task_repository is None or not task_ids:
+            return
+        task_index = 0
+        for execution in executions:
+            if execution.action.action_type not in {
+                AlarmActionType.CREATE_ALARM_EVENT,
+                AlarmActionType.UPDATE_ALARM_EVENT,
+            }:
+                continue
+            if task_index >= len(task_ids):
+                break
+            task_id = task_ids[task_index]
+            task_index += 1
+            if execution.status is ActionExecutionStatus.FAILED:
+                continue
+            try:
+                self.task_repository.cancel(task_id, updated_at=updated_at)
+            except (KeyError, ValueError):
+                # A scheduler may have reclaimed the safety task already; its
+                # own execution remains a valid idempotent retry path.
+                logger.debug(
+                    "event reconciliation task was already claimed or finished | task=%s",
+                    task_id,
+                )
+
+    def _schedule_event_reconciliation_retry(
+        self,
+        task: AutomationTask,
+        *,
+        now: datetime,
+    ) -> None:
+        if self.task_repository is None:
+            return
+        attempt = _retry_attempt(task.payload) + 1
+        device_id = normalize_device_id(task.entity_id) or str(task.entity_id).strip()
+        started_at = _parse_payload_datetime(task.payload.get("violation_started_at"))
+        if started_at is None:
+            started_at = now
+        payload = dict(task.payload)
+        payload["retry_attempt"] = attempt
+        delay = min(
+            _active_event_retry_base_seconds() * (2 ** max(attempt - 1, 0)),
+            _active_event_retry_max_seconds(),
+        )
+        self.task_repository.create_or_get(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="DEVICE",
+            entity_id=device_id,
+            due_at=now + timedelta(seconds=delay),
+            payload=payload,
+            dedupe_key=(
+                f"{_event_reconciliation_key(device_id, started_at)}:retry:{attempt}"
+            ),
+            created_at=now,
+        )
+
+    def _active_event_writes_enabled(self, device_id: str) -> bool:
+        mode = getattr(self.action_executor, "mode", None)
+        mode_value = getattr(mode, "value", mode)
+        if mode_value != AutomationMode.ACTIVE.value:
+            return False
+        return active_scope_allows(
+            device_id,
+            active_device_ids=getattr(self.action_executor, "active_device_ids", ()),
         )
 
     def _project_local_actions(
@@ -412,3 +674,61 @@ def _sample_dict(sample: MonitorSample) -> dict[str, Any]:
         "online_status": sample.online_status,
         "data_quality": _enum_value(quality) if quality is not None else None,
     }
+
+
+def _parse_payload_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _same_instant(left: datetime, right: datetime) -> bool:
+    if left.tzinfo is None or right.tzinfo is None:
+        return left == right
+    return left.astimezone().timestamp() == right.astimezone().timestamp()
+
+
+def _event_reconciliation_key(device_id: str, started_at: datetime) -> str:
+    return f"RECONCILE_ALARM_EVENT:{device_id}:{started_at.isoformat()}"
+
+
+def _retry_attempt(payload: Mapping[str, Any]) -> int:
+    try:
+        return max(0, int(payload.get("retry_attempt", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _active_event_retry_base_seconds() -> float:
+    # Keep this fallback local so older test/application configurations can
+    # load the new reconciliation path without requiring a config migration.
+    import config
+
+    return max(
+        1.0,
+        float(
+            getattr(
+                config,
+                "ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS",
+                getattr(config, "FEISHU_PROJECTION_BACKOFF_SECONDS", 30.0),
+            )
+        ),
+    )
+
+
+def _active_event_retry_max_seconds() -> float:
+    import config
+
+    return max(
+        _active_event_retry_base_seconds(),
+        float(
+            getattr(
+                config,
+                "ACTIVE_EVENT_RECONCILIATION_MAX_BACKOFF_SECONDS",
+                600.0,
+            )
+        ),
+    )

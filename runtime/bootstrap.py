@@ -377,6 +377,7 @@ def build_runtime(
         handlers={
             "VERIFY_ALARM": lambda task: runtime_holder["runtime"].handle_verify_alarm(task),
             "VERIFY_RECOVERY": lambda task: runtime_holder["runtime"].handle_verify_recovery(task),
+            "RECONCILE_ALARM_EVENT": lambda task: runtime_holder["runtime"].handle_reconcile_alarm_event(task),
             "SHADOW_COMPARE": lambda task: runtime_holder["runtime"].handle_shadow_compare(task),
             "SYNC_STANDARD": lambda task: runtime_holder["runtime"].handle_standard_sync(task),
             "SYNC_OPERATIONS": lambda task: runtime_holder["runtime"].handle_operation_sync(task),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -49,6 +50,7 @@ class _FeishuStore:
     def __init__(self, created_at: datetime) -> None:
         self.clock = created_at
         self.sequence = 0
+        self.fail_event_creates = 0
         self.tables: dict[str, list[FeishuRawRecord]] = {
             "tbl-device": [
                 FeishuRawRecord(
@@ -75,6 +77,12 @@ class _FeishuStore:
     ) -> dict[str, Any]:
         if client_token and client_token in self.tokens:
             return {"code": 0, "record_id": self.tokens[client_token], "deduped": True}
+        if table_id == "tbl-event" and self.fail_event_creates:
+            self.fail_event_creates -= 1
+            # Simulate a transport failure before the remote record is
+            # persisted.  The next attempt must recover through CREATE, not
+            # keep issuing UPDATE against a non-existent record.
+            raise TimeoutError("event create transport failure")
         self.sequence += 1
         record_id = f"rec-{self.sequence}"
         stored_fields = dict(fields)
@@ -281,6 +289,184 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         self.assertEqual(inspection.fields["仓库区域"], "设备区")
         self.assertNotIn("点检时间", inspection.fields)
         self.assertNotIn("点检人", inspection.fields)
+
+    def test_failed_event_create_recovers_after_restart_and_retry_claim(self) -> None:
+        base_time = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+        store = _FeishuStore(base_time)
+        operation_writer = FeishuOperationRecordWriter(
+            writer=store,
+            operation_table_id="tbl-operation",
+            interval_table_id="tbl-interval",
+            device_table_id="tbl-device",
+        )
+        operation_writer.create_registration(
+            device_id="TH-03",
+            area="精密装配间",
+            action=OperationAction.START,
+            operation_type="未关联工艺文件（TH-03）",
+            status_recorded_at=base_time,
+            idempotency_key="op-failure-e2e",
+        )
+        operation_repository = SQLiteOperationRepository(sqlite3.connect(":memory:"))
+        # Use a single connection for all Python-owned state, as the runtime
+        # does; the operation source remains the in-memory Feishu store.
+        operation_connection = operation_repository.connection
+        self.addCleanup(operation_connection.close)
+        operation_adapter = FeishuOperationAdapter(
+            source=store,
+            table_id="tbl-operation",
+            fields=FeishuOperationFieldMap(
+                device_id="监测点",
+                area_id="区域",
+                action="状态变更",
+                operation_type="当前工艺",
+                validation="登记组合校验",
+                valid_values=("有效",),
+                allowed_device_ids=frozenset({"TH-03"}),
+            ),
+        )
+        OperationObservationService(store=operation_repository).apply(
+            operation_adapter.fetch_observations(observed_at=base_time)[0]
+        )
+        device = DeviceContext(
+            device_id="TH-03",
+            area="精密装配间",
+            control_type=ControlType.OPERATION_PERIOD,
+        )
+        event_writer = FeishuEnvironmentEventWriter(
+            writer=store,
+            source=store,
+            event_table_id="tbl-event",
+            device_table_id="tbl-device",
+        )
+        standard = EnvironmentStandard(
+            standard_id="STD-FAIL-E2E",
+            revision="R1",
+            area="精密装配间",
+            operation_type="未关联工艺文件（TH-03）",
+            temperature_min=20.0,
+            temperature_max=30.0,
+            humidity_min=30.0,
+            humidity_max=60.0,
+            effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            effective_to=None,
+            source_document="E2E",
+            clause="test",
+        )
+
+        def build_service() -> MonitorApplicationService:
+            return MonitorApplicationService(
+                operation_state_provider=_OperationProvider(operation_repository),
+                standard_resolver=StaticStandardResolver((standard,)),
+                alarm_state_repository=SQLiteAlarmStateRepository(operation_connection),
+                alarm_state_machine=AlarmStateMachine(),
+                action_mapper=ApplicationActionMapper(),
+                action_executor=ActionExecutor(
+                    mode="active",
+                    active_device_ids=("TH-03",),
+                    handlers={
+                        AlarmActionType.CREATE_VERIFY_TASK: lambda action: None,
+                        AlarmActionType.COMPLETE_VERIFY_TASK: lambda action: None,
+                        AlarmActionType.CANCEL_VERIFY_TASK: lambda action: None,
+                    },
+                    context_handlers={
+                        AlarmActionType.CREATE_ALARM_EVENT: event_writer.handle_alarm_action,
+                        AlarmActionType.UPDATE_ALARM_EVENT: event_writer.handle_alarm_action,
+                        AlarmActionType.START_RECOVERY: event_writer.handle_alarm_action,
+                        AlarmActionType.CLOSE_ALARM_EVENT: event_writer.handle_alarm_action,
+                    },
+                ),
+                task_repository=SQLiteAutomationTaskRepository(operation_connection),
+                event_repository=SQLiteEnvironmentEventRepository(operation_connection),
+                latest_sample_repository=SQLiteLatestSampleRepository(operation_connection),
+            )
+
+        def sample(service: MonitorApplicationService, at: datetime, temperature: float):
+            return service.handle_sample(
+                device=device,
+                sample=MonitorSample(
+                    device_id="TH-03",
+                    sample_time=at,
+                    temperature=temperature,
+                    humidity=50.0,
+                    online_status="在线",
+                    data_quality=DataQualityStatus.GOOD,
+                ),
+                now=at,
+            )
+
+        service = build_service()
+        self.assertEqual(sample(service, base_time, 35).transition.next.state.value, "PENDING")
+        store.fail_event_creates = 2
+        failed = sample(service, base_time + timedelta(minutes=5), 36)
+        self.assertEqual(failed.transition.next.state.value, "ALARM")
+        self.assertEqual(len(store.read_records("tbl-event")), 0)
+        self.assertTrue(
+            any(
+                row[0] == "RECONCILE_ALARM_EVENT"
+                and row[1] == "PENDING"
+                for row in operation_connection.execute(
+                    "SELECT task_type, status FROM automation_tasks"
+                )
+            )
+        )
+
+        # Simulate process restart: state and the recovery task are reloaded
+        # from the same SQLite database, then a worker claims the persisted
+        # task without a new sensor sample.
+        restarted = build_service()
+        reconciliation = next(
+            task
+            for task in restarted.task_repository.claim_due(
+                now=base_time + timedelta(minutes=5),
+                worker_id="restarted-worker",
+            )
+            if task.task_type == "RECONCILE_ALARM_EVENT"
+        )
+        first_retry_at = base_time + timedelta(minutes=5, seconds=1)
+        with self.assertRaisesRegex(RuntimeError, "event create transport failure"):
+            restarted.reconcile_alarm_event_task(
+                task=reconciliation,
+                device=device,
+                now=first_retry_at,
+            )
+        restarted.task_repository.mark_failed(
+            reconciliation.task_id,
+            finished_at=first_retry_at,
+            error="event create transport failure",
+            worker_id="restarted-worker",
+        )
+        retry = next(
+            task
+            for task in restarted.task_repository.claim_due(
+                now=first_retry_at
+                + timedelta(seconds=config.ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS),
+                worker_id="restarted-worker",
+            )
+            if task.task_type == "RECONCILE_ALARM_EVENT"
+        )
+        restarted.reconcile_alarm_event_task(
+            task=retry,
+            device=device,
+            now=first_retry_at
+            + timedelta(seconds=config.ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS),
+        )
+        restarted.task_repository.mark_succeeded(
+            retry.task_id,
+            finished_at=first_retry_at
+            + timedelta(seconds=config.ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS),
+            worker_id="restarted-worker",
+        )
+        self.assertEqual(len(store.read_records("tbl-event")), 1)
+
+        # The next ALARM sample is a normal UPDATE of the recovered event;
+        # repeated retries remain idempotent and never create a second row.
+        sample(restarted, base_time + timedelta(minutes=6), 37)
+        sample(restarted, base_time + timedelta(minutes=7), 38)
+        self.assertEqual(len(store.read_records("tbl-event")), 1)
+        self.assertEqual(
+            store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 38.0
+        )
 
 
 if __name__ == "__main__":

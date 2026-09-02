@@ -231,6 +231,7 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID |
 | `FEISHU_OPERATION_INTERVAL_TABLE_ID` / `FEISHU_INSPECTION_TABLE_ID` | 当前台账表 ID | 作业区间和仓库点检写入目标表 |
 | `FEISHU_WRITE_ENABLED` | `false` | 飞书写入总开关；只有与 `AUTOMATION_MODE=active` 同时启用才生效 |
+| `ACTIVE_EVENT_RECONCILIATION_*` | `30` / `600` | Active 异常事件 CREATE/UPDATE 失败后的持久化 reconciliation 退避秒数与上限 |
 | `SHADOW_*_SECONDS` | 见 `.env.example` | Shadow 调度、作业同步、标准同步和飞书延迟窗口 |
 | `TEMPERATURE_API_KEY` | 空 | 可选的温度上报接口共享密钥 |
 | `HISTORY_DEVICES` | `TH-01,…,TH-11` | 历史采样设备列表；覆盖时必须同步配置 `HISTORY_TABLE_MAP` |

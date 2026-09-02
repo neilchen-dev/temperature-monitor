@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlparse
 
 import config
 from services import feishu
@@ -133,6 +134,26 @@ class RecordDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(result["code"], 0)
         self.assertEqual(request.call_count, 2)
+
+    def test_normalizes_long_client_token_stably(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": 0, "data": {"record_id": "rec-1"}}
+        long_key = "  ENV:" + ("TH-01/very-long-business-key:" * 4) + "  "
+
+        with (
+            patch.object(feishu, "get_token", return_value="token"),
+            patch.object(feishu, "request_with_retry", return_value=response) as request,
+        ):
+            feishu.create_bitable_record("tbl_event", {"监测点": "TH-01"}, client_token=long_key)
+            feishu.create_bitable_record("tbl_event", {"监测点": "TH-01"}, client_token=long_key)
+
+        tokens = [
+            parse_qs(urlparse(call.args[1]).query)["client_token"][0]
+            for call in request.call_args_list
+        ]
+        self.assertEqual(tokens[0], tokens[1])
+        self.assertLessEqual(len(tokens[0]), 50)
+        self.assertTrue(tokens[0].startswith("tm:"))
 
     def test_reads_latest_history_timestamp_with_descending_sort(self) -> None:
         response = Mock(status_code=200)

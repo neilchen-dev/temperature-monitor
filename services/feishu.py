@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
@@ -23,6 +24,8 @@ _record_id_lock = threading.Lock()
 _RECORD_ID_CACHE_TTL_SECONDS = 3600
 _RECORD_NOT_FOUND_TTL_SECONDS = 300
 _TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
+_CLIENT_TOKEN_MAX_LENGTH = 50
+_CLIENT_TOKEN_HASH_PREFIX = "tm:"
 
 
 def _resource_lock(key: str) -> threading.RLock:
@@ -39,6 +42,24 @@ def _validate_bitable_config(*, require_default_table: bool = False) -> None:
         raise RuntimeError("缺少飞书环境变量 APP_TOKEN 或 FEISHU_BASE_APP_TOKEN")
     if require_default_table and not config.TABLE_ID:
         raise RuntimeError("缺少飞书环境变量 TABLE_ID 或 FEISHU_DEVICE_TABLE_ID")
+
+
+def normalize_client_token(client_token: Any | None) -> str:
+    """Return one stable, Feishu-compatible idempotency token.
+
+    Bitable accepts at most 50 characters for ``client_token``.  Business
+    keys are intentionally kept verbatim when they already fit so existing
+    idempotency keys remain observable and backwards compatible.  Longer
+    keys are replaced with a deterministic digest rather than truncated;
+    truncation could merge two different business identities.
+    """
+    token = str(client_token or "").strip()
+    if not token:
+        return str(uuid.uuid4())
+    if len(token) <= _CLIENT_TOKEN_MAX_LENGTH:
+        return token
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"{_CLIENT_TOKEN_HASH_PREFIX}{digest[:_CLIENT_TOKEN_MAX_LENGTH - len(_CLIENT_TOKEN_HASH_PREFIX)]}"
 
 
 def normalize_field_value(value: Any) -> str:
@@ -331,11 +352,7 @@ def create_bitable_record(
         raise ValueError("table_id 不能为空")
     if not isinstance(fields, dict):
         raise TypeError("fields 必须是 JSON object")
-    normalized_token = str(client_token or uuid.uuid4()).strip()
-    if not normalized_token:
-        raise ValueError("client_token 不能为空")
-    if len(normalized_token) > 50:
-        raise ValueError("client_token 长度不能超过 50 个字符")
+    normalized_token = normalize_client_token(client_token)
     query = urlencode({"client_token": normalized_token})
     return _require_success(
         _request_bitable_json(
@@ -443,7 +460,7 @@ def get_latest_history_timestamp(table_id: str) -> Any | None:
 def create_history_record(table_id: str, fields: dict[str, Any]) -> dict[str, Any]:
     """Create one history record with an idempotency token reused by retries."""
     _validate_bitable_config()
-    query = urlencode({"client_token": str(uuid.uuid4())})
+    query = urlencode({"client_token": normalize_client_token(uuid.uuid4())})
     return _request_bitable_json(
         "POST",
         f"{_bitable_table_url(table_id, '/records')}?{query}",

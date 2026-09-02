@@ -400,6 +400,16 @@ FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = max(
 FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS = max(
     1.0, _get_float("FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS", 5.0)
 )
+# Active alarm event writes are armed before the external call.  If the call
+# fails, the durable reconciliation task retries with exponential backoff;
+# the task remains recoverable after a process restart.
+ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS = max(
+    1.0, _get_float("ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS", 30.0)
+)
+ACTIVE_EVENT_RECONCILIATION_MAX_BACKOFF_SECONDS = max(
+    ACTIVE_EVENT_RECONCILIATION_BACKOFF_SECONDS,
+    _get_float("ACTIVE_EVENT_RECONCILIATION_MAX_BACKOFF_SECONDS", 600.0),
+)
 # Active 切换三开关确认：AUTOMATION_MODE=active + FEISHU_WRITE_ENABLED=true
 # + ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS 必须同时满足。
 # ACK 只承诺 ACTIVE_DEVICE_IDS 中设备的 legacy owner 已禁用或排除；Canary

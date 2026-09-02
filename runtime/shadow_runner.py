@@ -491,6 +491,21 @@ class ShadowRuntime:
     def handle_verify_recovery(self, task: Any) -> None:
         self._handle_verification_task(task)
 
+    def handle_reconcile_alarm_event(self, task: Any) -> None:
+        """Run one durable Active Feishu alarm-event reconciliation attempt."""
+        device_id = str(task.entity_id).strip().upper()
+        device = self.devices.get(device_id)
+        if device is None:
+            raise RuntimeError(
+                f"alarm event reconciliation device is not configured: {device_id}"
+            )
+        with self._execution_lock:
+            self.monitor_service.reconcile_alarm_event_task(
+                task=task,
+                device=device,
+                now=self.now_provider(),
+            )
+
     def handle_feishu_projection(self, task: Any) -> None:
         """Retry a deferred Feishu projection for one device.
 

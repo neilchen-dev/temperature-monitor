@@ -21,6 +21,7 @@ from domain.models import MonitorResult, MonitorSample
 from domain.operation import OperationAction, OperationObservation
 
 from .feishu_records import FeishuRawRecord
+from services.feishu import normalize_client_token
 
 
 _business_tz_cache: ZoneInfo | None = None
@@ -96,7 +97,7 @@ class FeishuBitableRecordWriter:
         return create_bitable_record(
             table_id,
             dict(fields),
-            client_token=client_token,
+            client_token=normalize_client_token(client_token),
         )
 
     def update(
@@ -207,12 +208,12 @@ class FeishuOperationRecordWriter:
             fields.update(self.snapshot_fields(snapshot))
         if status_recorded_at is not None:
             fields[self.fields.state_recorded_at] = _datetime_cell(status_recorded_at)
-        token = idempotency_key or (
+        token = normalize_client_token(idempotency_key or (
             f"PROC:{_device_id(device_id)}:{action_text}:"
             f"{_datetime_cell(status_recorded_at)}"
             if status_recorded_at is not None
             else f"PROC:{uuid.uuid4()}"
-        )
+        ))
         return self.writer.create(
             self.operation_table_id,
             fields,
@@ -274,7 +275,9 @@ class FeishuOperationRecordWriter:
             raise ValueError("记录类型是飞书自动编号字段，不能由接口写入")
         if snapshot is not None:
             fields.update(self._interval_start_fields(snapshot))
-        token = idempotency_key or f"RUN:{observation.source_record_id}"
+        token = normalize_client_token(
+            idempotency_key or f"RUN:{observation.source_record_id}"
+        )
         return self.writer.create(
             self.interval_table_id,
             fields,
@@ -562,9 +565,9 @@ class FeishuEnvironmentEventWriter:
         )
         if anomaly_type:
             fields[self.fields.anomaly_type] = anomaly_type
-        token = idempotency_key or (
+        token = normalize_client_token(idempotency_key or (
             f"ENV:{normalized_device}:{_datetime_cell(start_time)}"
-        )
+        ))
         return self.writer.create(
             self.event_table_id,
             fields,
@@ -615,6 +618,60 @@ class FeishuEnvironmentEventWriter:
             humidity=humidity,
             temperature_status=temperature_status,
             humidity_status=humidity_status,
+        )
+
+    def reconcile_active_event(
+        self,
+        *,
+        device_id: str,
+        area: str,
+        start_time: datetime | None,
+        temperature: float | None = None,
+        humidity: float | None = None,
+        temperature_status: str | None = None,
+        humidity_status: str | None = None,
+        owner: Any | None = None,
+        control_requirement: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Update the sole active event, or recreate it when it is missing.
+
+        The Python alarm state is durable, while the Feishu event is an
+        external projection.  A successful state transition can therefore be
+        followed by a failed CREATE.  Subsequent ALARM samples must not keep
+        issuing UPDATE against a record that does not exist.  Re-entering the
+        normal ``create_event`` path is safe because it checks the business
+        key and uses the same deterministic client token.
+        """
+        normalized_device = _device_id(device_id)
+        active = self._active_events(normalized_device)
+        if len(active) > 1:
+            raise FeishuWriteError(
+                f"设备 {normalized_device} 存在 {len(active)} 条未关闭环境异常，拒绝继续写入"
+            )
+        if active:
+            return self.update_event(
+                record_id=active[0].record_id,
+                temperature=temperature,
+                humidity=humidity,
+                temperature_status=temperature_status,
+                humidity_status=humidity_status,
+            )
+        if start_time is None:
+            raise FeishuWriteError("补写环境异常缺少连续超限开始时间")
+        return self.create_event(
+            device_id=normalized_device,
+            area=area,
+            start_time=start_time,
+            temperature=temperature,
+            humidity=humidity,
+            temperature_status=temperature_status,
+            humidity_status=humidity_status,
+            owner=owner,
+            control_requirement=control_requirement,
+            idempotency_key=idempotency_key
+            or f"ENV:{normalized_device}:{_datetime_cell(start_time)}",
+            allow_existing=True,
         )
 
     def recover_event(
@@ -716,12 +773,30 @@ class FeishuEnvironmentEventWriter:
             )
             return
         if action_type == "UPDATE_ALARM_EVENT":
-            self.update_active_event(
+            started_at = _parse_datetime(
+                transition.get("violation_started_at")
+                or transition.get("alarm_started_at")
+                or context.get("sample_time")
+            )
+            operation_state = context.get("operation_state", {})
+            area = (
+                str(operation_state.get("area_id", "")).strip()
+                if isinstance(operation_state, Mapping)
+                else ""
+            )
+            self.reconcile_active_event(
                 device_id=device_id,
+                area=area,
+                start_time=started_at,
                 temperature=_number_value(sample.get("temperature")),
                 humidity=_number_value(sample.get("humidity")),
                 temperature_status=str(result.get("temperature_status") or ""),
                 humidity_status=str(result.get("humidity_status") or ""),
+                idempotency_key=(
+                    f"ENV:{device_id}:{_datetime_cell(started_at)}"
+                    if started_at is not None
+                    else None
+                ),
             )
             return
         if action_type == "START_RECOVERY":
@@ -874,7 +949,9 @@ class FeishuInspectionRecordWriter:
             parent_record_id=parent_record_id,
             state_recorded_at=state_recorded_at,
         )
-        token = idempotency_key or f"WH:{area.strip()}:{_datetime_cell(inspected_at)}"
+        token = normalize_client_token(
+            idempotency_key or f"WH:{area.strip()}:{_datetime_cell(inspected_at)}"
+        )
         return self.writer.create(
             self.inspection_table_id,
             fields,
