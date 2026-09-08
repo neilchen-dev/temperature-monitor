@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 
@@ -64,8 +64,9 @@ class SQLiteEnvironmentEventRepository:
         self.connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self.connection.executescript(_SCHEMA)
-        self._apply_migrations()
-        self.connection.commit()
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self._apply_migrations()
 
     def _apply_migrations(self) -> None:
         columns = {
@@ -187,6 +188,49 @@ class SQLiteEnvironmentEventRepository:
         """
         return self.close(event_id, closed_at=recovered_at)
 
+    def patch_external_projection(self, event_id: str, **values: Any) -> EnvironmentEventRecord:
+        """Merge projection metadata under a database write transaction."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                payload.update(values)
+                self.connection.execute(
+                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                    (json.dumps(payload, ensure_ascii=False), event_id),
+                )
+                self.connection.commit()
+                return self._require(event_id)
+            except Exception:
+                self.connection.rollback()
+                raise
+
+    def reserve_external_post(self, event_id: str) -> bool:
+        """One durable POST permit, never renewed by lease expiry or restart.
+
+        A crash after reservation is ambiguous and requires lookup/manual review.
+        This intentionally favors no duplicate over blindly retrying a POST.
+        """
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                if payload.get("feishu_create_attempted") or payload.get("feishu_record_id"):
+                    self.connection.commit()
+                    return False
+                payload["feishu_create_attempted"] = True
+                self.connection.execute(
+                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                    (json.dumps(payload, ensure_ascii=False), event_id),
+                )
+                self.connection.commit()
+                return True
+            except Exception:
+                self.connection.rollback()
+                raise
+
     def bind_external_record(
         self,
         event_id: str,
@@ -220,6 +264,10 @@ class SQLiteEnvironmentEventRepository:
                             f"environment event {row['event_id']}"
                         )
                 payload["feishu_record_id"] = record_id
+                payload["feishu_binding_status"] = "BOUND"
+                if record.closed_at is not None:
+                    payload.setdefault("feishu_recovered_at", record.closed_at.isoformat())
+                    payload.setdefault("feishu_recovery_pending", True)
                 self.connection.execute(
                     """
                     UPDATE environment_events
@@ -244,6 +292,98 @@ class SQLiteEnvironmentEventRepository:
                     self.connection.rollback()
                 raise
 
+    def mark_external_binding_pending(
+        self,
+        event_id: str,
+        *,
+        requested_at: datetime,
+    ) -> EnvironmentEventRecord:
+        """Persist that this local cycle entered an external CREATE path."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                if payload.get("feishu_record_id"):
+                    self.connection.commit()
+                    return record
+                payload["feishu_binding_status"] = "PENDING"
+                payload.setdefault("feishu_create_requested_at", _time_text(requested_at))
+                self.connection.execute(
+                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        event_id,
+                    ),
+                )
+                self.connection.commit()
+                return self._require(event_id)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
+    def list_pending_external_bindings(self) -> tuple[EnvironmentEventRecord, ...]:
+        """Return unbound events independently of local lifecycle status.
+
+        New events carry an explicit pending marker.  The audit fallback also
+        recognizes events written by the pre-marker deployment by tracing
+        CREATE_ALARM_EVENT's persisted transition context.
+        """
+        rows = self.connection.execute(
+            "SELECT * FROM environment_events ORDER BY opened_at, event_id"
+        ).fetchall()
+        records = [self._from_row(row) for row in rows]
+        candidates = {
+            record.event_id
+            for record in records
+            if not record.payload.get("feishu_record_id")
+            and record.payload.get("feishu_binding_status") == "PENDING"
+        }
+        try:
+            audit_rows = self.connection.execute(
+                """
+                SELECT alarm_id, python_alarm_transition_json, context_json
+                FROM automation_runs
+                WHERE action_type = 'CREATE_ALARM_EVENT' AND mode = 'active'
+                  AND action_status IN ('FAILED', 'SUCCEEDED')
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            audit_rows = ()
+        for row in audit_rows:
+            ids: list[Any] = [row["alarm_id"]]
+            for column in ("python_alarm_transition_json", "context_json"):
+                try:
+                    decoded = json.loads(row[column] or "{}")
+                except (TypeError, ValueError):
+                    decoded = {}
+                if not isinstance(decoded, Mapping):
+                    continue
+                if column == "python_alarm_transition_json":
+                    ids.append(decoded.get("active_alarm_id"))
+                else:
+                    transition = decoded.get("python_alarm_transition")
+                    if isinstance(transition, Mapping):
+                        ids.append(transition.get("active_alarm_id"))
+            candidates.update(
+                value.strip()
+                for value in ids
+                if isinstance(value, str) and value.strip()
+            )
+        return tuple(
+            record
+            for record in records
+            if (record.event_id in candidates and not record.payload.get("feishu_record_id"))
+            or record.payload.get("feishu_recovery_pending")
+            or record.payload.get("feishu_update_pending")
+        )
+
     def claim_external_create(
         self,
         event_id: str,
@@ -255,6 +395,7 @@ class SQLiteEnvironmentEventRepository:
         """Atomically elect one CREATE/reconciliation owner for a local cycle."""
         if not owner.strip():
             raise ValueError("owner cannot be empty")
+        claimed_at = claimed_at.replace(tzinfo=timezone.utc) if claimed_at.tzinfo is None else claimed_at.astimezone(timezone.utc)
         lease_until = claimed_at + timedelta(seconds=max(1.0, lease_seconds))
         with self._lock:
             cursor = self.connection.execute(
@@ -264,7 +405,8 @@ class SQLiteEnvironmentEventRepository:
                 WHERE event_id = ?
                   AND (
                     external_create_owner IS NULL
-                    OR external_create_lease_until <= ?
+                    OR external_create_lease_until IS NULL
+                    OR julianday(external_create_lease_until) <= julianday(?)
                   )
                 """,
                 (
@@ -282,11 +424,12 @@ class SQLiteEnvironmentEventRepository:
             return False
 
     def get(self, event_id: str) -> EnvironmentEventRecord | None:
-        row = self.connection.execute(
-            "SELECT * FROM environment_events WHERE event_id = ?",
-            (event_id,),
-        ).fetchone()
-        return self._from_row(row) if row is not None else None
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM environment_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return self._from_row(row) if row is not None else None
 
     def list_active(self, *, device_id: str | None = None) -> tuple[EnvironmentEventRecord, ...]:
         if device_id is None:

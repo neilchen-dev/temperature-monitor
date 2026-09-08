@@ -363,6 +363,7 @@ def create_bitable_record(
             operation="新增 Base 记录",
             json_data={"fields": dict(fields)},
             lock_key=f"table:{normalized_table_id}",
+            max_attempts=1,
         ),
         "新增 Base 记录",
     )

@@ -21,6 +21,7 @@ from domain.models import (
 )
 from domain.monitor_engine import MonitorEngine
 from domain.standard_resolver import StandardNotFoundError, StandardResolver
+from services.event_identity import epoch_milliseconds
 
 from .action_executor import (
     ActionExecution,
@@ -83,8 +84,18 @@ class AutomationTaskRepository(Protocol):
     ) -> AutomationTask:
         """Create or reuse one unfinished task for a business identity."""
 
+    def reschedule_running(self, task: AutomationTask, *, due_at: datetime,
+                           updated_at: datetime, payload: Mapping[str, Any]) -> None:
+        """Reschedule the same owned task without replacing its identity."""
+
 
 class LocalEnvironmentEventRepository(Protocol):
+    def patch_external_projection(self, event_id: str, **values: Any) -> Any:
+        """Atomically merge durable external projection metadata."""
+
+    def get(self, event_id: str) -> Any | None:
+        """Return a local event by its durable identity."""
+
     def create_or_get_active(
         self,
         *,
@@ -97,6 +108,14 @@ class LocalEnvironmentEventRepository(Protocol):
 
     def mark_recovered(self, event_id: str, *, recovered_at: datetime) -> Any:
         """Finish the monitoring cycle without claiming business closure."""
+
+    def mark_external_binding_pending(
+        self,
+        event_id: str,
+        *,
+        requested_at: datetime,
+    ) -> Any:
+        """Persist that a Feishu CREATE must still be reconciled."""
 
 
 @dataclass(frozen=True)
@@ -190,6 +209,7 @@ class MonitorApplicationService:
             transition,
             actions,
             sample=sample,
+            operation_state=operation_state,
             created_at=evaluated_at,
             scheduler_task_id=scheduler_task_id,
         )
@@ -229,6 +249,15 @@ class MonitorApplicationService:
         )
 
     def reconcile_alarm_event_task(
+        self, *, task: AutomationTask, device: DeviceContext, now: datetime,
+    ) -> tuple[ActionExecution, ...]:
+        try:
+            return self._reconcile_alarm_event_task(task=task, device=device, now=now)
+        except Exception:
+            self._schedule_event_reconciliation_retry(task, now=now)
+            raise
+
+    def _reconcile_alarm_event_task(
         self,
         *,
         task: AutomationTask,
@@ -239,40 +268,115 @@ class MonitorApplicationService:
 
         This intentionally does not call ``handle_sample``: a later normal or
         unknown sample must not advance the alarm state while an older failed
-        CREATE is being reconciled.  The persisted ALARM state is the guard;
-        the task payload is the last known violating snapshot used to create
-        the same business event.
+        CREATE is being reconciled. The task payload carries the local event
+        identity and last known violating snapshot. An unbound event remains
+        eligible even after the local cycle is recovered/CLOSED; a bound event
+        is a completed projection and is a no-op.
         """
         device_id = normalize_device_id(task.entity_id)
         if device_id is None or device_id != normalize_device_id(device.device_id):
             raise ValueError("alarm event reconciliation device mismatch")
-        state = self.alarm_state_repository.get(device_id)
-        if state is None or AlarmLifecycleState(state.state) is not AlarmLifecycleState.ALARM:
-            return ()
-
         expected_start = _parse_payload_datetime(task.payload.get("violation_started_at"))
-        current_start = state.violation_started_at or state.alarm_started_at
-        if expected_start is not None and current_start is not None:
-            if _same_instant(expected_start, current_start) is False:
-                # A retry from an older alarm must not create/update the new
-                # alarm event after a fast recover/re-alarm cycle.
+        local_event_id = str(task.payload.get("local_event_id") or "").strip() or None
+        local_event = (
+            self.event_repository.get(local_event_id)
+            if local_event_id is not None and self.event_repository is not None
+            else None
+        )
+        if local_event is not None:
+            if normalize_device_id(local_event.device_id) != device_id:
+                raise ValueError("reconciliation local event/device mismatch")
+            local_start = _parse_payload_datetime(local_event.payload.get("violation_started_at"))
+            if local_start is None and local_event.event_key.startswith("ENV:"):
+                local_start = _parse_payload_datetime(local_event.event_key.split(":", 2)[-1])
+            if local_start is None:
+                raise ValueError("reconciliation cycle start is unknown; manual review required")
+            if expected_start is not None and not _same_instant(expected_start, local_start):
+                raise ValueError("reconciliation cycle start mismatch; manual review required")
+            expected_start = local_start
+            if "feishu_create_attempted" not in local_event.payload and not local_event.payload.get("feishu_record_id"):
+                self.event_repository.patch_external_projection(
+                    local_event.event_id, feishu_create_attempted=True
+                )
+            if (local_event.payload.get("feishu_record_id")
+                    and not local_event.payload.get("feishu_recovery_pending")
+                    and not local_event.payload.get("feishu_update_pending")):
+                # Binding is an independent durable completion condition. A
+                # task left behind after recovery must not issue another UPDATE.
                 return ()
+            # The durable task itself is sufficient evidence for legacy
+            # pre-marker events. New events also carry the PENDING marker, but
+            # a recovered task must not depend on the monitoring lifecycle or
+            # on that marker having been written by an older deployment.
+            binding_pending = True
+        else:
+            binding_pending = False
+            if local_event_id is not None:
+                raise ValueError("reconciliation local event is missing; manual review required")
+
+        state = self.alarm_state_repository.get(device_id)
+        state_is_alarm = (
+            state is not None
+            and AlarmLifecycleState(state.state) is AlarmLifecycleState.ALARM
+        )
+        if not state_is_alarm and not binding_pending:
+            raise ValueError("reconciliation has no trustworthy local cycle identity")
+
+        if state is None:
+            state = AlarmState.normal(device_id)
+
+        current_start = (
+            state.violation_started_at or state.alarm_started_at
+            if state is not None and state_is_alarm
+            else None
+        )
+        if (
+            not binding_pending
+            and expected_start is not None
+            and current_start is not None
+            and _same_instant(expected_start, current_start) is False
+        ):
+            # A retry from an older alarm must not create/update the new alarm
+            # event after a fast recover/re-alarm cycle.
+            raise ValueError("reconciliation cycle differs from current alarm; manual review required")
+
+        if local_event_id is None and state is not None:
+            local_event_id = state.active_alarm_id
 
         source_action = AlarmAction(
-            action_type=AlarmActionType.UPDATE_ALARM_EVENT,
+            action_type=(
+                AlarmActionType.CREATE_ALARM_EVENT
+                if local_event is not None and not local_event.payload.get("feishu_record_id")
+                else AlarmActionType.UPDATE_ALARM_EVENT
+            ),
             device_id=device_id,
-            alarm_id=state.active_alarm_id,
+            alarm_id=local_event_id,
         )
+        recovery_pending = local_event is not None and local_event.payload.get("feishu_recovery_pending")
+        source_actions = (source_action,)
+        if recovery_pending:
+            recovery_action = AlarmAction(
+                action_type=AlarmActionType.MARK_ALARM_RECOVERED,
+                device_id=device_id,
+                alarm_id=local_event_id,
+            )
+            source_actions = (
+                (recovery_action,)
+                if local_event.payload.get("feishu_record_id") and not local_event.payload.get("feishu_update_pending")
+                else (source_action, recovery_action)
+            )
         transition = StateTransition(
             previous=state,
             next=state,
-            actions=(source_action,),
+            actions=source_actions,
             reason="alarm_event_reconciliation",
         )
         actions = self.action_mapper.map(transition)
         payload = task.payload
         sample_time = str(payload.get("sample_time") or now.isoformat())
+        area = str(payload.get("area") or device.area or "").strip()
         context = {
+            "binding_attempt": _retry_attempt(task.payload),
             "device_id": device_id,
             "created_at": now.isoformat(),
             "sample_time": sample_time,
@@ -287,6 +391,9 @@ class MonitorApplicationService:
             "python_monitor_result": {
                 "temperature_status": payload.get("temperature_status") or "",
                 "humidity_status": payload.get("humidity_status") or "",
+                "standard_id": payload.get("standard_id"),
+                "standard_revision": payload.get("standard_revision"),
+                "standard_source": payload.get("standard_source"),
             },
             "python_alarm_transition": {
                 "from": AlarmLifecycleState.ALARM.value,
@@ -296,10 +403,18 @@ class MonitorApplicationService:
                     expected_start.isoformat() if expected_start is not None else None
                 ),
                 "alarm_started_at": payload.get("alarm_started_at"),
-                "active_alarm_id": state.active_alarm_id,
+                "active_alarm_id": local_event_id,
             },
-            "operation_state": {"area_id": str(payload.get("area") or "").strip()},
+            "operation_state": {"area_id": area},
         }
+        if recovery_pending:
+            context["recovered_at"] = local_event.payload.get("feishu_recovered_at") or (
+                local_event.closed_at.isoformat() if local_event.closed_at else None
+            )
+        if local_event is not None and local_event.payload.get("feishu_update_pending"):
+            snapshot = local_event.payload.get("feishu_update_snapshot", {})
+            context["sample"].update({key: snapshot.get(key) for key in ("temperature", "humidity")})
+            context["python_monitor_result"].update({key: snapshot.get(key) for key in ("temperature_status", "humidity_status")})
         executions = self.action_executor.execute(
             actions,
             context=context,
@@ -309,12 +424,11 @@ class MonitorApplicationService:
             (
                 execution
                 for execution in executions
-                if execution.status is ActionExecutionStatus.FAILED
+                if execution.status is not ActionExecutionStatus.SUCCEEDED
             ),
             None,
         )
         if failed is not None:
-            self._schedule_event_reconciliation_retry(task, now=now)
             raise RuntimeError(failed.error or "alarm event reconciliation failed")
         return executions
 
@@ -352,6 +466,8 @@ class MonitorApplicationService:
         normalized_device = normalize_device_id(sample.device_id) or sample.device_id
         payload = {
             "device_id": normalized_device,
+            "local_event_id": transition.next.active_alarm_id
+            or transition.previous.active_alarm_id,
             "area": operation_state.area_id,
             "sample_time": sample.sample_time.isoformat(),
             "temperature": sample.temperature,
@@ -360,6 +476,9 @@ class MonitorApplicationService:
             "data_quality": _enum_value(sample.data_quality),
             "temperature_status": _enum_value(monitor_result.temperature_status),
             "humidity_status": _enum_value(monitor_result.humidity_status),
+            "standard_id": monitor_result.standard_id,
+            "standard_revision": monitor_result.standard_revision,
+            "standard_source": monitor_result.standard_source,
             "violation_started_at": started_at.isoformat(),
             "alarm_started_at": (
                 transition.next.alarm_started_at.isoformat()
@@ -376,7 +495,7 @@ class MonitorApplicationService:
                 entity_id=normalized_device,
                 due_at=created_at,
                 payload=payload,
-                dedupe_key=_event_reconciliation_key(normalized_device, started_at),
+                dedupe_key=f"RECONCILE_ALARM_EVENT:{payload['local_event_id']}",
                 created_at=created_at,
             )
             task_ids.append(task.task_id)
@@ -402,7 +521,7 @@ class MonitorApplicationService:
                 break
             task_id = task_ids[task_index]
             task_index += 1
-            if execution.status is ActionExecutionStatus.FAILED:
+            if execution.status is not ActionExecutionStatus.SUCCEEDED:
                 continue
             try:
                 self.task_repository.cancel(task_id, updated_at=updated_at)
@@ -423,26 +542,23 @@ class MonitorApplicationService:
         if self.task_repository is None:
             return
         attempt = _retry_attempt(task.payload) + 1
-        device_id = normalize_device_id(task.entity_id) or str(task.entity_id).strip()
-        started_at = _parse_payload_datetime(task.payload.get("violation_started_at"))
-        if started_at is None:
-            started_at = now
         payload = dict(task.payload)
         payload["retry_attempt"] = attempt
         delay = min(
-            _active_event_retry_base_seconds() * (2 ** max(attempt - 1, 0)),
+            _active_event_retry_base_seconds() * (2 ** min(max(attempt - 1, 0), 20)),
             _active_event_retry_max_seconds(),
         )
-        self.task_repository.create_or_get(
-            task_type="RECONCILE_ALARM_EVENT",
-            entity_type="DEVICE",
-            entity_id=device_id,
+        self.task_repository.reschedule_running(
+            task,
             due_at=now + timedelta(seconds=delay),
             payload=payload,
-            dedupe_key=(
-                f"{_event_reconciliation_key(device_id, started_at)}:retry:{attempt}"
-            ),
-            created_at=now,
+            updated_at=now,
+        )
+        logger.info(
+            "binding_retry | device_id=%s local_event_id=%s event_key=%s record_id=%s attempt=%s due_at=%s",
+            task.entity_id, task.payload.get("local_event_id"),
+            task.payload.get("violation_started_at"), None, attempt,
+            (now + timedelta(seconds=delay)).isoformat(),
         )
 
     def _active_event_writes_enabled(self, device_id: str) -> bool:
@@ -463,6 +579,7 @@ class MonitorApplicationService:
         actions: tuple[ApplicationAction, ...],
         *,
         sample: MonitorSample,
+        operation_state: OperationState,
         created_at: datetime,
         scheduler_task_id: str | None,
     ) -> StateTransition:
@@ -541,13 +658,40 @@ class MonitorApplicationService:
                     payload={
                         "projection": "local_shadow_event",
                         "sample_time": sample.sample_time.isoformat(),
+                        "violation_started_at": (
+                            next_state.violation_started_at.isoformat()
+                            if next_state.violation_started_at is not None
+                            else None
+                        ),
+                        "area": operation_state.area_id,
+                        "temperature": sample.temperature,
+                        "humidity": sample.humidity,
+                        "online_status": sample.online_status,
+                        "data_quality": _enum_value(sample.data_quality),
+                        "feishu_binding_status": (
+                            "PENDING"
+                            if self._active_event_writes_enabled(sample.device_id)
+                            else None
+                        ),
+                        "feishu_create_attempted": False,
                     },
                 )
+                if self._active_event_writes_enabled(sample.device_id):
+                    self.event_repository.mark_external_binding_pending(
+                        event.event_id,
+                        requested_at=created_at,
+                    )
                 next_state = replace(next_state, active_alarm_id=event.event_id)
 
             if action.action_type.value == "MARK_ALARM_RECOVERED":
                 event_id = action.alarm_id or transition.previous.active_alarm_id
                 if event_id is not None and self.event_repository is not None:
+                    if self._active_event_writes_enabled(sample.device_id):
+                        self.event_repository.patch_external_projection(
+                            event_id,
+                            feishu_recovery_pending=True,
+                            feishu_recovered_at=created_at.isoformat(),
+                        )
                     self.event_repository.mark_recovered(event_id, recovered_at=created_at)
 
         return replace(transition, next=next_state)
@@ -695,13 +839,7 @@ def _parse_payload_datetime(value: Any) -> datetime | None:
 
 
 def _same_instant(left: datetime, right: datetime) -> bool:
-    if left.tzinfo is None or right.tzinfo is None:
-        return left == right
-    return left.astimezone().timestamp() == right.astimezone().timestamp()
-
-
-def _event_reconciliation_key(device_id: str, started_at: datetime) -> str:
-    return f"RECONCILE_ALARM_EVENT:{device_id}:{started_at.isoformat()}"
+    return epoch_milliseconds(left) == epoch_milliseconds(right)
 
 
 def _retry_attempt(payload: Mapping[str, Any]) -> int:

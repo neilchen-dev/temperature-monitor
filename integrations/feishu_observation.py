@@ -9,6 +9,7 @@ import math
 from typing import Any, Protocol
 
 from application.shadow import ObservedAutomationState
+from services.event_identity import epoch_milliseconds
 
 
 class FeishuObservationSource(Protocol):
@@ -136,8 +137,13 @@ class FeishuBitableObservationSource:
         groups: dict[str, list[Any]] = {}
         order: list[str] = []
         for record in records:
-            start = _field_text(record.fields.get(self.fields.event_start_time))
-            key = f"start:{start}" if start else f"record:{record.record_id}"
+            raw_start = record.fields.get(self.fields.event_start_time)
+            try:
+                parsed = _record_time(raw_start)
+                start = epoch_milliseconds(parsed) if parsed is not None else None
+            except (ValueError, TypeError, OverflowError):
+                start = None
+            key = f"start:{start}" if start is not None else f"record:{record.record_id}"
             if key not in groups:
                 groups[key] = []
                 order.append(key)
@@ -145,7 +151,7 @@ class FeishuBitableObservationSource:
         if not order:
             return ()
         started = [key for key in order if key.startswith("start:")]
-        selected = max(started) if started else order[-1]
+        selected = max(started, key=lambda key: int(key.split(":", 1)[1])) if started else order[-1]
         return tuple(groups[selected])
 
 

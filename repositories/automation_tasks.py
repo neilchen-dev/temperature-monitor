@@ -59,8 +59,9 @@ class SQLiteAutomationTaskRepository:
         self._lock = threading.RLock()
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(_SCHEMA)
-        self._apply_migrations()
-        self.connection.commit()
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self._apply_migrations()
 
     def _apply_migrations(self) -> None:
         columns = {
@@ -157,7 +158,7 @@ class SQLiteAutomationTaskRepository:
         dedupe_key: str,
         created_at: datetime,
     ) -> AutomationTask:
-        """Create or reuse the sole unfinished task for a business identity.
+        """Create or reuse the unfinished task for a business identity.
 
         The stable ``dedupe_key`` belongs to the PENDING/RUNNING task only.
         When a new cycle starts, a terminal row that still owns that key is
@@ -167,7 +168,10 @@ class SQLiteAutomationTaskRepository:
 
         Legacy duplicate PENDING rows are cancelled while adopting this
         invariant.  A RUNNING row always wins and is never modified or
-        cancelled.  An existing PENDING task may move earlier, but never later.
+        cancelled. An existing PENDING task may move earlier, but never later.
+        Reconciliation tasks use their event-specific ``dedupe_key`` as the
+        identity, allowing multiple alarm cycles for one device to be repaired
+        independently.
         """
         if not task_type.strip():
             raise ValueError("task_type cannot be empty")
@@ -185,25 +189,55 @@ class SQLiteAutomationTaskRepository:
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                active_rows = self.connection.execute(
-                    """
-                    SELECT * FROM automation_tasks
-                    WHERE task_type = ? AND entity_id = ?
-                      AND status IN (?, ?)
-                    ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
-                             due_at, id
-                    """,
-                    (
-                        task_type,
-                        entity_id,
-                        AutomationTaskStatus.PENDING.value,
-                        AutomationTaskStatus.RUNNING.value,
-                        AutomationTaskStatus.RUNNING.value,
-                    ),
-                ).fetchall()
+                if task_type == "RECONCILE_ALARM_EVENT":
+                    # Reconciliation identity is one local alarm cycle, not
+                    # one device. A device can have multiple recovered/CLOSED
+                    # cycles waiting for external binding. Retry rows retain
+                    # the same cycle prefix, so a live backoff retry is not
+                    # replaced by a fresh task on every incoming sample.
+                    active_rows = self.connection.execute(
+                        """
+                        SELECT * FROM automation_tasks
+                        WHERE task_type = ?
+                          AND (dedupe_key = ? OR substr(dedupe_key, 1, length(?)) = ?
+                               OR (? IS NOT NULL AND json_extract(payload_json, '$.local_event_id') = ?))
+                          AND status IN (?, ?)
+                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                                 due_at, id
+                        """,
+                        (
+                            task_type,
+                            dedupe_key,
+                            f"{dedupe_key}:retry:",
+                            f"{dedupe_key}:retry:",
+                            (payload or {}).get("local_event_id"),
+                            (payload or {}).get("local_event_id"),
+                            AutomationTaskStatus.PENDING.value,
+                            AutomationTaskStatus.RUNNING.value,
+                            AutomationTaskStatus.RUNNING.value,
+                        ),
+                    ).fetchall()
+                else:
+                    active_rows = self.connection.execute(
+                        """
+                        SELECT * FROM automation_tasks
+                        WHERE task_type = ? AND entity_id = ?
+                          AND status IN (?, ?)
+                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                                 due_at, id
+                        """,
+                        (
+                            task_type,
+                            entity_id,
+                            AutomationTaskStatus.PENDING.value,
+                            AutomationTaskStatus.RUNNING.value,
+                            AutomationTaskStatus.RUNNING.value,
+                        ),
+                    ).fetchall()
 
                 winner = active_rows[0] if active_rows else None
                 if winner is not None:
+                    winner_is_retry = task_type == "RECONCILE_ALARM_EVENT"
                     duplicate_pending_ids = [
                         row["id"]
                         for row in active_rows[1:]
@@ -226,6 +260,14 @@ class SQLiteAutomationTaskRepository:
                                 AutomationTaskStatus.PENDING.value,
                             ),
                         )
+
+                    if winner_is_retry:
+                        # A retry row already represents this exact alarm
+                        # cycle. Preserve its due_at so exponential backoff
+                        # remains effective; the base key can be reclaimed
+                        # after the retry reaches a terminal state.
+                        self.connection.commit()
+                        return self._require(winner["id"])
 
                     self._release_dedupe_key_from_other_row(
                         dedupe_key=dedupe_key,
@@ -400,6 +442,21 @@ class SQLiteAutomationTaskRepository:
             last_error=None,
             worker_id=worker_id,
         )
+
+    def reschedule_running(self, task: AutomationTask, *, due_at: datetime,
+                           updated_at: datetime, payload: Mapping[str, Any]) -> None:
+        """Keep the cycle's task id/key and attempts across a durable backoff."""
+        with self._lock:
+            cursor = self.connection.execute(
+                """UPDATE automation_tasks SET status = 'PENDING', due_at = ?,
+                   updated_at = ?, payload_json = ?, lease_until = NULL, worker_id = NULL
+                   WHERE id = ? AND status = 'RUNNING' AND worker_id = ?""",
+                (_datetime_text(due_at), _datetime_text(updated_at),
+                 json.dumps(dict(payload)), task.task_id, task.worker_id),
+            )
+            self.connection.commit()
+            if cursor.rowcount != 1:
+                raise TaskStateError("reconciliation task ownership was lost")
 
     def mark_failed(
         self,

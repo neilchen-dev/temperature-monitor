@@ -193,6 +193,90 @@ class GlobalSyncTaskDeduplicationTests(unittest.TestCase):
         self.assertEqual(self._unfinished_count("SYNC_STANDARD", "standards"), 1)
         self.assertEqual(self._unfinished_count("SYNC_OPERATIONS", "operations"), 1)
 
+    def test_reconcile_tasks_are_deduped_per_alarm_cycle_not_per_device(self) -> None:
+        first = self.repository.create_or_get_unfinished(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="DEVICE",
+            entity_id="TH-01",
+            due_at=self.now,
+            payload={"local_event_id": "event-A"},
+            dedupe_key="RECONCILE_ALARM_EVENT:TH-01:cycle-A",
+            created_at=self.now,
+        )
+        second = self.repository.create_or_get_unfinished(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="DEVICE",
+            entity_id="TH-01",
+            due_at=self.now,
+            payload={"local_event_id": "event-B"},
+            dedupe_key="RECONCILE_ALARM_EVENT:TH-01:cycle-B",
+            created_at=self.now,
+        )
+
+        self.assertNotEqual(first.task_id, second.task_id)
+        self.assertEqual(
+            {
+                row[0]
+                for row in self.connection.execute(
+                    """
+                    SELECT dedupe_key FROM automation_tasks
+                    WHERE task_type = 'RECONCILE_ALARM_EVENT'
+                      AND status = 'PENDING'
+                    """
+                )
+            },
+            {
+                "RECONCILE_ALARM_EVENT:TH-01:cycle-A",
+                "RECONCILE_ALARM_EVENT:TH-01:cycle-B",
+            },
+        )
+
+    def test_reconcile_retry_backoff_is_not_reset_by_rearm(self) -> None:
+        base_key = "RECONCILE_ALARM_EVENT:TH-01:cycle-A"
+        base = self.repository.create_or_get_unfinished(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="DEVICE",
+            entity_id="TH-01",
+            due_at=self.now,
+            payload={"local_event_id": "event-A", "retry_attempt": 0},
+            dedupe_key=base_key,
+            created_at=self.now,
+        )
+        self.repository.claim_due(now=self.now, worker_id="worker-a")
+        self.repository.mark_failed(
+            base.task_id,
+            finished_at=self.now + timedelta(seconds=1),
+            error="temporary Feishu failure",
+            worker_id="worker-a",
+        )
+        retry_at = self.now + timedelta(minutes=10)
+        retry = self.repository.create_or_get(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="DEVICE",
+            entity_id="TH-01",
+            due_at=retry_at,
+            payload={"local_event_id": "event-A", "retry_attempt": 1},
+            dedupe_key=f"{base_key}:retry:1",
+            created_at=self.now + timedelta(seconds=1),
+        )
+
+        rearmed = self.repository.create_or_get_unfinished(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="DEVICE",
+            entity_id="TH-01",
+            due_at=self.now + timedelta(seconds=2),
+            payload={"local_event_id": "event-A", "retry_attempt": 0},
+            dedupe_key=base_key,
+            created_at=self.now + timedelta(seconds=2),
+        )
+
+        self.assertEqual(rearmed.task_id, retry.task_id)
+        self.assertEqual(rearmed.due_at, retry_at)
+        self.assertEqual(
+            self._unfinished_count("RECONCILE_ALARM_EVENT", "TH-01"),
+            1,
+        )
+
     def test_legacy_pending_duplicates_are_consolidated(self) -> None:
         for offset in (1, 2, 3):
             self.repository.create_or_get(

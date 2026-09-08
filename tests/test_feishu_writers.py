@@ -320,9 +320,17 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             },
         )
         writer = self._writer(recording, (event,))
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        writer.event_repository = SQLiteEnvironmentEventRepository(connection)
+        local = writer.event_repository.create_or_get_active(
+            device_id="TH-03", event_key=f"ENV:TH-03:{_sample().sample_time.isoformat()}",
+            opened_at=_sample().sample_time,
+        )
         action = AlarmAction(
             action_type=AlarmActionType.MARK_ALARM_RECOVERED,
             device_id="TH-03",
+            alarm_id=local.event_id,
         )
         recovered_at = _sample().sample_time.replace(minute=1)
 
@@ -389,9 +397,17 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             ),
         )
         writer = self._writer(recording, events)
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        writer.event_repository = SQLiteEnvironmentEventRepository(connection)
+        local = writer.event_repository.create_or_get_active(
+            device_id="TH-03", event_key=f"ENV:TH-03:{current_start.isoformat()}",
+            opened_at=current_start,
+        )
         action = AlarmAction(
             action_type=AlarmActionType.UPDATE_ALARM_EVENT,
             device_id="TH-03",
+            alarm_id=local.event_id,
         )
         writer.handle_alarm_action(
             action,
@@ -408,6 +424,7 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             },
         )
         self.assertEqual(recording.updated[-1][1], "rec-B")
+        self.assertEqual(writer.event_repository.get(local.event_id).payload["feishu_record_id"], "rec-B")
 
     def test_restart_uses_persisted_local_to_feishu_record_binding(self) -> None:
         connection = sqlite3.connect(":memory:")
@@ -535,6 +552,7 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             mode="active",
             active_device_ids=("TH-03",),
             context_handlers={AlarmActionType.CREATE_ALARM_EVENT: writer.handle_alarm_action},
+            standards_ready_provider=lambda: True,
         )
         execution = executor.execute(
             (
@@ -557,6 +575,55 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
 
         self.assertEqual(execution.status.value, "FAILED")
         self.assertNotIn("feishu_record_id", repository.get(local.event_id).payload)
+
+    def test_update_without_local_event_id_cannot_be_a_successful_active_action(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = SQLiteEnvironmentEventRepository(connection)
+        recording = _RecordingWriter()
+        writer = FeishuEnvironmentEventWriter(
+            writer=recording,
+            source=_RecordSource(
+                {
+                    "tbl-devices": (
+                        FeishuRawRecord(
+                            record_id="device",
+                            fields={
+                                "设备编号": "TH-03",
+                                "默认异常责任人": [{"id": "ou-owner"}],
+                            },
+                        ),
+                    )
+                }
+            ),
+            event_table_id="tbl-events",
+            device_table_id="tbl-devices",
+            event_repository=repository,
+        )
+        execution = ActionExecutor(
+            mode="active",
+            active_device_ids=("TH-03",),
+            context_handlers={AlarmActionType.UPDATE_ALARM_EVENT: writer.handle_alarm_action},
+            standards_ready_provider=lambda: True,
+        ).execute(
+            (
+                AlarmAction(
+                    action_type=AlarmActionType.UPDATE_ALARM_EVENT,
+                    device_id="TH-03",
+                ),
+            ),
+            context={
+                "device_id": "TH-03",
+                "sample_time": _sample().sample_time.isoformat(),
+                "python_alarm_transition": {
+                    "violation_started_at": _sample().sample_time.isoformat(),
+                },
+                "operation_state": {"area_id": "精密装配间"},
+            },
+        )[0]
+
+        self.assertEqual(execution.status.value, "FAILED")
+        self.assertEqual(recording.updated, [])
 
     def test_concurrent_reconciliation_has_one_remote_create_owner(self) -> None:
         connection = sqlite3.connect(":memory:", check_same_thread=False)
@@ -596,6 +663,7 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
         context = {
             "created_at": _sample().sample_time.isoformat(),
             "sample_time": _sample().sample_time.isoformat(),
+            "sample": {"temperature": 35.0},
             "python_alarm_transition": {
                 "violation_started_at": _sample().sample_time.isoformat(),
             },

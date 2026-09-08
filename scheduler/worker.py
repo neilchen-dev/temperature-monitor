@@ -77,6 +77,12 @@ class TaskScheduler:
             try:
                 handler(task)
             except Exception as exc:  # noqa: BLE001 - persist handler failure
+                current = self.repository.get(task.task_id)
+                if current is not None and current.status.value == "PENDING":
+                    # Handler durably rescheduled the same task, preserving
+                    # its identity and backoff. Do not overwrite with FAILED.
+                    failed += 1
+                    continue
                 self.repository.mark_failed(
                     task.task_id,
                     finished_at=current_time,

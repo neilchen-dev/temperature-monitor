@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from repositories.environment_events import SQLiteEnvironmentEventRepository
+from repositories.automation_runs import SQLiteAutomationRunRepository
+from application.action_executor import ActionExecution, ActionExecutionStatus, AutomationMode
+from domain.models import AlarmAction, AlarmActionType
 
 
 class EnvironmentEventRepositoryTests(unittest.TestCase):
@@ -106,6 +109,83 @@ class EnvironmentEventRepositoryTests(unittest.TestCase):
             self.repository.get(second.event_id).payload["feishu_record_id"],
             "rec-B",
         )
+
+    def test_closed_unbound_event_is_a_reconciliation_candidate_from_audit(self) -> None:
+        event = self.repository.create_or_get_active(
+            device_id="TH-01",
+            event_key="ENV:TH-01:audit-candidate",
+            opened_at=self.opened_at,
+        )
+        self.repository.close(
+            event.event_id,
+            closed_at=self.opened_at + timedelta(minutes=5),
+        )
+        SQLiteAutomationRunRepository(self.connection).record(
+            ActionExecution(
+                action=AlarmAction(
+                    action_type=AlarmActionType.CREATE_ALARM_EVENT,
+                    device_id="TH-01",
+                ),
+                mode=AutomationMode.ACTIVE,
+                status=ActionExecutionStatus.FAILED,
+                context={
+                    "python_alarm_transition": {
+                        "active_alarm_id": event.event_id,
+                    }
+                },
+                created_at=self.opened_at,
+            )
+        )
+
+        candidates = self.repository.list_pending_external_bindings()
+
+        self.assertEqual([candidate.event_id for candidate in candidates], [event.event_id])
+
+    def test_closed_marked_pending_event_remains_a_reconciliation_candidate(self) -> None:
+        event = self.repository.create_or_get_active(
+            device_id="TH-01",
+            event_key="ENV:TH-01:pending-candidate",
+            opened_at=self.opened_at,
+            payload={"feishu_binding_status": "PENDING"},
+        )
+        self.repository.close(
+            event.event_id,
+            closed_at=self.opened_at + timedelta(minutes=5),
+        )
+
+        candidates = self.repository.list_pending_external_bindings()
+
+        self.assertEqual([candidate.event_id for candidate in candidates], [event.event_id])
+
+    def test_planned_active_create_is_not_a_legacy_binding_candidate(self) -> None:
+        event = self.repository.create_or_get_active(
+            device_id="TH-01",
+            event_key="ENV:TH-01:planned-candidate",
+            opened_at=self.opened_at,
+        )
+        self.repository.close(
+            event.event_id,
+            closed_at=self.opened_at + timedelta(minutes=5),
+        )
+        SQLiteAutomationRunRepository(self.connection).record(
+            ActionExecution(
+                action=AlarmAction(
+                    action_type=AlarmActionType.CREATE_ALARM_EVENT,
+                    device_id="TH-01",
+                    alarm_id=event.event_id,
+                ),
+                mode=AutomationMode.ACTIVE,
+                status=ActionExecutionStatus.PLANNED,
+                context={
+                    "python_alarm_transition": {
+                        "active_alarm_id": event.event_id,
+                    }
+                },
+                created_at=self.opened_at,
+            )
+        )
+
+        self.assertEqual(self.repository.list_pending_external_bindings(), ())
 
     def test_two_connections_racing_for_different_events_keep_one_active(self) -> None:
         database_path = Path.cwd() / "events-race-test.sqlite"

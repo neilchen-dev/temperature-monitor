@@ -322,17 +322,15 @@ class ShadowAuditTests(unittest.TestCase):
         """Aware values preserve their instant; naive values use business time."""
         import integrations.feishu_writers as writers
 
-        writers._business_tz_cache = None
         utc_value = datetime(2026, 8, 31, 4, 30, 0, tzinfo=timezone.utc)
         expected = int(utc_value.timestamp() * 1000)
         self.assertEqual(writers._datetime_cell(utc_value), expected)
-        business_value = utc_value.astimezone(writers._business_timezone())
+        business_value = utc_value.astimezone(ZoneInfo(config.HISTORY_TIMEZONE))
         self.assertEqual(writers._datetime_cell(business_value), expected)
         naive_value = datetime(2026, 8, 31, 12, 30, 0)
         self.assertEqual(writers._datetime_cell(naive_value), expected)
         with_microseconds = utc_value.replace(microsecond=987654)
         self.assertEqual(writers._datetime_cell(with_microseconds), expected + 987)
-        writers._business_tz_cache = None
 
     def test_runtime_status_reflects_built_runtime(self) -> None:
         """runtime_status() 暴露运行时健康，供 /api/system/status 使用。"""

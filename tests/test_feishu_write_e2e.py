@@ -15,6 +15,7 @@ from application.operation_sync import OperationObservationService
 from domain.alarm_state_machine import AlarmStateMachine
 from domain.models import (
     AlarmActionType,
+    AlarmState,
     ControlType,
     DataQualityStatus,
     DeviceContext,
@@ -444,6 +445,19 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         failed = sample(service, base_time + timedelta(minutes=5), 36)
         self.assertEqual(failed.transition.next.state.value, "ALARM")
         self.assertEqual(len(store.read_records("tbl-event")), 0)
+        local_event_id = failed.transition.next.active_alarm_id
+        self.assertIsNotNone(local_event_id)
+        self.assertEqual(
+            local_event_repository.get(local_event_id).payload["feishu_binding_status"],
+            "PENDING",
+        )
+        # The local monitoring cycle may recover before the remote projection
+        # is repaired. Binding must remain an independent durable obligation.
+        local_event_repository.mark_recovered(
+            local_event_id,
+            recovered_at=base_time + timedelta(minutes=5, seconds=10),
+        )
+        SQLiteAlarmStateRepository(operation_connection).save(AlarmState.normal("TH-03"))
         self.assertTrue(
             any(
                 row[0] == "RECONCILE_ALARM_EVENT"
@@ -473,12 +487,12 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
                 device=device,
                 now=first_retry_at,
             )
-        restarted.task_repository.mark_failed(
-            reconciliation.task_id,
-            finished_at=first_retry_at,
-            error="event create transport failure",
-            worker_id="restarted-worker",
-        )
+        self.assertEqual(restarted.task_repository.get(reconciliation.task_id).status.value, "PENDING")
+        # Delayed visibility of the accepted POST: an empty lookup is not
+        # evidence that a second POST is safe. Publish the same cycle only.
+        store.tables["tbl-event"] = [FeishuRawRecord(
+            record_id="rec-late", fields={"监测点": "TH-03", "开始时间": int(base_time.timestamp() * 1000)}
+        )]
         retry = next(
             task
             for task in restarted.task_repository.claim_due(
@@ -503,9 +517,8 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             worker_id="restarted-worker",
         )
         self.assertEqual(len(store.read_records("tbl-event")), 1)
-        active_event_id = restarted.alarm_state_repository.get("TH-03").active_alarm_id
         self.assertEqual(
-            local_event_repository.get(active_event_id).payload["feishu_record_id"],
+            local_event_repository.get(local_event_id).payload["feishu_record_id"],
             store.read_records("tbl-event")[0].record_id,
         )
         event_tokens = tuple(
@@ -513,19 +526,16 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             for table_id, token in store.create_attempt_tokens
             if table_id == "tbl-event"
         )
-        self.assertEqual(len(event_tokens), 2)
+        self.assertEqual(len(event_tokens), 1)
         self.assertEqual(len(set(event_tokens)), 1)
         self.assertEqual(str(uuid.UUID(event_tokens[0] or "")), event_tokens[0])
         self.assertEqual(uuid.UUID(event_tokens[0] or "").version, 4)
 
-        # The next ALARM sample is a normal UPDATE of the recovered event;
-        # repeated retries remain idempotent and never create a second row.
+        # A later alarm cycle is independent and cannot create a second remote
+        # row for the already recovered cycle.
         sample(restarted, base_time + timedelta(minutes=6), 37)
         sample(restarted, base_time + timedelta(minutes=7), 38)
         self.assertEqual(len(store.read_records("tbl-event")), 1)
-        self.assertEqual(
-            store.read_records("tbl-event")[0].fields["峰值温度(°C)"], 38.0
-        )
 
     def test_create_response_lost_recovers_same_remote_record_and_binds_it(self) -> None:
         moment = datetime(2026, 9, 2, 13, 41, 47, tzinfo=timezone.utc)

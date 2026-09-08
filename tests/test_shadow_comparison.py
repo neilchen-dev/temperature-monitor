@@ -481,8 +481,8 @@ class ShadowComparisonTests(unittest.TestCase):
         self.assertTrue(diff.matched)
         self.assertEqual(diff.difference_type, ())
 
-    def test_unrecovered_open_event_is_duplicated_for_normal(self) -> None:
-        """NORMAL + 未写恢复时间的打开事件 = 真正的重复报警。"""
+    def test_unrecovered_open_event_is_state_mismatch_for_normal(self) -> None:
+        """One remote event does not prove multiple records for one cycle."""
         expected_at = datetime(2026, 8, 28, 13, 0)
         expected = ExpectedAutomationState(
             "TH-03", "NORMAL", "OPERATING", False, expected_at=expected_at
@@ -494,11 +494,11 @@ class ShadowComparisonTests(unittest.TestCase):
             True,
             active_event_count=1,
             pending_closure_count=0,
-            observed_at=expected_at,
+            observed_at=expected_at - timedelta(seconds=61),
         )
         self.assertEqual(
             compare_states(expected, observed).difference_type,
-            ("EVENT_DUPLICATED",),
+            ("EVENT_STATE_MISMATCH",),
         )
 
     def test_recovered_pending_closure_satisfies_recovery_projection(self) -> None:

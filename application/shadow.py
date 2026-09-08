@@ -286,7 +286,7 @@ def _event_difference(
         details["pending_closure_count"] = {"expected": 0, "observed": pending_count}
         return None
     details["event_exists"] = {"expected": False, "observed": True}
-    return "EVENT_DUPLICATED"
+    return "EVENT_STATE_MISMATCH"
 
 
 def _canonical_differences(

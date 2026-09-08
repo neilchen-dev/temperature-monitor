@@ -17,6 +17,7 @@ import threading
 from typing import Any, Callable, Mapping
 
 import config
+from application.active_scope import active_scope_allows
 from application.monitor_service import MonitorApplicationService, MonitorHandlingResult
 from application.operation_sync import OperationObservationService
 from application.shadow import (
@@ -300,6 +301,9 @@ class ShadowRuntime:
                 with self._execution_lock:
                     self._maybe_purge()
                     try:
+                        self._ensure_event_reconciliation_tasks(
+                            now=self.now_provider()
+                        )
                         self.scheduler.run_once()
                     except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
                         # run_once 已捕获 handler 异常；走到这里的是
@@ -609,10 +613,17 @@ class ShadowRuntime:
                 self._last_shadow_compare_time = self.now_provider()
                 self._last_shadow_diff = ",".join(diff.difference_type) or "MATCH"
                 logger.info(
-                    "shadow sample %s %s -> %s",
+                    "shadow sample %s %s -> %s | alarm_lifecycle_owner=%s "
+                    "| standard_projection_differences=%s",
                     expected.device_id,
                     expected.alarm_state,
                     self._last_shadow_diff,
+                    "python" if self.active_canary_enabled and self._standards_ready() and active_scope_allows(
+                        expected.device_id, active_device_ids=self.active_device_ids
+                    ) else "feishu",
+                    ",".join(value for value in diff.difference_type if value not in {
+                        "ALARM_STATE_MISMATCH", "EVENT_STATE_MISMATCH", "EVENT_MISSING", "EVENT_DUPLICATED"
+                    }) or "none",
                 )
         except Exception as exc:
             # Keep a durable retry task for temporary read failures while the
@@ -786,6 +797,67 @@ class ShadowRuntime:
             now if immediate else now + timedelta(seconds=self.operation_sync_interval),
         )
 
+    def _ensure_event_reconciliation_tasks(self, *, now: datetime) -> None:
+        """Re-arm unbound Feishu CREATEs independently of alarm lifecycle state."""
+        standards_ready = getattr(self, "_standards_ready", lambda: True)
+        if not self.active_canary_enabled or not standards_ready():
+            return
+        for event in self.event_repository.list_pending_external_bindings():
+            device_id = event.device_id.strip().upper()
+            if device_id not in self.devices or not active_scope_allows(
+                device_id,
+                active_device_ids=self.active_device_ids,
+            ):
+                continue
+            payload = dict(event.payload)
+            if not payload.get("feishu_record_id") and "feishu_create_attempted" not in payload:
+                self.event_repository.patch_external_projection(
+                    event.event_id, feishu_create_attempted=True
+                )
+            if not payload.get("feishu_record_id") and payload.get("feishu_binding_status") != "PENDING":
+                # Pre-marker CREATE audit is evidence of a possibly accepted
+                # POST, never permission to recreate a manually deleted row.
+                self.event_repository.patch_external_projection(
+                    event.event_id, feishu_create_attempted=True
+                )
+                self.event_repository.mark_external_binding_pending(
+                    event.event_id,
+                    requested_at=now,
+                )
+            started_at = _parse_event_start(payload.get("violation_started_at"))
+            if started_at is None:
+                started_at = _parse_event_start(event.event_key)
+            device = self.devices[device_id]
+            task_payload = {
+                "device_id": device_id,
+                "local_event_id": event.event_id,
+                # Older local events did not project ``area`` into payload_json.
+                # The configured device context is the authoritative fallback
+                # needed to recreate those events after a response loss.
+                "area": str(payload.get("area") or getattr(device, "area", "") or "").strip(),
+                "sample_time": str(payload.get("sample_time") or event.opened_at.isoformat()),
+                "temperature": payload.get("temperature"),
+                "humidity": payload.get("humidity"),
+                "online_status": payload.get("online_status"),
+                "data_quality": payload.get("data_quality"),
+                "temperature_status": payload.get("temperature_status") or "",
+                "humidity_status": payload.get("humidity_status") or "",
+                "violation_started_at": started_at.isoformat() if started_at is not None else None,
+                "alarm_started_at": payload.get("alarm_started_at"),
+                "retry_attempt": int(payload.get("retry_attempt", 0) or 0),
+            }
+            self.task_repository.create_or_get_unfinished(
+                task_type="RECONCILE_ALARM_EVENT",
+                entity_type="DEVICE",
+                entity_id=device_id,
+                due_at=now,
+                payload=task_payload,
+                dedupe_key=(
+                    f"RECONCILE_ALARM_EVENT:{event.event_id}"
+                ),
+                created_at=now,
+            )
+
     def _ensure_projection_tasks(self, *, now: datetime) -> None:
         """Per-tick projection maintenance — the dispatch single owner.
 
@@ -810,6 +882,18 @@ class ShadowRuntime:
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _parse_event_start(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.startswith("ENV:"):
+        text = text.split(":", 2)[-1]
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _expected_payload(expected: ExpectedAutomationState) -> dict[str, Any]:
