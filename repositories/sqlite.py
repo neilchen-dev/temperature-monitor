@@ -40,6 +40,7 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
         "alarm_id", "planned_run_at", "python_monitor_result_json",
         "python_alarm_transition_json", "feishu_observed_state_json", "matched",
         "difference_type", "details_json", "context_json", "error", "created_at",
+        "standard_id", "standard_revision", "standard_source",
     ),
     "environment_events": (
         "event_id", "device_id", "event_key", "status", "opened_at",
@@ -52,10 +53,21 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
         "temperature_min", "temperature_max", "humidity_min", "humidity_max",
         "effective_from", "effective_to", "source_document", "clause",
         "priority", "enabled", "created_at", "updated_at",
+        "standard_source", "validation_status", "validated_at",
     ),
     "standard_sync_runs": (
         "id", "source", "status", "standard_count", "errors_json",
-        "started_at", "finished_at",
+        "started_at", "finished_at", "snapshot_id",
+    ),
+    "standard_snapshots": (
+        "snapshot_id", "source", "synced_at", "standard_count", "status",
+        "created_at",
+    ),
+    "standard_snapshot_members": (
+        "snapshot_id", "standard_id", "revision",
+    ),
+    "standard_runtime_state": (
+        "singleton_id", "active_snapshot_id", "last_known_good_snapshot_id",
     ),
     "alarm_states": (
         "device_id", "state", "violation_started_at", "alarm_started_at",

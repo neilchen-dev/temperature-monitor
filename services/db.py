@@ -21,10 +21,11 @@ Design notes / semantics:
 - ``device_events`` stores state *transitions* only (online/offline,
   temperature threshold crossing); repeated polls in a steady state never
   insert rows.
-- ``device_thresholds`` is the only *authoritative local* table (not a
-  Feishu mirror): per-device control bands for the console. Because losing
-  a write here loses user config, ``save_device_threshold`` reports failure
-  instead of swallowing it like the mirror writers do.
+- ``device_thresholds`` is a legacy presentation cache only. It is not a
+  production standard source; the runtime resolves limits/control type/
+  enabled exclusively from validated Feishu snapshots. The compatibility
+  helpers remain for old database inspection and migration tests, but the API
+  no longer exposes a write path to them.
 - Concurrency assumes a single process / single instance (Waitress threads
   guarded by one lock). Multi-process or multi-container deployment would
   need WAL-friendly coordination beyond the current scope.
@@ -797,12 +798,7 @@ def save_device_threshold(
     humidity_min: float | None,
     humidity_max: float | None,
 ) -> bool:
-    """Full-replace one device's control band; True only when persisted.
-
-    Unlike the mirror writers above, thresholds are authoritative local
-    config — a silently dropped write would make the console show a band
-    the database no longer holds, so the caller must see the failure.
-    """
+    """Legacy cache helper; never use this table for runtime decisions."""
     connection = _get_connection()
     if connection is None:
         return False

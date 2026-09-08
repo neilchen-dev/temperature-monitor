@@ -64,6 +64,7 @@ class ActionExecutor:
         ] | None = None,
         active_device_ids: Iterable[str] | str | None = None,
         recorder: ActionRunRecorder | None = None,
+        standards_ready_provider: Callable[[], bool] | None = None,
     ) -> None:
         self.mode = AutomationMode(mode)
         self.active_device_ids = normalize_device_ids(active_device_ids)
@@ -76,6 +77,18 @@ class ActionExecutor:
             for action_type, handler in (context_handlers or {}).items()
         }
         self.recorder = recorder
+        self.standards_ready_provider = standards_ready_provider
+
+    def standards_ready(self) -> bool:
+        """Return the current production-standard gate, failing closed."""
+        if self.standards_ready_provider is None:
+            # Active execution must never be enabled by omission.  Tests and
+            # alternate runtimes must explicitly provide a ready predicate.
+            return False
+        try:
+            return bool(self.standards_ready_provider())
+        except Exception:  # noqa: BLE001 - a broken health gate must deny writes
+            return False
 
     def execute(
         self,
@@ -126,6 +139,19 @@ class ActionExecutor:
                 action=action,
                 mode=self.mode,
                 status=ActionExecutionStatus.PLANNED,
+                context=context,
+                created_at=created_at,
+            )
+
+        # This is the final production-write gate.  A missing/failed standard
+        # snapshot is observable as a planned action, never as a normal alarm
+        # write and never as a handler exception.
+        if not self.standards_ready():
+            return ActionExecution(
+                action=action,
+                mode=self.mode,
+                status=ActionExecutionStatus.PLANNED,
+                error="standards_ready=false; production action remains PLANNED",
                 context=context,
                 created_at=created_at,
             )

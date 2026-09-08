@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from domain.alarm_state_machine import AlarmStateMachine
-from domain.models import DeviceContext, EnvironmentStandard, MonitorSample
+from domain.models import ControlType, DeviceContext, EnvironmentStandard, MonitorSample
 from domain.standard_resolver import select_standard
 from application.action_executor import ActionExecutor
 from application.actions import ApplicationActionMapper
@@ -36,7 +36,9 @@ def _standard(temp_max: float) -> EnvironmentStandard:
         standard_id="ENV-TEST",
         revision="Rev.A",
         area=AREA,
+        device_id="TH-T",
         operation_type=None,
+        control_type=ControlType.ALL_DAY,
         temperature_min=20.0,
         temperature_max=temp_max,
         humidity_min=40.0,

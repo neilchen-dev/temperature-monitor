@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from typing import Protocol
 
-from domain.models import EnvironmentStandard
+from domain.models import ControlType, EnvironmentStandard
 from repositories.standard_resolver import SQLiteStandardRepository
 
 
@@ -29,6 +30,7 @@ class StandardSyncReport:
     activated: bool
     sync_id: str | None
     errors: tuple[str, ...] = ()
+    changed: bool = False
 
 
 def _intervals_overlap(left: EnvironmentStandard, right: EnvironmentStandard) -> bool:
@@ -64,6 +66,35 @@ def validate_standard_snapshot(
             errors.append(f"priority must be an integer: {identity[0]}/{identity[1]}")
         if not isinstance(standard.enabled, bool):
             errors.append(f"enabled must be boolean: {identity[0]}/{identity[1]}")
+        if not isinstance(standard.device_id, str) or not standard.device_id.strip():
+            errors.append(f"device_id is required: {identity[0]}/{identity[1]}")
+        if not isinstance(standard.control_type, ControlType):
+            errors.append(f"control_type must be a supported enum: {identity[0]}/{identity[1]}")
+        if not isinstance(standard.revision, str) or not standard.revision.strip():
+            errors.append(f"revision/version is required: {identity[0]}/{identity[1]}")
+        for field_name in (
+            "temperature_min",
+            "temperature_max",
+            "humidity_min",
+            "humidity_max",
+        ):
+            value = getattr(standard, field_name)
+            if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(f"{field_name} is required and numeric: {identity[0]}/{identity[1]}")
+            elif not math.isfinite(float(value)):
+                errors.append(f"{field_name} must be finite: {identity[0]}/{identity[1]}")
+        if (
+            standard.temperature_min is not None
+            and standard.temperature_max is not None
+            and standard.temperature_min >= standard.temperature_max
+        ):
+            errors.append(f"temp_min must be less than temp_max: {identity[0]}/{identity[1]}")
+        if (
+            standard.humidity_min is not None
+            and standard.humidity_max is not None
+            and standard.humidity_min >= standard.humidity_max
+        ):
+            errors.append(f"humidity_min must be less than humidity_max: {identity[0]}/{identity[1]}")
 
     for index, left in enumerate(standards):
         if not left.enabled:
@@ -95,8 +126,10 @@ class StandardSyncService:
         *,
         source: StandardSource,
         repository: SQLiteStandardRepository,
-        source_name: str = "standard-source",
+        source_name: str = "feishu:standard-source",
     ) -> None:
+        if not source_name.strip().lower().startswith("feishu:"):
+            raise ValueError("standard sync source must be feishu:*")
         self.source = source
         self.repository = repository
         self.source_name = source_name
@@ -139,11 +172,13 @@ class StandardSyncService:
             )
 
         try:
+            previous_snapshot_id = self.repository.active_snapshot_id()
             sync_id = self.repository.apply_snapshot(
                 standards,
                 source=self.source_name,
                 synced_at=now,
             )
+            changed = previous_snapshot_id != self.repository.active_snapshot_id()
         except Exception as exc:  # noqa: BLE001 - preserve old cache on failure
             error = f"cache activation failed: {exc}"
             failure_id = self.repository.record_sync_failure(
@@ -165,4 +200,5 @@ class StandardSyncService:
             standard_count=len(standards),
             activated=True,
             sync_id=sync_id,
+            changed=changed,
         )

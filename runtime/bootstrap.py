@@ -16,7 +16,7 @@ from application.operation_sync import OperationObservationService
 from application.shadow import ShadowComparisonService
 from application.standard_sync import StandardSyncService
 from domain.alarm_state_machine import AlarmStateMachine
-from domain.models import AlarmActionType, ControlType, DeviceContext
+from domain.models import AlarmActionType, DeviceContext
 from integrations.feishu_observation import (
     FeishuBitableObservationSource,
     FeishuObservationAdapter,
@@ -57,18 +57,20 @@ class RuntimeBootstrapError(ValueError):
     """Configuration prevents a safe Shadow Runtime from being assembled."""
 
 
-DEFAULT_DEVICE_CONTEXTS: dict[str, tuple[str, ControlType]] = {
-    "TH-01": ("对拖测试区", ControlType.MONITOR_ONLY),
-    "TH-02": ("螺旋桨测试间", ControlType.MONITOR_ONLY),
-    "TH-03": ("精密装配间", ControlType.OPERATION_PERIOD),
-    "TH-04": ("电力电子实验室", ControlType.OPERATION_PERIOD),
-    "TH-05": ("通用总装线", ControlType.OPERATION_PERIOD),
-    "TH-06": ("通用总装线", ControlType.MONITOR_ONLY),
-    "TH-07": ("特种工艺间", ControlType.OPERATION_PERIOD),
-    "TH-08": ("防爆仓库", ControlType.ALL_DAY),
-    "TH-09": ("仓库", ControlType.ALL_DAY),
-    "TH-10": ("PE仓库", ControlType.ALL_DAY),
-    "TH-11": ("设备区", ControlType.ALL_DAY),
+DEFAULT_DEVICE_CONTEXTS: dict[str, str] = {
+    # Bootstrap owns identity/routing metadata only.  control_type, limits and
+    # enabled are exclusively supplied by a validated Feishu standard.
+    "TH-01": "对拖测试区",
+    "TH-02": "螺旋桨测试间",
+    "TH-03": "精密装配间",
+    "TH-04": "电力电子实验室",
+    "TH-05": "通用总装线",
+    "TH-06": "通用总装线",
+    "TH-07": "特种工艺间",
+    "TH-08": "防爆仓库",
+    "TH-09": "仓库",
+    "TH-10": "PE仓库",
+    "TH-11": "设备区",
 }
 
 
@@ -137,6 +139,29 @@ def active_canary_status() -> dict[str, Any]:
     """Return the configured Active Canary state for health endpoints."""
     active_device_ids = list(config.ACTIVE_DEVICE_IDS)
     active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
+    readiness: dict[str, Any] = {
+        "active_snapshot_id": None,
+        "last_known_good_snapshot_id": None,
+        "validated_standard_count": 0,
+        "expected_standard_count": 0,
+        "latest_sync_status": None,
+        "last_sync_attempt_at": None,
+        "last_successful_sync_at": None,
+        "standard_source": None,
+        "standards_ready": False,
+    }
+    if _last_components is not None:
+        try:
+            live_readiness = _last_components.standards_readiness()
+            readiness.update(
+                {
+                    key: live_readiness[key]
+                    for key in readiness
+                    if key in live_readiness
+                }
+            )
+        except Exception:  # noqa: BLE001 - status must remain fail-closed
+            logger.exception("读取 Active Canary standards readiness 失败")
     return {
         "active_device_ids": active_device_ids,
         "active_device_count": len(active_device_ids),
@@ -145,7 +170,9 @@ def active_canary_status() -> dict[str, Any]:
             and config.FEISHU_WRITE_ENABLED
             and config.ACTIVE_CUTOVER_ACK == config.ACTIVE_CUTOVER_ACK_EXPECTED
             and active_device_ids
+            and readiness["standards_ready"]
         ),
+        **readiness,
     }
 
 
@@ -186,6 +213,59 @@ def shadow_summary_snapshot(*, hours: int = 24) -> dict[str, Any]:
         return {"available": False, "reason": "shadow summary unavailable", "hours": hours}
     summary["available"] = True
     return summary
+
+
+def resolved_feishu_standards() -> dict[str, Any]:
+    """Return active validated standards for the read-only thresholds API."""
+    result: dict[str, Any] = {
+        "authoritative_source": "feishu",
+        "standards_ready": False,
+        "active_snapshot_id": None,
+        "items": [],
+    }
+    if _last_components is None:
+        return result
+    try:
+        status = _last_components.status()
+        result.update(
+            {
+                "standards_ready": bool(status.get("standards_ready")),
+                "active_snapshot_id": status.get("active_snapshot_id"),
+                "standard_source": status.get("standard_source"),
+            }
+        )
+        result["items"] = [
+            {
+                "standard_id": standard.standard_id,
+                "revision": standard.revision,
+                "area": standard.area,
+                "device_id": standard.device_id,
+                "device": standard.device_id,
+                "operation_type": standard.operation_type,
+                "control_type": (
+                    standard.control_type.value
+                    if standard.control_type is not None
+                    else None
+                ),
+                "temp_min": standard.temperature_min,
+                "temp_max": standard.temperature_max,
+                "humidity_min": standard.humidity_min,
+                "humidity_max": standard.humidity_max,
+                "enabled": standard.enabled,
+                "effective_from": standard.effective_from.isoformat(),
+                "effective_to": (
+                    standard.effective_to.isoformat()
+                    if standard.effective_to is not None
+                    else None
+                ),
+                "standard_source": standard.standard_source,
+            }
+            for standard in _last_components.standard_repository.list_active()
+        ]
+    except Exception:  # noqa: BLE001 - read-only observability must not raise
+        logger.exception("读取 active Feishu standards 失败")
+    result["count"] = len(result["items"])
+    return result
 
 
 def build_runtime(
@@ -297,6 +377,8 @@ def build_runtime(
         ),
     )
 
+    devices, device_error = _build_device_contexts()
+
     effective_mode = (
         mode
         if mode == AutomationMode.SHADOW.value or _active_write_allowed(mode)
@@ -320,6 +402,9 @@ def build_runtime(
             AlarmActionType.MARK_ALARM_RECOVERED: event_writer.handle_alarm_action,
         },
         recorder=run_repository,
+        standards_ready_provider=lambda: standard_repository.standards_ready(
+            expected_device_ids=devices.keys()
+        ),
     )
     if mode == AutomationMode.ACTIVE.value:
         if effective_mode == AutomationMode.ACTIVE.value and config.ACTIVE_DEVICE_IDS:
@@ -353,7 +438,6 @@ def build_runtime(
         ),
     )
 
-    devices, device_error = _build_device_contexts()
     missing = _missing_configuration()
     reason_parts = [part for part in (mode_error, device_error, *missing) if part]
     if mode == AutomationMode.ACTIVE.value:
@@ -460,11 +544,7 @@ def _missing_configuration() -> tuple[str, ...]:
 def _build_device_contexts() -> tuple[dict[str, DeviceContext], str | None]:
     contexts = dict(DEFAULT_DEVICE_CONTEXTS)
     for device_id, override in config.SHADOW_DEVICE_CONTEXTS.items():
-        control = override.get("control_type", "")
-        contexts[device_id] = (
-            override["area"],
-            ControlType(control) if control in {item.value for item in ControlType} else control,
-        )
+        contexts[device_id] = override["area"]
     devices: dict[str, DeviceContext] = {}
     missing: list[str] = []
     for device_id in config.SHADOW_DEVICE_IDS:
@@ -472,11 +552,10 @@ def _build_device_contexts() -> tuple[dict[str, DeviceContext], str | None]:
         if context is None:
             missing.append(device_id)
             continue
-        area, control_type = context
+        area = context
         devices[device_id] = DeviceContext(
             device_id=device_id,
             area=area,
-            control_type=control_type,
         )
     if missing:
         return devices, "缺少 Shadow 设备上下文: " + ",".join(missing)

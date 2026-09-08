@@ -29,6 +29,7 @@ class ActiveCanaryTests(unittest.TestCase):
             mode="active",
             active_device_ids=" th-10 ",
             context_handlers={AlarmActionType.CREATE_ALARM_EVENT: handler},
+            standards_ready_provider=lambda: True,
         )
 
         execution = executor.execute(
@@ -49,6 +50,7 @@ class ActiveCanaryTests(unittest.TestCase):
                     context["device_id"]
                 )
             },
+            standards_ready_provider=lambda: True,
         )
 
         execution = executor.execute(
@@ -68,6 +70,7 @@ class ActiveCanaryTests(unittest.TestCase):
             handlers={
                 AlarmActionType.CREATE_VERIFY_TASK: lambda action: calls.append("called")
             },
+            standards_ready_provider=lambda: True,
         )
 
         execution = executor.execute(
@@ -86,6 +89,7 @@ class ActiveCanaryTests(unittest.TestCase):
             mode="active",
             active_device_ids=(),
             handlers={AlarmActionType.CREATE_VERIFY_TASK: lambda action: calls.append("called")},
+            standards_ready_provider=lambda: True,
         )
 
         execution = executor.execute(
@@ -107,6 +111,7 @@ class ActiveCanaryTests(unittest.TestCase):
             active_device_ids=("TH-10",),
             handlers={AlarmActionType.CREATE_VERIFY_TASK: lambda action: calls.append("called")},
             recorder=recorder,
+            standards_ready_provider=lambda: True,
         )
 
         execution = executor.execute(
@@ -139,6 +144,7 @@ class ActiveCanaryTests(unittest.TestCase):
             mode="active",
             active_device_ids=("TH-10",),
             context_handlers={action_type: handler for action_type in action_types},
+            standards_ready_provider=lambda: True,
         )
 
         executions = executor.execute(
@@ -179,6 +185,7 @@ class ActiveCanaryTests(unittest.TestCase):
                     action.device_id
                 )
             },
+            standards_ready_provider=lambda: True,
         )
 
         def run(device_id: str):

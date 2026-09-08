@@ -164,13 +164,13 @@ class StandardResolverTests(unittest.TestCase):
     def test_sqlite_resolver_uses_same_selection_rules(self) -> None:
         connection = sqlite3.connect(":memory:")
         repository = SQLiteStandardRepository(connection)
-        repository.upsert(
-            self._standard("DEFAULT"),
-            updated_at=self.timestamp,
-        )
-        repository.upsert(
-            self._standard("OPERATION", operation_type="清洁", priority=1),
-            updated_at=self.timestamp,
+        repository.apply_snapshot(
+            (
+                self._standard("DEFAULT"),
+                self._standard("OPERATION", operation_type="清洁", priority=1),
+            ),
+            source="feishu:test",
+            synced_at=self.timestamp,
         )
         resolver = SQLiteStandardResolver(repository)
         selected = resolver.resolve(

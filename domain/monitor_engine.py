@@ -110,9 +110,18 @@ def _quality_from_sample(
 def resolve_control_type(
     *, device: DeviceContext, standard: EnvironmentStandard | None
 ) -> tuple[ControlType | None, str, str]:
-    """Resolve one authoritative control type plus migration diagnostics."""
+    """Resolve control type from the validated standard only.
+
+    ``DeviceContext.control_type`` is retained as a compatibility field for
+    older callers and diagnostics, but it is never a source of business
+    configuration.  Missing standard data therefore fails closed.
+    """
     standard_control = standard.control_type if standard is not None else None
-    legacy_control = parse_control_type(device.control_type)
+    # Legacy metadata is observed only for a non-empty standard's migration
+    # diagnostic.  It is never consulted when no validated standard exists.
+    legacy_control = (
+        parse_control_type(device.control_type) if standard is not None else None
+    )
     if standard_control is not None:
         consistency = (
             "match"
@@ -122,9 +131,7 @@ def resolve_control_type(
             else "legacy_missing"
         )
         return standard_control, "standard", consistency
-    if legacy_control is not None:
-        return legacy_control, "device_context_fallback", "standard_missing"
-    return None, "configuration_error", "standard_missing"
+    return None, "standard_unavailable", "standard_missing"
 
 
 def _is_not_applicable(
@@ -174,7 +181,7 @@ def evaluate_monitor_state(
     if standard is None:
         temperature_status = TemperatureStatus.UNKNOWN
         humidity_status = TemperatureStatus.UNKNOWN
-        temperature_reasons = ("no_applicable_standard",)
+        temperature_reasons = ("standard_unavailable", "no_applicable_standard")
         humidity_reasons: tuple[str, ...] = ()
     else:
         temperature_status, temperature_reasons = _evaluate_dimension(
@@ -235,6 +242,7 @@ def evaluate_monitor_state(
         standard_id=standard.standard_id if standard is not None else None,
         standard_revision=standard.revision if standard is not None else None,
         reasons=reasons,
+        standard_source=(standard.standard_source if standard is not None else None),
         applicability=applicability,
         data_quality=quality,
         resolved_control_type=resolved_control_type,

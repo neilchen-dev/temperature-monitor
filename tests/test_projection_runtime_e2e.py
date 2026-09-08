@@ -39,6 +39,7 @@ def _std_record(record_id: str, area: str, device: str, temp_max: float) -> Feis
             "适用区域": area,
             "适用设备": device,
             "适用作业类型": None,
+            "控制类型": "全天控制",
             "温度下限（°C）": 20,
             "温度上限（°C）": temp_max,
             "湿度下限（%RH）": 40,

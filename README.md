@@ -56,7 +56,7 @@ flowchart LR
     monitoring --> console
 ```
 
-Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器在后台轮询 TCP 或 RTU 设备，并把结果写入同一套设备样本、事件和查询接口。SQLite 是飞书业务数据的本地镜像，同时保存统一设备状态、阈值和事件；飞书多维表格仍是业务同步链路的事实源。
+Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器在后台轮询 TCP 或 RTU 设备，并把结果写入同一套设备样本、事件和查询接口。SQLite 保存飞书业务数据的本地镜像、统一设备状态和审计；生产运行标准只来自飞书标准表同步后的 validated snapshot。
 
 ## Features
 
@@ -73,7 +73,7 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 - 在线/离线状态只在发生变化时记录事件，稳定轮询不会制造重复事件。
 - 可通过 `EVENT_TEMPERATURE_HIGH_C` 开启温度超限和恢复事件。
 - 事件身份是“设备 + 数据源”，同一设备的 Home Assistant 与 Modbus 状态互不覆盖。
-- 控制区间按设备保存在本地 SQLite，可分别设置温度和湿度上下限。
+- 控制区间由飞书 validated standard 提供；本地控制台只读展示，不提供本地标准写入。
 
 ### Domain engine and Shadow Runtime
 
@@ -87,7 +87,7 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 - Home Assistant 默认每 10 分钟调用一次 `POST /history/sample`。
 - 历史快照按设备和时间桶幂等写入，重复请求不会重复生成记录。
-- SQLite 采用 WAL 模式，保存温度上报、历史快照、设备样本、事件和阈值。
+- SQLite 采用 WAL 模式，保存温度上报、历史快照、设备样本、事件和审计；旧阈值表仅保留作兼容性缓存。
 - 提供快照明细、每日统计、设备总览和系统健康接口。
 - 飞书或 SQLite 的局部失败会记录日志并暴露健康状态，便于排查同步延迟。
 
@@ -125,7 +125,8 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 | `GET /history/stats/devices` | 设备快照和离线时长估算 | `X-History-Key` |
 | `GET /api/devices` | 查询统一设备状态 | `X-History-Key` |
 | `GET /api/events` | 查询设备事件 | `X-History-Key` |
-| `GET /api/thresholds` / `PUT /api/thresholds/<device_id>` | 查询或写入设备控制区间 | `X-History-Key` |
+| `GET /api/thresholds` | 查询当前 Feishu validated 控制区间（`authoritative_source=feishu`） | `X-History-Key` |
+| `PUT /api/thresholds/<device_id>` | 已废止，返回 `409`，不能改变生产标准 | `X-History-Key` |
 | `POST /api/operations` | 写入一条作业登记 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` + 白名单设备 |
 | `POST /api/environment-events` | 写入一条环境异常事件 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` + 白名单设备 |
 | `PATCH /api/environment-events/<record_id>` | 填写闭环资料并关闭环境异常 | `X-History-Key`；先按 `record_id` 解析事件设备，再检查白名单 |
@@ -227,7 +228,7 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `SHADOW_DEVICE_IDS` | 空 | Shadow 处理的设备白名单；为空时不处理设备 |
 | `ACTIVE_DEVICE_IDS` | 空 | Active Canary 写回白名单；逗号分隔、自动 uppercase/strip；为空时 fail closed |
 | `ACTIVE_CUTOVER_ACK` | 空 | 确认白名单设备的 legacy owner 已禁用/排除；Canary 阶段不要求关闭其他设备工作流 |
-| `SHADOW_DEVICE_CONTEXTS` | 空 | 设备上下文 JSON，可覆盖区域和控制类型 |
+| `SHADOW_DEVICE_CONTEXTS` | 空 | 设备静态上下文 JSON，可覆盖区域；控制类型、上下限和启用状态只来自已验证的飞书标准表 |
 | `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID |
 | `FEISHU_OPERATION_INTERVAL_TABLE_ID` / `FEISHU_INSPECTION_TABLE_ID` | 当前台账表 ID | 作业区间和仓库点检写入目标表 |
 | `FEISHU_WRITE_ENABLED` | `false` | 飞书写入总开关；只有与 `AUTOMATION_MODE=active` 同时启用才生效 |

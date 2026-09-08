@@ -8,7 +8,7 @@ from application.standard_sync import (
     StandardSyncService,
     StandardSyncStatus,
 )
-from domain.models import EnvironmentStandard
+from domain.models import ControlType, EnvironmentStandard
 from repositories.standard_resolver import SQLiteStandardRepository, SQLiteStandardResolver
 
 
@@ -40,8 +40,9 @@ class StandardSyncTests(unittest.TestCase):
             standard_id=standard_id,
             revision="Rev.A",
             area="仓库",
-            device_id=device_id,
+            device_id=device_id or "TH-01",
             operation_type=None,
+            control_type=ControlType.ALL_DAY,
             temperature_min=20.0,
             temperature_max=26.0,
             humidity_min=40.0,
@@ -57,7 +58,7 @@ class StandardSyncTests(unittest.TestCase):
         service = StandardSyncService(
             source=_Source((self._standard("ENV-001"),)),
             repository=self.repository,
-            source_name="test",
+            source_name="feishu:test",
         )
         report = service.sync(now=self.now)
         self.assertEqual(report.status, StandardSyncStatus.SUCCEEDED)
@@ -66,6 +67,7 @@ class StandardSyncTests(unittest.TestCase):
             resolver.resolve(
                 area_id="仓库",
                 operation_type=None,
+                device_id="TH-01",
                 timestamp=self.now,
             ).standard_id,
             "ENV-001",
@@ -79,7 +81,7 @@ class StandardSyncTests(unittest.TestCase):
         report = StandardSyncService(
             source=_Source(standards),
             repository=self.repository,
-            source_name="test",
+            source_name="feishu:test",
         ).sync(now=self.now)
         self.assertEqual(report.status, StandardSyncStatus.SUCCEEDED)
         resolver = SQLiteStandardResolver(self.repository)
@@ -95,7 +97,7 @@ class StandardSyncTests(unittest.TestCase):
 
     def test_invalid_snapshot_keeps_previous_active_standard(self) -> None:
         initial = self._standard("ENV-001")
-        self.repository.apply_snapshot((initial,), source="test", synced_at=self.now)
+        self.repository.apply_snapshot((initial,), source="feishu:test", synced_at=self.now)
         invalid = (
             self._standard("ENV-002"),
             self._standard("ENV-003"),
@@ -103,20 +105,21 @@ class StandardSyncTests(unittest.TestCase):
         report = StandardSyncService(
             source=_Source(invalid),
             repository=self.repository,
-            source_name="test",
+            source_name="feishu:test",
         ).sync(now=self.now + timedelta(minutes=1))
         self.assertEqual(report.status, StandardSyncStatus.FAILED)
         self.assertFalse(report.activated)
         selected = SQLiteStandardResolver(self.repository).resolve(
             area_id="仓库",
             operation_type=None,
+            device_id="TH-01",
             timestamp=self.now,
         )
         self.assertEqual(selected.standard_id, "ENV-001")
 
     def test_source_failure_keeps_previous_active_standard(self) -> None:
         initial = self._standard("ENV-001")
-        self.repository.apply_snapshot((initial,), source="test", synced_at=self.now)
+        self.repository.apply_snapshot((initial,), source="feishu:test", synced_at=self.now)
 
         class FailingSource:
             def fetch_standards(self) -> tuple[EnvironmentStandard, ...]:
@@ -125,12 +128,17 @@ class StandardSyncTests(unittest.TestCase):
         report = StandardSyncService(
             source=FailingSource(),
             repository=self.repository,
-            source_name="test",
+            source_name="feishu:test",
         ).sync(now=self.now + timedelta(minutes=1))
         self.assertEqual(report.status, StandardSyncStatus.FAILED)
         self.assertEqual(
             SQLiteStandardResolver(self.repository)
-            .resolve(area_id="仓库", operation_type=None, timestamp=self.now)
+            .resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-01",
+                timestamp=self.now,
+            )
             .standard_id,
             "ENV-001",
         )

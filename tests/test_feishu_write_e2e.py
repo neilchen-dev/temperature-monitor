@@ -209,6 +209,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             revision="R1",
             area="精密装配间",
             operation_type="未关联工艺文件（TH-03）",
+            control_type=ControlType.OPERATION_PERIOD,
             temperature_min=20.0,
             temperature_max=30.0,
             humidity_min=30.0,
@@ -221,6 +222,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
         action_executor = ActionExecutor(
             mode="active",
             active_device_ids=("TH-03",),
+            standards_ready_provider=lambda: True,
             handlers={
                 AlarmActionType.CREATE_VERIFY_TASK: lambda action: None,
                 AlarmActionType.COMPLETE_VERIFY_TASK: lambda action: None,
@@ -383,6 +385,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
             revision="R1",
             area="精密装配间",
             operation_type="未关联工艺文件（TH-03）",
+            control_type=ControlType.OPERATION_PERIOD,
             temperature_min=20.0,
             temperature_max=30.0,
             humidity_min=30.0,
@@ -403,6 +406,7 @@ class FeishuWriteEndToEndTests(unittest.TestCase):
                 action_executor=ActionExecutor(
                     mode="active",
                     active_device_ids=("TH-03",),
+                    standards_ready_provider=lambda: True,
                     handlers={
                         AlarmActionType.CREATE_VERIFY_TASK: lambda action: None,
                         AlarmActionType.COMPLETE_VERIFY_TASK: lambda action: None,

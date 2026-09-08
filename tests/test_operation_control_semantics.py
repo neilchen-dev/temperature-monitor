@@ -24,16 +24,21 @@ from runtime.bootstrap import DEFAULT_DEVICE_CONTEXTS
 NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 
 
-def _device(device_id: str, area: str, control_type: ControlType) -> DeviceContext:
-    return DeviceContext(device_id=device_id, area=area, control_type=control_type)
+def _device(device_id: str, area: str) -> DeviceContext:
+    return DeviceContext(device_id=device_id, area=area)
 
 
-def _standard(device: DeviceContext, operation_type: str | None = None) -> EnvironmentStandard:
+def _standard(
+    device: DeviceContext,
+    operation_type: str | None = None,
+    control_type: ControlType = ControlType.ALL_DAY,
+) -> EnvironmentStandard:
     return EnvironmentStandard(
         standard_id=f"ENV-{device.device_id}",
         revision="Rev.A",
         area=device.area,
         operation_type=operation_type,
+        control_type=control_type,
         temperature_min=20.0,
         temperature_max=26.0,
         humidity_min=40.0,
@@ -55,7 +60,7 @@ def _evaluate(
     return evaluate_monitor_state(
         device=device,
         sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
-        standard=_standard(device, operation_type),
+    standard=_standard(device, operation_type),
         operation_state=repository.get(device),
     )
 
@@ -64,13 +69,17 @@ def _evaluate(
 def test_monitor_only_production_devices_default_to_not_applicable(device_id: str) -> None:
     connection = sqlite3.connect(":memory:")
     repository = SQLiteOperationRepository(connection)
-    area, control_type = DEFAULT_DEVICE_CONTEXTS[device_id]
-    device = _device(device_id, area, control_type)
+    area = DEFAULT_DEVICE_CONTEXTS[device_id]
+    device = _device(device_id, area)
 
     state = repository.get(device)
-    result = _evaluate(repository, device)
+    result = evaluate_monitor_state(
+        device=device,
+        sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
+        standard=_standard(device, control_type=ControlType.MONITOR_ONLY),
+        operation_state=state,
+    )
 
-    assert control_type is ControlType.MONITOR_ONLY
     assert state.state is OperationStatus.NOT_APPLICABLE
     assert result.applicability is ApplicabilityStatus.NOT_APPLICABLE
     assert result.overall_status is OverallStatus.UNKNOWN
@@ -80,8 +89,8 @@ def test_monitor_only_production_devices_default_to_not_applicable(device_id: st
 @pytest.mark.parametrize(
     ("device_id", "expected_control", "expected_operation", "expected_overall"),
     (
-        ("TH-05", ControlType.OPERATION_PERIOD, OperationStatus.IDLE, OverallStatus.UNKNOWN),
-        ("TH-07", ControlType.OPERATION_PERIOD, OperationStatus.IDLE, OverallStatus.UNKNOWN),
+        ("TH-05", ControlType.OPERATION_PERIOD, OperationStatus.NOT_APPLICABLE, OverallStatus.UNKNOWN),
+        ("TH-07", ControlType.OPERATION_PERIOD, OperationStatus.NOT_APPLICABLE, OverallStatus.UNKNOWN),
         ("TH-08", ControlType.ALL_DAY, OperationStatus.NOT_APPLICABLE, OverallStatus.NORMAL),
         ("TH-09", ControlType.ALL_DAY, OperationStatus.NOT_APPLICABLE, OverallStatus.NORMAL),
         ("TH-11", ControlType.ALL_DAY, OperationStatus.NOT_APPLICABLE, OverallStatus.NORMAL),
@@ -95,13 +104,17 @@ def test_current_match_device_branches_are_preserved(
 ) -> None:
     connection = sqlite3.connect(":memory:")
     repository = SQLiteOperationRepository(connection)
-    area, control_type = DEFAULT_DEVICE_CONTEXTS[device_id]
-    device = _device(device_id, area, control_type)
+    area = DEFAULT_DEVICE_CONTEXTS[device_id]
+    device = _device(device_id, area)
 
     state = repository.get(device)
-    result = _evaluate(repository, device)
+    result = evaluate_monitor_state(
+        device=device,
+        sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
+        standard=_standard(device, control_type=expected_control),
+        operation_state=state,
+    )
 
-    assert control_type is expected_control
     assert state.state is expected_operation
     assert result.overall_status is expected_overall
     connection.close()
@@ -111,8 +124,8 @@ def test_operation_period_with_valid_operation_is_applicable() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SQLiteOperationRepository(connection)
     service = OperationObservationService(store=repository)
-    area, control_type = DEFAULT_DEVICE_CONTEXTS["TH-05"]
-    device = _device("TH-05", area, control_type)
+    area = DEFAULT_DEVICE_CONTEXTS["TH-05"]
+    device = _device("TH-05", area)
     service.apply(
         OperationObservation(
             device_id=device.device_id,
@@ -127,7 +140,14 @@ def test_operation_period_with_valid_operation_is_applicable() -> None:
     )
 
     state = repository.get(device)
-    result = _evaluate(repository, device, operation_type="总装")
+    result = evaluate_monitor_state(
+        device=device,
+        sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
+        standard=_standard(
+            device, operation_type="总装", control_type=ControlType.OPERATION_PERIOD
+        ),
+        operation_state=state,
+    )
 
     assert state.state is OperationStatus.OPERATING
     assert result.applicability is ApplicabilityStatus.APPLICABLE
@@ -139,8 +159,8 @@ def test_operation_just_ended_returns_operation_period_to_idle() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SQLiteOperationRepository(connection)
     service = OperationObservationService(store=repository)
-    area, control_type = DEFAULT_DEVICE_CONTEXTS["TH-05"]
-    device = _device("TH-05", area, control_type)
+    area = DEFAULT_DEVICE_CONTEXTS["TH-05"]
+    device = _device("TH-05", area)
     service.apply(
         OperationObservation(
             device_id=device.device_id,
@@ -167,7 +187,12 @@ def test_operation_just_ended_returns_operation_period_to_idle() -> None:
     )
 
     state = repository.get(device)
-    result = _evaluate(repository, device)
+    result = evaluate_monitor_state(
+        device=device,
+        sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
+        standard=_standard(device, control_type=ControlType.OPERATION_PERIOD),
+        operation_state=state,
+    )
 
     assert state.state is OperationStatus.IDLE
     assert state.ended_at == NOW

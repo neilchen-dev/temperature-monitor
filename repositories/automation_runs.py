@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     details_json TEXT,
     context_json TEXT NOT NULL,
     error TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    standard_id TEXT,
+    standard_revision TEXT,
+    standard_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_automation_runs_device_time
     ON automation_runs(device_id, created_at);
@@ -58,12 +61,26 @@ class SQLiteAutomationRunRepository:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(_SCHEMA)
+        columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(automation_runs)"
+            ).fetchall()
+        }
+        for column in ("standard_id", "standard_revision", "standard_source"):
+            if column not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE automation_runs ADD COLUMN {column} TEXT"
+                )
         self.connection.commit()
 
     def record(self, execution: ActionExecution) -> str:
         context = dict(execution.context)
         created_at = execution.created_at or datetime.now().astimezone()
         run_id = uuid.uuid4().hex
+        monitor_result = context.get("python_monitor_result")
+        if not isinstance(monitor_result, Mapping):
+            monitor_result = {}
         self.connection.execute(
             """
             INSERT INTO automation_runs (
@@ -71,8 +88,8 @@ class SQLiteAutomationRunRepository:
                 alarm_id, planned_run_at, python_monitor_result_json,
                 python_alarm_transition_json, feishu_observed_state_json,
                 matched, difference_type, details_json, context_json, error,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, standard_id, standard_revision, standard_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -96,6 +113,9 @@ class SQLiteAutomationRunRepository:
                 _json_text(context),
                 execution.error,
                 _time_text(created_at),
+                monitor_result.get("standard_id"),
+                monitor_result.get("standard_revision"),
+                monitor_result.get("standard_source"),
             ),
         )
         self.connection.commit()
@@ -118,8 +138,9 @@ class SQLiteAutomationRunRepository:
             INSERT INTO automation_runs (
                 id, device_id, sample_time, mode, action_type, action_status,
                 feishu_observed_state_json, matched, difference_type,
-                details_json, context_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                details_json, context_json, created_at,
+                standard_id, standard_revision, standard_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -134,6 +155,9 @@ class SQLiteAutomationRunRepository:
                 _json_text(dict(diff.details)),
                 _json_text({"expected": dict(expected), "observed": dict(observed)}),
                 created_at.isoformat(),
+                expected.get("standard_id"),
+                expected.get("standard_revision"),
+                expected.get("standard_source"),
             ),
         )
         self.connection.commit()

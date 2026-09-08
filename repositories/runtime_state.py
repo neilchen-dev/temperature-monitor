@@ -13,13 +13,11 @@ from datetime import datetime
 from domain.models import (
     AlarmLifecycleState,
     AlarmState,
-    ControlType,
     DataQualityStatus,
     DeviceContext,
     MonitorSample,
     OperationState,
     OperationStatus,
-    parse_control_type,
 )
 from domain.operation import OperationAction, OperationObservation
 
@@ -320,17 +318,12 @@ class SQLiteOperationRepository:
             "SELECT * FROM operation_states WHERE device_id = ?", (device.device_id,)
         ).fetchone()
         if row is None:
-            control_type = parse_control_type(device.control_type)
-            default_status = (
-                OperationStatus.NOT_APPLICABLE
-                # ALL_DAY has no operation context; MONITOR_ONLY is outside
-                # operation-gated control.  Only OPERATION_PERIOD can be IDLE.
-                if control_type in {ControlType.ALL_DAY, ControlType.MONITOR_ONLY}
-                else OperationStatus.IDLE
-            )
             return OperationState(
                 area_id=device.area,
-                state=default_status,
+                # Operation state is independent runtime context.  The
+                # environmental control mode is resolved from Feishu only by
+                # the monitor engine and is never inferred here.
+                state=OperationStatus.NOT_APPLICABLE,
                 operation_type=None,
                 work_order=None,
                 started_at=None,

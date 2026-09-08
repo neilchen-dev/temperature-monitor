@@ -90,8 +90,9 @@ resolve(
 解析顺序固定为：启用且时间有效、区域匹配、设备精确匹配优先、作业类型精确匹配优先、
 `priority` 较高优先。
 如果最高优先级仍有多个候选，必须抛出配置冲突；没有候选则抛出未找到异常。
-`StaticStandardResolver` 用于测试和本地开发，`SQLiteStandardResolver` 从本地
-`standard_versions` 缓存解析；飞书只作为后续同步来源，不参与实时规则判断。
+`StaticStandardResolver` 仅用于测试和本地开发，生产 `SQLiteStandardResolver` 只从
+validated Feishu snapshot 的 active/LKG 链解析；legacy `standard_versions` 历史行没有
+快照指针时不可用，也不能提供 control_type fallback。
 
 ## 调用约定
 
@@ -215,13 +216,14 @@ Feishu HTTP 服务，领域层不感知飞书字段名。
 标准同步的输入是标准化后的完整快照，不是领域层直接读取飞书记录。`StandardSyncService`
 先验证全部快照，再在一个事务内激活：
 
-1. 检查字段完整性、版本重复、时间范围和 `min <= max`。
+1. 检查字段完整性、设备编号、control_type enum、版本重复、时间范围和 `min < max`。
 2. 检查启用标准在相同 `area + operation_type + priority` 下是否存在有效时间重叠。
-3. 校验通过后，原子更新 SQLite `standard_versions`。
+3. 校验通过后，追加/复用不可变版本行，创建历史 snapshot，并原子移动 active/LKG 指针。
 4. 校验失败、源不可用或激活失败时写入 `standard_sync_runs`，保留上一版有效缓存。
 
 当前提供 `StaticStandardResolver` 和 `SQLiteStandardResolver`；`FeishuStandardAdapter` 作为
-只读 source adapter 读取已建立的独立标准表，不让飞书字段名进入 domain 或比较器。
+只读 source adapter 读取已建立的独立标准表，不让飞书字段名进入 domain 或比较器。首次
+部署不会把 legacy 行提升为 snapshot，必须先完成一次严格 Feishu sync。
 
 ## 作业观察和 active event 规则
 

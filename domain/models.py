@@ -144,6 +144,9 @@ class EnvironmentStandard:
     enabled: bool = True
     device_id: str | None = None
     control_type: ControlType | str | None = None
+    # Operational provenance of the validated snapshot.  This is deliberately
+    # separate from ``source_document`` (the QMS/SOP reference in the table).
+    standard_source: str = "feishu"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "control_type", parse_control_type(self.control_type))
@@ -155,6 +158,8 @@ class EnvironmentStandard:
             raise ValueError("area cannot be empty")
         if self.device_id is not None and not self.device_id.strip():
             raise ValueError("device_id cannot be blank when provided")
+        if not self.standard_source.strip():
+            raise ValueError("standard_source cannot be empty")
         if not self.source_document.strip():
             raise ValueError("source_document cannot be empty")
         if self.effective_from.tzinfo is None or self.effective_from.utcoffset() is None:
@@ -229,6 +234,7 @@ class MonitorResult:
     standard_id: str | None
     standard_revision: str | None
     reasons: tuple[str, ...]
+    standard_source: str | None = None
     applicability: ApplicabilityStatus = ApplicabilityStatus.APPLICABLE
     data_quality: DataQualityStatus = DataQualityStatus.GOOD
     resolved_control_type: ControlType | None = None

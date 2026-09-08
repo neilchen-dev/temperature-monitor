@@ -62,6 +62,15 @@ class RuntimeStatus:
     scheduler_running: bool
     last_standard_sync_time: datetime | None
     enabled_standard_count: int
+    active_snapshot_id: str | None
+    last_known_good_snapshot_id: str | None
+    validated_standard_count: int
+    expected_standard_count: int
+    latest_sync_status: str | None
+    last_sync_attempt_at: datetime | None
+    last_successful_sync_at: datetime | None
+    standard_source: str | None
+    standards_ready: bool
     last_processed_sample_time: datetime | None
     last_shadow_compare_time: datetime | None
     last_shadow_diff: str | None
@@ -82,6 +91,15 @@ class RuntimeStatus:
             "scheduler_running": self.scheduler_running,
             "last_standard_sync_time": _iso(self.last_standard_sync_time),
             "enabled_standard_count": self.enabled_standard_count,
+            "active_snapshot_id": self.active_snapshot_id,
+            "last_known_good_snapshot_id": self.last_known_good_snapshot_id,
+            "validated_standard_count": self.validated_standard_count,
+            "expected_standard_count": self.expected_standard_count,
+            "latest_sync_status": self.latest_sync_status,
+            "last_sync_attempt_at": _iso(self.last_sync_attempt_at),
+            "last_successful_sync_at": _iso(self.last_successful_sync_at),
+            "standard_source": self.standard_source,
+            "standards_ready": self.standards_ready,
             "last_processed_sample_time": _iso(self.last_processed_sample_time),
             "last_shadow_compare_time": _iso(self.last_shadow_compare_time),
             "last_shadow_diff": self.last_shadow_diff,
@@ -163,6 +181,42 @@ class ShadowRuntime:
         self._last_purge_time: datetime | None = None
         self._last_operation_sync_time: datetime | None = None
         self._last_expected_state: dict[str, ExpectedAutomationState] = {}
+
+    def standards_readiness(self) -> dict[str, Any]:
+        """Return repository-backed readiness; any read error fails closed."""
+        try:
+            return self.standard_repository.readiness(
+                expected_device_ids=self.devices.keys()
+            )
+        except Exception:  # noqa: BLE001 - observability must not enable writes
+            logger.exception("读取 standards readiness 失败，按未就绪处理")
+            return {
+                "active_snapshot_id": None,
+                "last_known_good_snapshot_id": None,
+                "validated_standard_count": 0,
+                "validated_device_count": 0,
+                "expected_standard_count": len(self.devices),
+                "expected_device_count": len(self.devices),
+                "latest_sync_status": "UNAVAILABLE",
+                "last_sync_attempt_at": None,
+                "last_successful_sync_at": None,
+                "standard_source": None,
+                "standards_ready": False,
+                "active_snapshot_status": None,
+                "last_known_good_snapshot_status": None,
+            }
+
+    def _standards_ready(self) -> bool:
+        return bool(self.standards_readiness()["standards_ready"])
+
+    @staticmethod
+    def _readiness_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
 
     def start(self) -> None:
         """Start local scheduling; Feishu sync and observation are background work."""
@@ -338,6 +392,7 @@ class ShadowRuntime:
                 overall_status=result.monitor_result.overall_status.value,
                 standard_id=result.monitor_result.standard_id,
                 standard_revision=result.monitor_result.standard_revision,
+                standard_source=result.monitor_result.standard_source,
                 active_event_count=len(active_events),
                 active_event_ids=tuple(event.event_id for event in active_events),
                 expected_at=self.now_provider(),
@@ -364,6 +419,8 @@ class ShadowRuntime:
                 self._scheduler_thread is not None
                 and self._scheduler_thread.is_alive()
             )
+            readiness = self.standards_readiness()
+            standards_ready = bool(readiness["standards_ready"])
             status = RuntimeStatus(
                 mode=self.mode,
                 available=self.available,
@@ -375,10 +432,27 @@ class ShadowRuntime:
                 configured_shadow_devices=tuple(self.devices),
                 active_device_ids=self.active_device_ids,
                 active_device_count=len(self.active_device_ids),
-                active_canary_enabled=self.active_canary_enabled,
+                active_canary_enabled=(
+                    self.active_canary_enabled and standards_ready
+                ),
                 scheduler_running=scheduler_running,
                 last_standard_sync_time=self._last_standard_sync_time,
                 enabled_standard_count=self._enabled_standard_count,
+                active_snapshot_id=readiness["active_snapshot_id"],
+                last_known_good_snapshot_id=readiness[
+                    "last_known_good_snapshot_id"
+                ],
+                validated_standard_count=readiness["validated_standard_count"],
+                expected_standard_count=readiness["expected_standard_count"],
+                latest_sync_status=readiness["latest_sync_status"],
+                last_sync_attempt_at=self._readiness_datetime(
+                    readiness["last_sync_attempt_at"]
+                ),
+                last_successful_sync_at=self._readiness_datetime(
+                    readiness["last_successful_sync_at"]
+                ),
+                standard_source=readiness["standard_source"],
+                standards_ready=standards_ready,
                 last_processed_sample_time=self._last_processed_sample_time,
                 last_shadow_compare_time=self._last_shadow_compare_time,
                 last_shadow_diff=self._last_shadow_diff,
@@ -576,12 +650,13 @@ class ShadowRuntime:
 
     def handle_standard_sync(self, task: Any) -> None:
         with self._execution_lock:
-            report = self.standard_sync.sync(now=self.now_provider())
-            self._last_standard_sync_time = self.now_provider()
+            sync_time = self.now_provider()
+            report = self.standard_sync.sync(now=sync_time)
+            self._last_standard_sync_time = sync_time
             # Read the cache after both success and failure so status keeps
             # reporting the previous active version when a remote sync fails.
             self._enabled_standard_count = sum(
-                1 for standard in self.standard_repository.list_all() if standard.enabled
+                1 for standard in self.standard_repository.list_active() if standard.enabled
             )
             if report.errors:
                 logger.error(
@@ -590,6 +665,27 @@ class ShadowRuntime:
                 )
             else:
                 logger.info("Shadow 标准同步完成 | enabled=%s", self._enabled_standard_count)
+
+    def trigger_standard_sync(self, *, now: datetime | None = None) -> Any:
+        """Queue an immediate sync; designed as the future Feishu event hook.
+
+        Periodic scheduling remains the safety net.  A webhook/event adapter
+        can call this method without knowing the scheduler or SQLite details.
+        """
+        current_time = now or self.now_provider()
+        with self._execution_lock:
+            return self.task_repository.create_or_get_unfinished(
+                task_type="SYNC_STANDARD",
+                entity_type="RUNTIME",
+                entity_id="standards",
+                due_at=current_time,
+                payload={
+                    "runtime_worker_id": self.worker_id,
+                    "trigger": "external_event",
+                },
+                dedupe_key="RUNTIME:SYNC_STANDARD:standards",
+                created_at=current_time,
+            )
 
     def handle_operation_sync(self, task: Any) -> None:
         with self._execution_lock:
@@ -629,6 +725,7 @@ class ShadowRuntime:
                 overall_status=result.monitor_result.overall_status.value,
                 standard_id=result.monitor_result.standard_id,
                 standard_revision=result.monitor_result.standard_revision,
+                standard_source=result.monitor_result.standard_source,
                 active_event_count=len(active_events),
                 active_event_ids=tuple(event.event_id for event in active_events),
                 expected_at=self.now_provider(),
@@ -724,6 +821,7 @@ def _expected_payload(expected: ExpectedAutomationState) -> dict[str, Any]:
         "overall_status": expected.overall_status,
         "standard_id": expected.standard_id,
         "standard_revision": expected.standard_revision,
+        "standard_source": expected.standard_source,
         "active_event_count": expected.active_event_count,
         "expected_at": _iso(expected.expected_at),
         "applicability": expected.applicability,
@@ -749,6 +847,7 @@ def _expected_comparison_values(expected: ExpectedAutomationState) -> dict[str, 
         "overall_status": expected.overall_status,
         "standard_id": expected.standard_id,
         "standard_revision": expected.standard_revision,
+        "standard_source": expected.standard_source,
         "applicability": expected.applicability,
         "data_quality": expected.data_quality,
         "temperature_status": expected.temperature_status,
@@ -767,6 +866,7 @@ def _expected_from_payload(payload: Mapping[str, Any]) -> ExpectedAutomationStat
         overall_status=payload.get("overall_status"),
         standard_id=payload.get("standard_id"),
         standard_revision=payload.get("standard_revision"),
+        standard_source=payload.get("standard_source"),
         active_event_count=payload.get("active_event_count"),
         expected_at=(datetime.fromisoformat(expected_at) if expected_at else None),
         applicability=payload.get("applicability"),

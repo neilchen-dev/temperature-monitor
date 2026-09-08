@@ -147,6 +147,10 @@ def _optional_text(values: dict[str, Any] | Any, field_name: str) -> str | None:
     value = _raw_value(values, field_name)
     if value is None:
         return None
+    if isinstance(value, list):
+        raise ValueError(
+            f"Feishu field must contain exactly one value: {field_name}"
+        )
     text = str(value).strip()
     return text or None
 

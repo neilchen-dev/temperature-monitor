@@ -189,7 +189,6 @@
   .threshold-shell { padding: 12px 14px; }
   .threshold-shell .section-heading { margin-bottom: 10px; }
   .threshold-shell table { min-width: 640px; }
-  .threshold-action { padding: 2px 8px; color: var(--brand); }
 
   /* ---- Dialogs ---- */
   dialog { width: min(440px, 92vw); padding: 16px; border: 1px solid var(--line); border-radius: 2px; box-shadow: none; background: var(--surface); color: var(--ink); }
@@ -285,7 +284,7 @@
   <button class="tab-btn active" data-tab="monitor">实时监控</button>
   <button class="tab-btn" data-tab="trend">历史趋势</button>
   <button class="tab-btn" data-tab="events">设备与事件</button>
-  <button class="tab-btn" data-tab="thresholds">阈值设置</button>
+  <button class="tab-btn" data-tab="thresholds">环境标准</button>
 </nav>
 
 <!-- Tab 1: 实时监控 -->
@@ -359,30 +358,14 @@
 <section class="tab-panel" id="tab-thresholds">
   <div class="card threshold-shell">
     <div class="section-heading">
-      <div><h2 class="card-title">阈值设置</h2><div class="muted">控制区间用于判断温度与湿度超限；留空表示不限制该边界</div></div>
-      <div class="muted">范围：温度 −50 ~ 100 °C · 湿度 0 ~ 100 %RH</div>
+      <div><h2 class="card-title">环境标准（只读）</h2><div class="muted">运行标准由飞书 validated standard 提供；本地页面不修改生产标准</div></div>
+      <div class="muted">权威来源：Feishu</div>
     </div>
     <div id="thresholdTableWrap"><div class="empty">暂无设备数据</div></div>
   </div>
 </section>
 
 <footer id="footer"><span id="footerStatus">SQLite OK | 等待设备数据 | 刷新 10 秒</span><span class="footer-api">本地镜像 · /api/devices · /api/events · /api/thresholds · /history/query</span></footer>
-
-<dialog id="thresholdDialog">
-  <h3>设定控制区间</h3>
-  <div class="sub" id="dialogDevice"></div>
-  <div class="field-grid">
-    <label class="field">温度下限 (°C)<input type="number" step="0.1" id="tempMin"></label>
-    <label class="field">温度上限 (°C)<input type="number" step="0.1" id="tempMax"></label>
-    <label class="field">湿度下限 (%RH)<input type="number" step="0.1" id="humMin"></label>
-    <label class="field">湿度上限 (%RH)<input type="number" step="0.1" id="humMax"></label>
-  </div>
-  <div class="dialog-error" id="dialogError"></div>
-  <div class="dialog-actions">
-    <button id="dialogCancel">取消</button>
-    <button class="primary" id="dialogSave">保存</button>
-  </div>
-</dialog>
 
 <script>
 "use strict";
@@ -433,9 +416,6 @@
     deviceTableWrap: $("deviceTableWrap"), eventTimeline: $("eventTimeline"),
     eventsFilterChip: $("eventsFilterChip"), eventsHint: $("eventsHint"),
     thresholdTableWrap: $("thresholdTableWrap"), footer: $("footer"), footerStatus: $("footerStatus"),
-    dialog: $("thresholdDialog"), dialogDevice: $("dialogDevice"),
-    tempMin: $("tempMin"), tempMax: $("tempMax"), humMin: $("humMin"), humMax: $("humMax"),
-    dialogError: $("dialogError"), dialogCancel: $("dialogCancel"), dialogSave: $("dialogSave"),
   };
 
   function setConn(kind, text) {
@@ -447,18 +427,6 @@
     var headers = {};
     if (state.key) headers["X-History-Key"] = state.key;
     return fetch(path, { headers: headers }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        return { status: res.status, ok: res.ok, data: data };
-      });
-    });
-  }
-
-  function apiPut(path, body) {
-    return fetch(path, {
-      method: "PUT",
-      headers: { "X-History-Key": state.key, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         return { status: res.status, ok: res.ok, data: data };
       });
@@ -691,12 +659,7 @@
       trendBtn.type = "button";
       trendBtn.textContent = "趋势";
       trendBtn.addEventListener("click", function (ev) { ev.stopPropagation(); selectTrend(item); });
-      var thresholdBtn = document.createElement("button");
-      thresholdBtn.className = "row-action";
-      thresholdBtn.type = "button";
-      thresholdBtn.textContent = "阈值";
-      thresholdBtn.addEventListener("click", function (ev) { ev.stopPropagation(); openThresholdDialog(item.device_id); });
-      operation.append(trendBtn, thresholdBtn);
+      operation.appendChild(trendBtn);
 
       var alarmCell = document.createElement("td");
       var alarmText = document.createElement("span");
@@ -734,14 +697,14 @@
       var emptyTable = document.createElement("table");
       var emptyHead = document.createElement("thead");
       var emptyHeadRow = document.createElement("tr");
-      ["设备", "温度控制区间", "湿度控制区间", "配置状态", "操作"].forEach(function (title) {
+      ["设备", "温度控制区间", "湿度控制区间", "标准状态"].forEach(function (title) {
         var th = document.createElement("th");
         th.textContent = title;
         emptyHeadRow.appendChild(th);
       });
       emptyHead.appendChild(emptyHeadRow);
       var emptyBody = document.createElement("tbody");
-      emptyBody.appendChild(placeholderRow(5, "暂无设备数据", "等待本地镜像同步"));
+      emptyBody.appendChild(placeholderRow(4, "暂无设备数据", "等待 Feishu 标准同步"));
       emptyTable.append(emptyHead, emptyBody);
       els.thresholdTableWrap.appendChild(emptyTable);
       return;
@@ -755,7 +718,7 @@
     var table = document.createElement("table");
     var thead = document.createElement("thead");
     var headRow = document.createElement("tr");
-    ["设备", "温度控制区间", "湿度控制区间", "配置状态", "操作"].forEach(function (title) {
+    ["设备", "温度控制区间", "湿度控制区间", "标准状态"].forEach(function (title) {
       var th = document.createElement("th");
       th.textContent = title;
       headRow.appendChild(th);
@@ -780,20 +743,12 @@
       deviceCell.append(name, source);
       var status = document.createElement("td");
       status.className = band ? "ok" : "muted";
-      status.textContent = band ? "已配置" : "未设置";
-      var actionCell = document.createElement("td");
-      var action = document.createElement("button");
-      action.className = "threshold-action";
-      action.type = "button";
-      action.textContent = band ? "编辑" : "配置";
-      action.addEventListener("click", function () { openThresholdDialog(item.device_id); });
-      actionCell.appendChild(action);
+      status.textContent = band ? "Feishu 已解析" : "标准未就绪";
       tr.append(
         deviceCell,
         thresholdCell(bandText(band, "temp"), "num"),
         thresholdCell(bandText(band, "humidity"), "num"),
         status,
-        actionCell,
       );
       tbody.appendChild(tr);
     });
@@ -1140,71 +1095,6 @@
     });
   }
 
-  // ---- 阈值弹窗 ----
-  function toInputValue(v) { return v === null || v === undefined ? "" : String(v); }
-
-  function openThresholdDialog(deviceId) {
-    var band = bandOf(deviceId);
-    els.dialogDevice.textContent = "设备 " + deviceId
-      + " · 留空表示不限制该边界 · 范围：温度 [-50, 100]°C，湿度 [0, 100]%RH";
-    els.tempMin.value = toInputValue(band && band.temp_min);
-    els.tempMax.value = toInputValue(band && band.temp_max);
-    els.humMin.value = toInputValue(band && band.humidity_min);
-    els.humMax.value = toInputValue(band && band.humidity_max);
-    els.dialogError.textContent = "";
-    els.dialog.dataset.device = deviceId;
-    els.dialog.showModal();
-  }
-
-  function parseBoundInput(input, low, high, name) {
-    var text = input.value.trim();
-    if (text === "") return { value: null };
-    var num = Number(text);
-    if (!isFinite(num)) return { error: name + "不是有效数字" };
-    if (num < low || num > high) return { error: name + "超出范围 [" + low + ", " + high + "]" };
-    return { value: num };
-  }
-
-  function saveThreshold() {
-    var deviceId = els.dialog.dataset.device;
-    var tempMin = parseBoundInput(els.tempMin, -50, 100, "温度下限");
-    if (tempMin.error) { els.dialogError.textContent = tempMin.error; return; }
-    var tempMax = parseBoundInput(els.tempMax, -50, 100, "温度上限");
-    if (tempMax.error) { els.dialogError.textContent = tempMax.error; return; }
-    var humMin = parseBoundInput(els.humMin, 0, 100, "湿度下限");
-    if (humMin.error) { els.dialogError.textContent = humMin.error; return; }
-    var humMax = parseBoundInput(els.humMax, 0, 100, "湿度上限");
-    if (humMax.error) { els.dialogError.textContent = humMax.error; return; }
-    if (tempMin.value !== null && tempMax.value !== null && tempMin.value >= tempMax.value) {
-      els.dialogError.textContent = "温度下限必须小于上限";
-      return;
-    }
-    if (humMin.value !== null && humMax.value !== null && humMin.value >= humMax.value) {
-      els.dialogError.textContent = "湿度下限必须小于上限";
-      return;
-    }
-
-    els.dialogSave.disabled = true;
-    apiPut("/api/thresholds/" + encodeURIComponent(deviceId), {
-      temp_min: tempMin.value,
-      temp_max: tempMax.value,
-      humidity_min: humMin.value,
-      humidity_max: humMax.value,
-    }).then(function (res) {
-      els.dialogSave.disabled = false;
-      if (res.status === 401) { els.dialogError.textContent = "鉴权失败：请检查密钥"; return; }
-      if (!res.ok) {
-        els.dialogError.textContent = res.data.error || ("保存失败：HTTP " + res.status);
-        return;
-      }
-      els.dialog.close();
-      refresh();
-    }).catch(function () {
-      els.dialogSave.disabled = false;
-      els.dialogError.textContent = "保存失败：网络错误";
-    });
-  }
-
   // ---- 系统状态（免鉴权） ----
   function loadSystemStatus() {
     apiGet("/api/system/status").then(function (res) {
@@ -1344,9 +1234,6 @@
     state.deviceSourceFilter = els.deviceSourceFilter.value;
     renderCards();
   });
-  els.dialogCancel.addEventListener("click", function () { els.dialog.close(); });
-  els.dialogSave.addEventListener("click", saveThreshold);
-
   // ---- 启动 ----
   if (state.key) els.apiKey.value = state.key;
   setAutoRefresh(true);

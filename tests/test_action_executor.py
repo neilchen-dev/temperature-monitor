@@ -73,6 +73,7 @@ class ActionExecutorTests(unittest.TestCase):
             active_device_ids=("TH-03",),
             handlers={AlarmActionType.CREATE_VERIFY_TASK: self._handler},
             recorder=self.recorder,
+            standards_ready_provider=lambda: True,
         )
         executions = executor.execute(
             (self.action,),
@@ -87,6 +88,7 @@ class ActionExecutorTests(unittest.TestCase):
             mode=AutomationMode.ACTIVE,
             active_device_ids=("TH-03",),
             recorder=self.recorder,
+            standards_ready_provider=lambda: True,
         )
         executions = executor.execute(
             (self.action,),
@@ -109,6 +111,7 @@ class ActionExecutorTests(unittest.TestCase):
             context_handlers={
                 AlarmActionType.CREATE_VERIFY_TASK: context_handler,
             },
+            standards_ready_provider=lambda: True,
         )
         executions = executor.execute(
             (self.action,),

@@ -115,24 +115,26 @@ def test_standard_monitor_only_never_enters_alarm_judgement() -> None:
     assert result.overall_status is OverallStatus.UNKNOWN
 
 
-def test_missing_standard_control_type_uses_legacy_fallback() -> None:
+def test_missing_standard_control_type_fails_closed_without_legacy_fallback() -> None:
     result = _evaluate(None, ControlType.OPERATION_PERIOD, OperationStatus.OPERATING)
-    assert result.resolved_control_type is ControlType.OPERATION_PERIOD
-    assert result.control_type_source == "device_context_fallback"
+    assert result.resolved_control_type is None
+    assert result.control_type_source == "standard_unavailable"
     assert result.control_type_consistency == "standard_missing"
 
 
 def test_both_control_types_missing_is_configuration_error() -> None:
     result = _evaluate(None, None, OperationStatus.OPERATING)
     assert result.resolved_control_type is None
-    assert result.control_type_source == "configuration_error"
+    assert result.control_type_source == "standard_unavailable"
     assert result.applicability is ApplicabilityStatus.NOT_APPLICABLE
     assert "control_type_configuration_error" in result.reasons
 
 
 class _Source:
-    def __init__(self, value: object) -> None:
+    def __init__(self, value: object, *, device: object = "TH-03", revision: object = "R1") -> None:
         self.value = value
+        self.device = device
+        self.revision = revision
 
     def read_records(self, table_id: str):  # noqa: ARG002
         return (
@@ -140,9 +142,9 @@ class _Source:
                 record_id="rec-1",
                 fields={
                     "id": "ENV-TH-03",
-                    "revision": "R1",
+                    "revision": self.revision,
                     "area": "精密装配间",
-                    "device": "TH-03",
+                    "device": self.device,
                     "operation": None,
                     "control": self.value,
                     "tmin": 20,
@@ -160,9 +162,11 @@ class _Source:
         )
 
 
-def _adapter(value: object) -> FeishuStandardAdapter:
+def _adapter(
+    value: object, *, device: object = "TH-03", revision: object = "R1"
+) -> FeishuStandardAdapter:
     return FeishuStandardAdapter(
-        source=_Source(value),
+        source=_Source(value, device=device, revision=revision),
         table_id="standards",
         fields=FeishuStandardFieldMap(
             standard_id="id",
@@ -211,6 +215,18 @@ def test_invalid_feishu_control_type_records_sync_failure() -> None:
     assert repository.list_all() == ()
 
 
+def test_multivalue_device_id_is_rejected_before_snapshot_activation() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SQLiteStandardRepository(connection)
+    report = StandardSyncService(
+        source=_adapter("全天控制", device=["TH-03", "TH-04"]),
+        repository=repository,
+    ).sync(now=NOW)
+    assert report.status == StandardSyncStatus.FAILED
+    assert "exactly one value" in report.errors[0]
+    assert repository.list_all() == ()
+
+
 def test_control_type_switches_with_effective_revision() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SQLiteStandardRepository(connection)
@@ -220,7 +236,7 @@ def test_control_type_switches_with_effective_revision() -> None:
             _standard(ControlType.OPERATION_PERIOD, effective_to=boundary),
             _standard(ControlType.ALL_DAY, revision="R2", effective_from=boundary),
         ),
-        source="test",
+        source="feishu:test",
         synced_at=NOW,
     )
     resolver = SQLiteStandardResolver(repository)
@@ -254,9 +270,59 @@ def test_old_sqlite_schema_is_upgraded_without_losing_rows() -> None:
     )
     repository = SQLiteStandardRepository(connection)
     assert repository.list_all()[0].control_type is None
-    repository.upsert(_standard(ControlType.ALL_DAY), updated_at=NOW)
+    legacy_readiness = repository.readiness(expected_device_ids=("TH-01",))
+    assert legacy_readiness["active_snapshot_id"] is None
+    assert legacy_readiness["last_known_good_snapshot_id"] is None
+    assert legacy_readiness["standards_ready"] is False
+    # Re-running startup migration must be a no-op and must not duplicate the
+    # pre-existing legacy history row.
+    SQLiteStandardRepository(connection)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM standard_versions"
+    ).fetchone()[0] == 1
+    repository.apply_snapshot(
+        (_standard(ControlType.ALL_DAY),), source="feishu:test", synced_at=NOW
+    )
     inserted = next(row for row in repository.list_all() if row.standard_id == "ENV-TH-03")
     assert inserted.control_type is ControlType.ALL_DAY
+
+
+def test_failed_additive_migration_rolls_back_without_touching_legacy_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        """CREATE TABLE standard_versions (
+        standard_id TEXT NOT NULL, revision TEXT NOT NULL, area TEXT NOT NULL,
+        operation_type TEXT, temperature_min REAL, temperature_max REAL,
+        humidity_min REAL, humidity_max REAL, effective_from TEXT NOT NULL,
+        effective_to TEXT, source_document TEXT NOT NULL, clause TEXT,
+        priority INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY (standard_id, revision))"""
+    )
+    connection.execute(
+        """INSERT INTO standard_versions VALUES
+        ('OLD', 'R1', '仓库', NULL, 20, 26, 40, 60, ?, NULL,
+         'legacy', NULL, 0, 1, ?, ?)""",
+        (NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+    )
+    connection.commit()
+
+    def deny_snapshot_table(action, arg1, arg2, database, source):  # noqa: ARG001
+        if action == sqlite3.SQLITE_CREATE_TABLE and arg1 == "standard_snapshots":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(deny_snapshot_table)
+    with pytest.raises(sqlite3.DatabaseError):
+        SQLiteStandardRepository(connection)
+    connection.set_authorizer(None)
+
+    assert connection.execute(
+        "SELECT COUNT(*) FROM standard_versions"
+    ).fetchone()[0] == 1
+    assert connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'standard_snapshots'"
+    ).fetchone()[0] == 0
 
 
 class _OperationProvider:
@@ -297,7 +363,7 @@ def test_control_type_conflict_warns_and_standard_wins() -> None:
     warning.assert_called_once()
     message, *values = warning.call_args.args
     rendered = message % tuple(values)
-    assert "source=standard_table" in rendered
+    assert "standard_source=feishu" in rendered
     assert "device_id=TH-03" in rendered
 
 

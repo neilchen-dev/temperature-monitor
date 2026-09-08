@@ -168,12 +168,13 @@ class MonitorApplicationService:
             legacy_control = getattr(device.control_type, "value", device.control_type)
             logger.warning(
                 "control_type mismatch | device_id=%s | standard_id=%s | revision=%s "
-                "| standard_control_type=%s | legacy_control_type=%s | source=standard_table",
+                "| standard_control_type=%s | legacy_control_type=%s | standard_source=%s",
                 device.device_id,
                 standard.standard_id,
                 standard.revision,
                 standard.control_type.value if standard.control_type is not None else None,
                 legacy_control,
+                standard.standard_source,
             )
         current_state = self.alarm_state_repository.get(device.device_id)
         if current_state is None:
@@ -449,6 +450,8 @@ class MonitorApplicationService:
         mode_value = getattr(mode, "value", mode)
         if mode_value != AutomationMode.ACTIVE.value:
             return False
+        if not getattr(self.action_executor, "standards_ready", lambda: True)():
+            return False
         return active_scope_allows(
             device_id,
             active_device_ids=getattr(self.action_executor, "active_device_ids", ()),
@@ -611,6 +614,7 @@ def _monitor_result_dict(result: MonitorResult) -> dict[str, Any]:
         "overall_status": result.overall_status.value,
         "standard_id": result.standard_id,
         "standard_revision": result.standard_revision,
+        "standard_source": result.standard_source,
         "applicability": result.applicability.value,
         "data_quality": result.data_quality.value,
         "resolved_control_type": (

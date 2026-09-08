@@ -18,6 +18,7 @@ class ExpectedAutomationState:
     overall_status: str | None = None
     standard_id: str | None = None
     standard_revision: str | None = None
+    standard_source: str | None = None
     active_event_count: int | None = None
     expected_at: datetime | None = None
     applicability: str | None = None
@@ -43,6 +44,7 @@ class ObservedAutomationState:
     overall_status: str | None = None
     standard_id: str | None = None
     standard_revision: str | None = None
+    standard_source: str | None = None
     active_event_count: int | None = None
     observed_at: datetime | None = None
     applicability: str | None = None
@@ -90,6 +92,7 @@ def expected_state_from(
     overall_status: str | None = None,
     standard_id: str | None = None,
     standard_revision: str | None = None,
+    standard_source: str | None = None,
     active_event_count: int | None = None,
     expected_at: datetime | None = None,
     applicability: str | None = None,
@@ -118,6 +121,7 @@ def expected_state_from(
         overall_status=overall_status,
         standard_id=standard_id,
         standard_revision=standard_revision,
+        standard_source=standard_source,
         active_event_count=active_event_count,
         expected_at=expected_at,
         applicability=applicability,
@@ -152,6 +156,8 @@ def compare_states(
         and observed.standard_id is None
         and expected.standard_revision is None
         and observed.standard_revision is None
+        and expected.standard_source is None
+        and observed.standard_source is None
         and expected.active_event_count is None
         and observed.active_event_count is None
         and expected.applicability is None
@@ -484,6 +490,7 @@ def _state_dict(state: ExpectedAutomationState | ObservedAutomationState) -> dic
         "overall_status",
         "standard_id",
         "standard_revision",
+        "standard_source",
         "active_event_count",
         "applicability",
         "data_quality",

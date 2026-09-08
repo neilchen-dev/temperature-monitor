@@ -518,13 +518,9 @@ def _get_shadow_contexts() -> dict[str, dict[str, str]]:
                 "SHADOW_DEVICE_CONTEXTS 的每个设备值必须是非空 JSON 对象"
             )
         area = str(raw_context.get("area", "")).strip()
-        control_type = str(raw_context.get("control_type", "")).strip()
         if not area:
             raise ValueError(f"SHADOW_DEVICE_CONTEXTS 缺少区域: {normalized_device}")
-        contexts[normalized_device] = {
-            "area": area,
-            "control_type": control_type,
-        }
+        contexts[normalized_device] = {"area": area}
     return contexts
 
 

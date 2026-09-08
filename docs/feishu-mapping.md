@@ -220,9 +220,9 @@
 
 ### 3.5 建议的标准同步契约
 
-飞书标准台账（或经过确认的标准来源）→ `StandardSyncService` → 字段校验 → SQLite `standard_versions` → 原子激活 → `SQLiteStandardResolver`。
+飞书标准台账 → `StandardSyncService` → 严格字段校验 → immutable SQLite `standard_versions` + 历史 snapshot → 原子激活 → `SQLiteStandardResolver`。
 
-同步校验至少包括：上下限成对且 `min <= max`、时间范围合法、版本唯一、同一匹配键的有效期不冲突、来源文件非空、优先级明确。同步失败时继续使用上一版有效标准，并记录同步错误；不能让一次飞书误编辑直接改变生产判定。
+同步校验至少包括：device_id、control_type enum、上下限成对且 `min < max`、enabled 布尔值、时间范围合法、版本唯一、同一匹配键的有效期不冲突、来源文件非空、优先级明确。同步失败时继续使用上一版 validated 标准，并记录同步错误；不能让一次飞书误编辑直接改变生产判定。
 
 ## 4. 作业状态字段映射
 
