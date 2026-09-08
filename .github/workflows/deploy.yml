@@ -147,6 +147,52 @@ jobs:
 
             IMAGE_REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
 
+            # SQLite 一致性备份：必须在切换镜像/执行迁移前完成。通过仍在运行的
+            # Python 容器调用 sqlite 在线 backup API，兼容 WAL；禁止 cp 正在使用
+            # 的 .db 文件，以免漏掉 WAL 中的已提交页。备份与 quick_check 任一步
+            # 失败都直接终止，后续 pull/up 不得执行。
+            DB_CONTAINER_PATH=$(grep -E '^SQLITE_DB_PATH=' .env | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)
+            DB_CONTAINER_PATH="${DB_CONTAINER_PATH:-/app/data/temperature_monitor.db}"
+            case "${DB_CONTAINER_PATH}" in
+              /app/data/*) ;;
+              *)
+                echo "ERROR: SQLITE_DB_PATH must be under /app/data for the deployment backup: ${DB_CONTAINER_PATH}"
+                exit 1
+                ;;
+            esac
+            if [ "$(docker inspect -f '{{.State.Running}}' temperature-monitor 2>/dev/null || true)" != "true" ]; then
+              echo "ERROR: current temperature-monitor container is not running; refusing deployment without an online SQLite backup"
+              exit 1
+            fi
+            if ! docker exec temperature-monitor test -f "${DB_CONTAINER_PATH}"; then
+              echo "ERROR: production SQLite database not found at ${DB_CONTAINER_PATH}"
+              exit 1
+            fi
+            BACKUP_ID=$(date -u +%Y%m%dT%H%M%SZ)
+            BACKUP_HOST_PATH="data/backups/temperature_monitor_${BACKUP_ID}.db"
+            BACKUP_CONTAINER_PATH="/app/${BACKUP_HOST_PATH}"
+            # Create the directory inside the running app container so the
+            # application user owns it on the bind mount.
+            if ! docker exec temperature-monitor mkdir -p /app/data/backups; then
+              echo "ERROR: could not create the SQLite backup directory"
+              exit 1
+            fi
+            if ! docker exec \
+              -e "SOURCE_DB=${DB_CONTAINER_PATH}" \
+              -e "BACKUP_DB=${BACKUP_CONTAINER_PATH}" \
+              temperature-monitor python -c 'import os, sqlite3; from pathlib import Path; source=os.environ["SOURCE_DB"]; backup=os.environ["BACKUP_DB"]; Path(backup).parent.mkdir(parents=True, exist_ok=True); src=sqlite3.connect("file:" + source + "?mode=ro", uri=True); dst=sqlite3.connect(backup); src.backup(dst); dst.close(); src.close()'; then
+              echo "ERROR: SQLite online backup failed"
+              exit 1
+            fi
+            QUICK_CHECK=$(docker exec \
+              -e "CHECK_DB=${BACKUP_CONTAINER_PATH}" \
+              temperature-monitor python -c 'import os, sqlite3; db=os.environ["CHECK_DB"]; c=sqlite3.connect("file:" + db + "?mode=ro", uri=True); print(c.execute("PRAGMA quick_check").fetchone()[0]); c.close()')
+            if [ "${QUICK_CHECK}" != "ok" ]; then
+              echo "ERROR: SQLite backup quick_check=${QUICK_CHECK}"
+              exit 1
+            fi
+            echo "SQLite consistency backup completed: ${BACKUP_HOST_PATH}"
+
             if grep -q '^IMAGE_REPOSITORY=' .env; then
               sed -i "s|^IMAGE_REPOSITORY=.*|IMAGE_REPOSITORY=${IMAGE_REPOSITORY}|" .env
             else
@@ -182,6 +228,21 @@ jobs:
 
             if ! curl --fail --silent --show-error --retry 10 --retry-delay 3 \
               "http://127.0.0.1:${APP_PORT}/health"; then
+              rollback
+            fi
+
+            # /health 只证明 Flask/基础 SQLite 链路存活；Shadow Runtime
+            # 迁移失败时旧采集链路仍可能返回 200。显式检查 runtime.available，
+            # 但不要求 standards_ready=true：首次严格 Feishu sync 在部署后完成。
+            if ! SYSTEM_STATUS=$(curl --fail --silent --show-error \
+              "http://127.0.0.1:${APP_PORT}/api/system/status"); then
+              echo "ERROR: system status endpoint unavailable after deployment"
+              rollback
+            fi
+            RUNTIME_AVAILABLE=$(printf '%s' "${SYSTEM_STATUS}" | sed -nE \
+              's/.*"runtime"[[:space:]]*:[[:space:]]*\{[^}]*"available"[[:space:]]*:[[:space:]]*(true|false).*/\1/p')
+            if [ "${RUNTIME_AVAILABLE}" != "true" ]; then
+              echo "ERROR: Shadow Runtime is not available after deployment; migration/startup likely failed"
               rollback
             fi
 
