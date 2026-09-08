@@ -1,21 +1,53 @@
+# Environment and local credentials
 .env
 .env.*
 !.env.example
+
+# Python caches and virtual environments
 __pycache__/
-*.pyc
-*.db
-*.sqlite
-*.sqlite3
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test, lint, and local runtime caches
+.pytest_cache/
+.pytest-*/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+pytest-cache-files-*/
+.runtime-tmp/
+.run-temp/
+.test-run-tmp/
+.tmp-test/
+.validation-temp/
+.validation-tmp/
+.codex-tmp/
+
+# Local application data, logs, and backups
 logs/
+*.log
 data/
+data/*.db
+data/*.sqlite*
+data/backups/
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+
+# Other local secrets and generated files
 **/secrets.yaml
 **/secrets.yml
 *.pem
 *.key
+
+# IDE and operating-system files
 .vscode/
 .idea/
-.DS_Store
-.venv/
-.runtime-tmp/
 .workbuddy/
 .zcode/
+.DS_Store
+Thumbs.db
