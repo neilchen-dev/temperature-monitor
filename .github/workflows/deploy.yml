@@ -207,8 +207,16 @@ jobs:
               else
                 echo "IMAGE_TAG=${ROLLBACK_TAG}" >> .env
               fi
-              docker compose up -d --remove-orphans --wait --wait-timeout 120 || true
-              echo "Rolled back to ${ROLLBACK_TAG}"
+              # IMAGE_TAG is exported by the SSH action and would otherwise
+              # override the restored .env value during Compose interpolation.
+              # Pull explicitly so a failed deployment cannot leave the new
+              # image running while merely reporting a rollback.
+              env -u IMAGE_TAG docker compose pull || true
+              if env -u IMAGE_TAG docker compose up -d --remove-orphans --wait --wait-timeout 120; then
+                echo "Rolled back to ${ROLLBACK_TAG}"
+              else
+                echo "ERROR: rollback to ${ROLLBACK_TAG} could not be verified"
+              fi
               exit 1
             }
 
@@ -239,8 +247,11 @@ jobs:
               echo "ERROR: system status endpoint unavailable after deployment"
               rollback
             fi
-            RUNTIME_AVAILABLE=$(printf '%s' "${SYSTEM_STATUS}" | sed -nE \
-              's/.*"runtime"[[:space:]]*:[[:space:]]*\{[^}]*"available"[[:space:]]*:[[:space:]]*(true|false).*/\1/p')
+            if ! RUNTIME_AVAILABLE=$(printf '%s' "${SYSTEM_STATUS}" | docker exec -i temperature-monitor python -c \
+              'import json, sys; print("true" if json.load(sys.stdin).get("runtime", {}).get("available") is True else "false")'); then
+              echo "ERROR: unable to parse runtime availability from system status"
+              rollback
+            fi
             if [ "${RUNTIME_AVAILABLE}" != "true" ]; then
               echo "ERROR: Shadow Runtime is not available after deployment; migration/startup likely failed"
               rollback
