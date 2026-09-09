@@ -25,12 +25,14 @@ class DeviceModelHealthTests(unittest.TestCase):
             "SQLITE_ENABLED": config.SQLITE_ENABLED,
             "SQLITE_DB_PATH": config.SQLITE_DB_PATH,
             "DEVICE_MODEL_STALE_SECONDS": config.DEVICE_MODEL_STALE_SECONDS,
+            "SHADOW_DEVICE_IDS": config.SHADOW_DEVICE_IDS,
         }
         db.close()
         db._init_failed = False
         config.SQLITE_ENABLED = True
         config.SQLITE_DB_PATH = Path(self._tmp_dir.name) / "health.db"
         config.DEVICE_MODEL_STALE_SECONDS = 300
+        config.SHADOW_DEVICE_IDS = ()
         devices._reset_device_model_stats()
         self.addCleanup(self._restore)
 
@@ -121,6 +123,29 @@ class DeviceModelHealthTests(unittest.TestCase):
         ):
             health = devices.get_device_model_health()
         self.assertFalse(health["degraded"])
+
+    def test_configured_shadow_device_staleness_is_visible(self) -> None:
+        now = time.time()
+        config.SHADOW_DEVICE_IDS = ("TH-01", "TH-02", "TH-03")
+        with (
+            patch(
+                "services.devices.db.fetch_device_summary",
+                return_value={"last_sample_time_ms": now * 1000},
+            ),
+            patch(
+                "services.devices.db.fetch_latest_device_states",
+                return_value=[
+                    {"device": "TH-01", "sample_time_ms": now * 1000},
+                    {"device": "TH-02", "sample_time_ms": (now - 600) * 1000},
+                ],
+            ),
+        ):
+            health = devices.get_device_model_health(now=now)
+
+        self.assertTrue(health["degraded"])
+        self.assertEqual(health["stale_devices"], ["TH-02"])
+        self.assertEqual(health["missing_devices"], ["TH-03"])
+        self.assertIn("TH-02", health["degraded_reasons"][-1])
 
 
 if __name__ == "__main__":

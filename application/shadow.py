@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Protocol
 
-from domain.models import AlarmLifecycleState, OperationState
+from domain.models import AlarmLifecycleState, OperationState, OperationStatus
 
 
 @dataclass(frozen=True)
@@ -312,7 +312,20 @@ def _canonical_differences(
             "observed": [observed.standard_id, observed.standard_revision],
         }
 
-    if expected.operation_state != observed.operation_state:
+    # The Feishu device table represents an idle operation-period device as
+    # ``IDLE``/``N/A``.  The local operation repository represents the same
+    # absence of an applicable operation as ``NOT_APPLICABLE``.  Treat only
+    # this explicitly bounded pair as equivalent; an actual OPERATING/IDLE
+    # disagreement must remain visible to Shadow.
+    operation_state_equivalent = (
+        expected.operation_state == OperationStatus.NOT_APPLICABLE.value
+        and observed.operation_state == OperationStatus.IDLE.value
+        and observed.operation_type == "N/A"
+    )
+    if (
+        expected.operation_state != observed.operation_state
+        and not operation_state_equivalent
+    ):
         differences.append("OPERATION_STATE_MISMATCH")
         details["operation_state"] = {
             "expected": expected.operation_state,

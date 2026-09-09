@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -176,6 +177,34 @@ class SqliteMirrorTests(unittest.TestCase):
             device="DEV-01", temperature_c=1.0, humidity=1.0,
             status="在线", feishu_code=0, feishu_message="success",
         )
+
+    def test_concurrent_first_access_does_not_disable_mirror(self) -> None:
+        """Scheduler/HTTP startup races must share one initialized connection."""
+        barrier = threading.Barrier(8)
+        results: list[object | None] = []
+        errors: list[BaseException] = []
+        results_lock = threading.Lock()
+
+        def open_mirror() -> None:
+            try:
+                barrier.wait(timeout=5)
+                connection = db._get_connection()
+                with results_lock:
+                    results.append(connection)
+            except BaseException as exc:  # pragma: no cover - diagnostic guard
+                with results_lock:
+                    errors.append(exc)
+
+        workers = [threading.Thread(target=open_mirror) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(connection is not None for connection in results))
+        self.assertFalse(db._init_failed)
 
     def test_legacy_device_events_gains_source_column(self) -> None:
         # 旧版本建的库缺 device_events.source 列；重开连接必须补列，

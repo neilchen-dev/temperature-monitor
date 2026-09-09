@@ -93,7 +93,9 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
 
     degraded = /temperature 仍在收到上报，但统一样本超过阈值没有成功落库。
     覆盖两类断流：record_sample 自身异常（显式计数），以及 SQLite 镜像
-    静默写失败（通过 device_samples 最新落库时间间接判断）。
+    静默写失败（通过 device_samples 最新落库时间间接判断）。同时按
+    SHADOW_DEVICE_IDS 检查逐台新鲜度，避免“某一台设备仍在上报”掩盖
+    另一台设备已经断流而 /api/system/status 仍显示健康。
     """
     current = time.time() if now is None else now
     with _device_model_stats_lock:
@@ -103,6 +105,27 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - health endpoint must never raise
         logger.exception("读取统一设备模型健康快照失败")
         last_persisted_ms = None
+    stale_devices: list[str] = []
+    missing_devices: list[str] = []
+    try:
+        latest_by_device: dict[str, int] = {}
+        for row in db.fetch_latest_device_states():
+            device = str(row.get("device") or "").strip().upper()
+            sample_time_ms = row.get("sample_time_ms")
+            if not device or sample_time_ms is None:
+                continue
+            latest_by_device[device] = max(
+                latest_by_device.get(device, 0), int(sample_time_ms)
+            )
+        for device in config.SHADOW_DEVICE_IDS:
+            normalized_device = str(device).strip().upper()
+            sample_time_ms = latest_by_device.get(normalized_device)
+            if sample_time_ms is None:
+                missing_devices.append(normalized_device)
+            elif current - sample_time_ms / 1000.0 > config.DEVICE_MODEL_STALE_SECONDS:
+                stale_devices.append(normalized_device)
+    except Exception:  # noqa: BLE001 - health endpoint must never raise
+        logger.exception("读取逐台统一设备模型健康快照失败")
     degraded_reasons: list[str] = []
     request_time = stats.get("last_temperature_request_time")
     if (
@@ -117,6 +140,16 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
             degraded_reasons.append(
                 "temperature reports active but unified samples are stale"
             )
+    if missing_devices:
+        degraded_reasons.append(
+            "configured shadow devices have no unified sample: "
+            + ",".join(missing_devices)
+        )
+    if stale_devices:
+        degraded_reasons.append(
+            "configured shadow devices have stale unified samples: "
+            + ",".join(stale_devices)
+        )
     return {
         "device_sample_error_count": stats.get("error_count", 0),
         "device_sample_last_error": stats.get("last_error"),
@@ -128,6 +161,8 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
         ),
         "last_persisted_sample_time_ms": last_persisted_ms,
         "stale_threshold_seconds": config.DEVICE_MODEL_STALE_SECONDS,
+        "stale_devices": stale_devices,
+        "missing_devices": missing_devices,
         "degraded": bool(degraded_reasons),
         "degraded_reasons": degraded_reasons,
     }

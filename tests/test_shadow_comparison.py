@@ -130,6 +130,56 @@ class ShadowComparisonTests(unittest.TestCase):
         diff = compare_states(expected, observed)
         self.assertEqual(diff.difference_type, ("OPERATION_STATE_MISMATCH",))
 
+    def test_idle_na_is_equivalent_to_not_applicable_for_operation_period(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-03",
+            "NORMAL",
+            "NOT_APPLICABLE",
+            False,
+            applicability="NOT_APPLICABLE",
+            operation_type=None,
+        )
+        observed = ObservedAutomationState(
+            "TH-03",
+            "NORMAL",
+            "IDLE",
+            False,
+            applicability="NOT_APPLICABLE",
+            operation_type="N/A",
+        )
+
+        self.assertTrue(compare_states(expected, observed).matched)
+
+    def test_idle_without_na_operation_observation_is_still_a_mismatch(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-03", "NORMAL", "NOT_APPLICABLE", False,
+            applicability="NOT_APPLICABLE",
+        )
+        observed = ObservedAutomationState(
+            "TH-03", "NORMAL", "IDLE", False,
+            applicability="NOT_APPLICABLE",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("OPERATION_STATE_MISMATCH",),
+        )
+
+    def test_operating_idle_is_never_equivalent(self) -> None:
+        expected = ExpectedAutomationState(
+            "TH-03", "NORMAL", "OPERATING", False,
+            operation_type="工艺A",
+        )
+        observed = ObservedAutomationState(
+            "TH-03", "NORMAL", "IDLE", False,
+            operation_type="N/A",
+        )
+
+        self.assertEqual(
+            compare_states(expected, observed).difference_type,
+            ("OPERATION_STATE_MISMATCH",),
+        )
+
     def test_overall_status_difference_is_not_an_alarm_state_mismatch(self) -> None:
         expected = ExpectedAutomationState(
             "TH-01",

@@ -171,41 +171,44 @@ _write_failures = 0
 def _get_connection() -> sqlite3.Connection | None:
     global _connection, _init_failed
 
-    if _init_failed or not config.SQLITE_ENABLED:
-        return None
-    if _connection is not None:
-        return _connection
+    # The first-open path is serialized below to prevent concurrent WAL setup.
+    # Without this, the scheduler and an HTTP request can both run
+    # ``PRAGMA journal_mode=WAL`` and one transient lock disables the mirror.
+    with _lock:
+        if _init_failed or not config.SQLITE_ENABLED:
+            return None
+        if _connection is not None:
+            return _connection
 
-    try:
-        config.SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(
-            str(config.SQLITE_DB_PATH),
-            check_same_thread=False,
-            timeout=5.0,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        with _lock:
+        try:
+            config.SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(
+                str(config.SQLITE_DB_PATH),
+                check_same_thread=False,
+                timeout=5.0,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA synchronous=NORMAL")
             connection.executescript(_SCHEMA)
             connection.commit()
             _apply_column_migrations(connection)
-        _connection = connection
-        logger.info(
-            "SQLite 本地镜像已启用 | path=%s", config.SQLITE_DB_PATH
-        )
-        return _connection
-    except Exception:
-        # This module is an isolation boundary: whatever goes wrong during
-        # init (sqlite errors, permission errors, OSError from mkdir, ...)
-        # may only disable the mirror, never break the Feishu main path or
-        # the Flask startup.
-        _init_failed = True
-        logger.exception(
-            "SQLite 初始化失败，本地镜像已停用 | path=%s", config.SQLITE_DB_PATH
-        )
-        return None
+            _connection = connection
+            logger.info(
+                "SQLite 本地镜像已启用 | path=%s", config.SQLITE_DB_PATH
+            )
+            return _connection
+        except Exception:
+            # This module is an isolation boundary: whatever goes wrong during
+            # init (sqlite errors, permission errors, OSError from mkdir, ...)
+            # may only disable the mirror, never break the Feishu main path or
+            # the Flask startup.
+            _init_failed = True
+            logger.exception(
+                "SQLite 初始化失败，本地镜像已停用 | path=%s", config.SQLITE_DB_PATH
+            )
+            return None
 
 
 def init_db() -> None:
