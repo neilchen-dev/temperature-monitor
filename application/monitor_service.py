@@ -92,6 +92,9 @@ class AutomationTaskRepository(Protocol):
                            updated_at: datetime, payload: Mapping[str, Any]) -> None:
         """Reschedule the same owned task without replacing its identity."""
 
+    def runtime_context(self) -> Any:
+        """Return the persisted mode/cutover context used for event metadata."""
+
 
 class LocalEnvironmentEventRepository(Protocol):
     def patch_external_projection(self, event_id: str, **values: Any) -> Any:
@@ -254,8 +257,11 @@ class MonitorApplicationService:
             event_id=transition.next.active_alarm_id or transition.previous.active_alarm_id,
         )
         self.alarm_state_repository.save(transition.next)
+        runtime_context = self._runtime_context_metadata()
         context = {
             "device_id": sample.device_id,
+            "created_mode": runtime_context["created_mode"],
+            "active_epoch": runtime_context["active_epoch"],
             "automation_task_id": scheduler_task_id,
             "created_at": evaluated_at.isoformat(),
             "sample_time": sample.sample_time.isoformat(),
@@ -324,6 +330,8 @@ class MonitorApplicationService:
                 "event_id": event_id,
                 "automation_task_id": task.task_id,
                 "dedupe_key": task.dedupe_key,
+                "created_mode": task.created_mode,
+                "active_epoch": task.active_epoch,
                 "created_at": context.get("created_at") or created_at.isoformat(),
                 "notification_attempted_at": created_at.isoformat(),
             }
@@ -501,6 +509,8 @@ class MonitorApplicationService:
         context = {
             "binding_attempt": _retry_attempt(task.payload),
             "device_id": device_id,
+            "created_mode": task.created_mode,
+            "active_epoch": task.active_epoch,
             "created_at": now.isoformat(),
             "sample_time": sample_time,
             "sample": {
@@ -1100,6 +1110,7 @@ class MonitorApplicationService:
         """
         next_state = transition.next
         previous_task_id = transition.previous.pending_task_id
+        runtime_context = self._runtime_context_metadata()
 
         if self.task_repository is not None and previous_task_id is not None:
             leaves_recovery = (
@@ -1166,6 +1177,9 @@ class MonitorApplicationService:
                     opened_at=created_at,
                     payload={
                         "projection": "local_shadow_event",
+                        "created_mode": runtime_context["created_mode"],
+                        "active_epoch": runtime_context["active_epoch"],
+                        "created_at": created_at.isoformat(),
                         "sample_time": sample.sample_time.isoformat(),
                         "violation_started_at": (
                             next_state.violation_started_at.isoformat()
@@ -1229,6 +1243,24 @@ class MonitorApplicationService:
                     self.event_repository.mark_recovered(event_id, recovered_at=created_at)
 
         return replace(transition, next=next_state)
+
+    def _runtime_context_metadata(self) -> dict[str, str | None]:
+        """Copy the durable cutover identity onto newly created local events."""
+        provider = getattr(self.task_repository, "runtime_context", None)
+        if callable(provider):
+            try:
+                context = provider()
+                return {
+                    "created_mode": str(getattr(context, "mode", "unknown")),
+                    "active_epoch": getattr(context, "active_epoch", None),
+                }
+            except Exception:  # noqa: BLE001 - metadata must not block local state
+                logger.exception("failed to read runtime cutover metadata")
+        mode = getattr(getattr(self.action_executor, "mode", None), "value", None)
+        return {
+            "created_mode": mode or "unknown",
+            "active_epoch": None,
+        }
 
     def _schedule_recovery_task(
         self,

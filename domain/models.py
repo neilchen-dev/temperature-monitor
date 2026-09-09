@@ -102,6 +102,9 @@ class AutomationTaskStatus(str, Enum):
     SUCCEEDED = "SUCCEEDED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+    # Historical external-effect work is retained for audit/manual review but
+    # is deliberately excluded from scheduler claiming.
+    LEGACY_PENDING = "LEGACY_PENDING"
 
 
 @dataclass(frozen=True)
@@ -306,3 +309,8 @@ class AutomationTask:
     worker_id: str | None = None
     attempt_count: int = 0
     last_error: str | None = None
+    # ``created_at`` predates the cutover feature.  These explicit fields make
+    # the origin of an external-effect task queryable without interpreting its
+    # payload or the process's current mode.
+    created_mode: str | None = None
+    active_epoch: str | None = None

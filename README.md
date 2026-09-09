@@ -156,6 +156,14 @@ Active Canary 使用独立的 `ACTIVE_DEVICE_IDS` 逗号分隔白名单（自动
 
 `ACTIVE_CUTOVER_ACK=I_HAVE_DISABLED_LEGACY_FEISHU_WORKFLOWS` 表示 `ACTIVE_DEVICE_IDS` 中设备的 legacy owner 已在飞书侧人工停用或排除；Canary 阶段不要求关闭其他非白名单设备的 legacy 工作流。
 
+Active 启动会在本地 Python-owned SQLite 元数据中记录 `active_cutover_at` 和
+`active_epoch`。`automation_tasks.created_mode`、`created_at`、`active_epoch`
+用于区分 Shadow-era、当前 Active epoch 和旧 Active epoch 的任务；cutover
+之前的 `RECONCILE_ALARM_EVENT`、`NOTIFY_ALARM`、`NOTIFY_RECOVERY` 会保留为
+`LEGACY_PENDING`，只供审计/人工复核，不能因为当前模式是 Active 而自动
+CREATE、UPDATE 或发送私聊。回滚后重新 Active 会生成新 epoch，未完成的旧
+epoch 外部副作用不会自动接管。
+
 Modbus 采集线程只在 `python app.py` 的生产入口启动一次。若以后使用多进程服务器，只允许一个 worker 开启 `MODBUS_ENABLED`，避免重复轮询同一设备或 RS485 总线。
 
 ## Quick start

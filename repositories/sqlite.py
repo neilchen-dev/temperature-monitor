@@ -33,7 +33,7 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
         "id", "task_type", "entity_type", "entity_id", "due_at", "status",
         "payload_json", "dedupe_key", "created_at", "updated_at", "started_at",
         "finished_at", "claimed_at", "lease_until", "worker_id",
-        "attempt_count", "last_error",
+        "attempt_count", "last_error", "created_mode", "active_epoch",
     ),
     "automation_runs": (
         "id", "device_id", "sample_time", "mode", "action_type", "action_status",
@@ -90,6 +90,10 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
     "operation_observation_audit": (
         "id", "device_id", "source_record_id", "source_created_at",
         "observed_at", "action", "accepted", "reason", "created_at",
+    ),
+    "automation_runtime_state": (
+        "singleton_id", "current_mode", "active_epoch", "active_cutover_at",
+        "updated_at",
     ),
 }
 

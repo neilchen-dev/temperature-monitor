@@ -64,8 +64,15 @@ class Remote:
 def setup(connection=None):
     connection = connection or sqlite3.connect(":memory:", check_same_thread=False)
     repo = SQLiteEnvironmentEventRepository(connection)
+    tasks = SQLiteAutomationTaskRepository(connection)
+    activation = tasks.set_runtime_context(mode="active", now=NOW)
     event = repo.create_or_get_active(device_id="TH-01", event_key=f"ENV:TH-01:{NOW.isoformat()}",
-                                      opened_at=NOW, payload={"feishu_binding_status": "PENDING", "feishu_create_attempted": False})
+                                      opened_at=NOW, payload={
+                                          "created_mode": "active",
+                                          "active_epoch": activation.active_epoch,
+                                          "feishu_binding_status": "PENDING",
+                                          "feishu_create_attempted": False,
+                                      })
     remote = Remote()
     writer = FeishuEnvironmentEventWriter(writer=remote, source=remote, event_table_id="events",
                                           device_table_id="devices", event_repository=repo)
@@ -322,7 +329,7 @@ def test_concurrent_old_schema_migration_and_post_reservation(tmp_path):
 
 
 @pytest.mark.parametrize("remote_present", [True, False])
-def test_historical_event_b_audit_evidence_recovers_without_touching_event_a(remote_present):
+def test_historical_event_b_is_quarantined_without_touching_event_a(remote_present):
     connection = sqlite3.connect(":memory:")
     try:
         repo = SQLiteEnvironmentEventRepository(connection)
@@ -346,6 +353,9 @@ def test_historical_event_b_audit_evidence_recovers_without_touching_event_a(rem
         writer = FeishuEnvironmentEventWriter(writer=remote, source=remote, event_table_id="events",
                                               device_table_id="devices", event_repository=repo)
         app = service(connection, repo, writer)
+        app.task_repository.set_runtime_context(
+            mode="active", now=NOW + timedelta(days=1)
+        )
         device = DeviceContext("TH-01", "仓库")
         runtime = SimpleNamespace(active_canary_enabled=True, active_device_ids=("TH-01",),
                                   devices={"TH-01": device}, event_repository=repo,
@@ -362,12 +372,11 @@ def test_historical_event_b_audit_evidence_recovers_without_touching_event_a(rem
         assert final.status == "CLOSED" and final.closed_at.isoformat() == closed_at
         assert final.event_key == f"ENV:TH-01:{NOW.isoformat()}"
         assert remote.posts == 0
+        assert not final.payload.get("feishu_record_id")
+        assert final.payload["feishu_binding_status"] == "LEGACY_PENDING"
+        assert final.payload["external_effect_policy"] == "SHADOW_ONLY"
+        assert final.payload["external_effect_block_reason"] == "created_before_active_cutover"
         if remote_present:
-            assert final.payload["feishu_record_id"] == "recB"
-            assert not final.payload["feishu_recovery_pending"]
-            assert remote.records[1].fields["恢复时间"] == epoch_milliseconds(datetime.fromisoformat(closed_at))
-        else:
-            assert not final.payload.get("feishu_record_id")
-            assert final.payload["feishu_binding_status"] == "PENDING"
+            assert "恢复时间" not in remote.records[1].fields
     finally:
         connection.close()

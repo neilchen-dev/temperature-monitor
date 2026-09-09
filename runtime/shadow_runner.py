@@ -60,6 +60,8 @@ class RuntimeStatus:
     active_device_ids: tuple[str, ...]
     active_device_count: int
     active_canary_enabled: bool
+    active_epoch: str | None
+    active_cutover_at: datetime | None
     scheduler_running: bool
     last_standard_sync_time: datetime | None
     enabled_standard_count: int
@@ -89,6 +91,8 @@ class RuntimeStatus:
             "active_device_ids": list(self.active_device_ids),
             "active_device_count": self.active_device_count,
             "active_canary_enabled": self.active_canary_enabled,
+            "active_epoch": self.active_epoch,
+            "active_cutover_at": _iso(self.active_cutover_at),
             "scheduler_running": self.scheduler_running,
             "last_standard_sync_time": _iso(self.last_standard_sync_time),
             "enabled_standard_count": self.enabled_standard_count,
@@ -425,6 +429,8 @@ class ShadowRuntime:
             )
             readiness = self.standards_readiness()
             standards_ready = bool(readiness["standards_ready"])
+            runtime_context = getattr(self.task_repository, "runtime_context", None)
+            activation = runtime_context() if callable(runtime_context) else None
             status = RuntimeStatus(
                 mode=self.mode,
                 available=self.available,
@@ -439,6 +445,8 @@ class ShadowRuntime:
                 active_canary_enabled=(
                     self.active_canary_enabled and standards_ready
                 ),
+                active_epoch=getattr(activation, "active_epoch", None),
+                active_cutover_at=getattr(activation, "active_cutover_at", None),
                 scheduler_running=scheduler_running,
                 last_standard_sync_time=self._last_standard_sync_time,
                 enabled_standard_count=self._enabled_standard_count,
@@ -818,6 +826,32 @@ class ShadowRuntime:
             ):
                 continue
             payload = dict(event.payload)
+            event_effect_allowed = getattr(
+                self.task_repository, "event_external_effect_allowed", None
+            )
+            if callable(event_effect_allowed) and not event_effect_allowed(
+                created_mode=payload.get("created_mode"),
+                active_epoch=payload.get("active_epoch"),
+            ):
+                # A pre-cutover event may remain locally useful for audit and
+                # manual reconciliation, but it is never upgraded to an
+                # Active CREATE/UPDATE/NOTIFY merely because the process mode
+                # changed.  Changing the binding marker keeps the scanner from
+                # repeatedly re-arming the same historical event.
+                self.event_repository.patch_external_projection(
+                    event.event_id,
+                    feishu_binding_status="LEGACY_PENDING",
+                    external_effect_policy="SHADOW_ONLY",
+                    external_effect_blocked_at=now.isoformat(),
+                    external_effect_block_reason="created_before_active_cutover",
+                )
+                logger.warning(
+                    "historical event held for manual review at Active cutover | "
+                    "device_id=%s | event_id=%s",
+                    device_id,
+                    event.event_id,
+                )
+                continue
             if not payload.get("feishu_record_id") and "feishu_create_attempted" not in payload:
                 self.event_repository.patch_external_projection(
                     event.event_id, feishu_create_attempted=True

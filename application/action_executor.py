@@ -66,6 +66,7 @@ class ActionExecutor:
         recorder: ActionRunRecorder | None = None,
         standards_ready_provider: Callable[[], bool] | None = None,
         action_enabled_provider: Callable[[AlarmAction | ApplicationAction], bool] | None = None,
+        active_epoch_provider: Callable[[], str | None] | None = None,
     ) -> None:
         self.mode = AutomationMode(mode)
         self.active_device_ids = normalize_device_ids(active_device_ids)
@@ -80,6 +81,7 @@ class ActionExecutor:
         self.recorder = recorder
         self.standards_ready_provider = standards_ready_provider
         self.action_enabled_provider = action_enabled_provider
+        self.active_epoch_provider = active_epoch_provider
 
     def standards_ready(self) -> bool:
         """Return the current production-standard gate, failing closed."""
@@ -228,6 +230,40 @@ class ActionExecutor:
                 context=context,
                 created_at=created_at,
             )
+
+        # A scheduler task carries the epoch in its durable audit metadata.
+        # When configured, require that metadata to belong to the process's
+        # current Active epoch before any external handler is reached.  Direct
+        # sample actions remain compatible for alternate/test callers that do
+        # not inject an epoch provider; production bootstrap always injects it.
+        if self.active_epoch_provider is not None:
+            try:
+                current_epoch = self.active_epoch_provider()
+            except Exception:  # noqa: BLE001 - a broken cutover gate denies writes
+                current_epoch = None
+            task_mode = context.get("created_mode")
+            task_epoch = context.get("active_epoch")
+            has_task_context = (
+                context.get("automation_task_id") is not None
+                or "created_mode" in context
+                or "active_epoch" in context
+            )
+            if has_task_context and (
+                task_mode != AutomationMode.ACTIVE.value
+                or not current_epoch
+                or task_epoch != current_epoch
+            ):
+                return ActionExecution(
+                    action=action,
+                    mode=self.mode,
+                    status=ActionExecutionStatus.PLANNED,
+                    error=(
+                        "external effect is outside the current Active epoch; "
+                        "action remains PLANNED"
+                    ),
+                    context=context,
+                    created_at=created_at,
+                )
 
         if self.action_enabled_provider is not None:
             try:

@@ -153,6 +153,8 @@ def active_canary_status() -> dict[str, Any]:
     active_device_ids = list(config.ACTIVE_DEVICE_IDS)
     active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
     readiness: dict[str, Any] = {
+        "active_epoch": None,
+        "active_cutover_at": None,
         "active_snapshot_id": None,
         "last_known_good_snapshot_id": None,
         "validated_standard_count": 0,
@@ -165,6 +167,7 @@ def active_canary_status() -> dict[str, Any]:
     }
     if _last_components is not None:
         try:
+            runtime_context = _last_components.task_repository.runtime_context()
             live_readiness = _last_components.standards_readiness()
             readiness.update(
                 {
@@ -172,6 +175,12 @@ def active_canary_status() -> dict[str, Any]:
                     for key in readiness
                     if key in live_readiness
                 }
+            )
+            readiness["active_epoch"] = runtime_context.active_epoch
+            readiness["active_cutover_at"] = (
+                runtime_context.active_cutover_at.isoformat()
+                if runtime_context.active_cutover_at is not None
+                else None
             )
         except Exception:  # noqa: BLE001 - status must remain fail-closed
             logger.exception("读取 Active Canary standards readiness 失败")
@@ -406,6 +415,27 @@ def build_runtime(
         if mode == AutomationMode.SHADOW.value or _active_write_allowed(mode)
         else AutomationMode.DISABLED.value
     )
+    activation_now = now_provider() if now_provider is not None else datetime.now().astimezone()
+    activation = task_repository.set_runtime_context(
+        mode=effective_mode,
+        now=activation_now,
+    )
+    # A rollback/re-activation gets a new epoch.  Tasks from an earlier mode or
+    # epoch remain queryable but can never be claimed as external work.  The
+    # same quarantine is applied in Shadow/disabled so rollback cannot churn
+    # old reconciliation tasks locally before the next Active startup.
+    quarantined = task_repository.quarantine_legacy_external_tasks(
+        now=activation_now,
+        active_epoch=activation.active_epoch,
+    )
+    if quarantined:
+        logger.warning(
+            "legacy external-effect tasks quarantined at runtime boundary | "
+            "count=%s | mode=%s | active_epoch=%s",
+            quarantined,
+            effective_mode,
+            activation.active_epoch,
+        )
     action_executor = ActionExecutor(
         mode=effective_mode,
         active_device_ids=config.ACTIVE_DEVICE_IDS,
@@ -430,6 +460,7 @@ def build_runtime(
         standards_ready_provider=lambda: standard_repository.standards_ready(
             expected_device_ids=devices.keys()
         ),
+        active_epoch_provider=lambda: task_repository.runtime_context().active_epoch,
     )
     if mode == AutomationMode.ACTIVE.value:
         if effective_mode == AutomationMode.ACTIVE.value and config.ACTIVE_DEVICE_IDS:

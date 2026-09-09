@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Mapping
 
@@ -30,13 +31,40 @@ CREATE TABLE IF NOT EXISTS automation_tasks (
     lease_until TEXT,
     worker_id TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    created_mode TEXT,
+    active_epoch TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_automation_tasks_due
     ON automation_tasks(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_automation_tasks_entity
     ON automation_tasks(entity_type, entity_id, status);
+
+CREATE TABLE IF NOT EXISTS automation_runtime_state (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    current_mode TEXT NOT NULL,
+    active_epoch TEXT,
+    active_cutover_at TEXT,
+    updated_at TEXT NOT NULL
+);
 """
+
+_EXTERNAL_EFFECT_TASK_TYPES = frozenset(
+    {
+        "RECONCILE_ALARM_EVENT",
+        "NOTIFY_ALARM",
+        "NOTIFY_RECOVERY",
+    }
+)
+
+
+@dataclass(frozen=True)
+class RuntimeActivation:
+    """Persisted mode boundary used to authorize external-effect tasks."""
+
+    mode: str
+    active_epoch: str | None
+    active_cutover_at: datetime | None
 
 
 class TaskStateError(ValueError):
@@ -72,11 +100,172 @@ class SQLiteAutomationTaskRepository:
             ("claimed_at", "TEXT"),
             ("lease_until", "TEXT"),
             ("worker_id", "TEXT"),
+            ("created_mode", "TEXT"),
+            ("active_epoch", "TEXT"),
         ):
             if column not in columns:
                 self.connection.execute(
                     f"ALTER TABLE automation_tasks ADD COLUMN {column} {definition}"
                 )
+
+    def set_runtime_context(
+        self,
+        *,
+        mode: str,
+        now: datetime | None = None,
+        active_epoch: str | None = None,
+    ) -> RuntimeActivation:
+        """Record the process mode and open a new epoch on every re-activation.
+
+        A restart while still Active reuses the persisted epoch.  A rollback to
+        Shadow/disabled clears the current epoch, so the next Active startup
+        gets a fresh cutover boundary.  This is metadata-only and never edits
+        business events or historical task payloads.
+        """
+        mode_value = str(getattr(mode, "value", mode)).strip().lower()
+        if mode_value not in {"disabled", "shadow", "active"}:
+            raise ValueError(f"unsupported runtime mode: {mode!r}")
+        current_time = now or datetime.now().astimezone()
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.connection.execute(
+                    "SELECT * FROM automation_runtime_state WHERE singleton_id = 1"
+                ).fetchone()
+                if (
+                    mode_value == "active"
+                    and previous is not None
+                    and previous["current_mode"] == "active"
+                    and previous["active_epoch"]
+                ):
+                    epoch = previous["active_epoch"]
+                    cutover_at = previous["active_cutover_at"]
+                elif mode_value == "active":
+                    epoch = active_epoch or uuid.uuid4().hex
+                    cutover_at = _datetime_text(current_time)
+                else:
+                    epoch = None
+                    cutover_at = None
+                self.connection.execute(
+                    """
+                    INSERT INTO automation_runtime_state (
+                        singleton_id, current_mode, active_epoch,
+                        active_cutover_at, updated_at
+                    ) VALUES (1, ?, ?, ?, ?)
+                    ON CONFLICT(singleton_id) DO UPDATE SET
+                        current_mode = excluded.current_mode,
+                        active_epoch = excluded.active_epoch,
+                        active_cutover_at = excluded.active_cutover_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        mode_value,
+                        epoch,
+                        cutover_at,
+                        _datetime_text(current_time),
+                    ),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return self.runtime_context()
+
+    def runtime_context(self) -> RuntimeActivation:
+        """Read the current persisted mode/epoch; missing state fails closed."""
+        row = self.connection.execute(
+            "SELECT * FROM automation_runtime_state WHERE singleton_id = 1"
+        ).fetchone()
+        if row is None:
+            return RuntimeActivation("unknown", None, None)
+        return RuntimeActivation(
+            mode=str(row["current_mode"]),
+            active_epoch=row["active_epoch"],
+            active_cutover_at=_datetime_value(row["active_cutover_at"]),
+        )
+
+    def quarantine_legacy_external_tasks(
+        self,
+        *,
+        now: datetime | None = None,
+        active_epoch: str | None = None,
+    ) -> int:
+        """Move pre-cutover external tasks to an unclaimable audit state."""
+        activation = self.runtime_context()
+        if activation.mode not in {"active", "shadow", "disabled"}:
+            # Test/embedded callers that have not installed a runtime context
+            # must not have their generic task repository silently rewritten.
+            return 0
+        epoch = active_epoch or activation.active_epoch
+        if not epoch and activation.mode == "active":
+            return 0
+        current_time = now or datetime.now().astimezone()
+        placeholders = ",".join("?" for _ in _EXTERNAL_EFFECT_TASK_TYPES)
+        if activation.mode == "active":
+            eligibility = "created_mode IS NULL OR created_mode <> 'active' OR active_epoch IS NULL OR active_epoch <> ?"
+            eligibility_params: tuple[Any, ...] = (epoch,)
+            reason = "legacy_external_effect_before_active_cutover"
+        else:
+            eligibility = "1 = 1"
+            eligibility_params = ()
+            reason = "external_effect_blocked_while_runtime_not_active"
+        params: tuple[Any, ...] = (
+            AutomationTaskStatus.LEGACY_PENDING.value,
+            _datetime_text(current_time),
+            reason,
+            *_EXTERNAL_EFFECT_TASK_TYPES,
+            AutomationTaskStatus.PENDING.value,
+            AutomationTaskStatus.RUNNING.value,
+            *eligibility_params,
+        )
+        with self._lock:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE automation_tasks
+                SET status = ?, updated_at = ?,
+                    last_error = COALESCE(last_error, ?),
+                    lease_until = NULL, worker_id = NULL
+                WHERE task_type IN ({placeholders})
+                  AND status IN (?, ?)
+                  AND ({eligibility})
+                """,
+                params,
+            )
+            self.connection.commit()
+        return max(cursor.rowcount, 0)
+
+    def external_effect_allowed(self, task: AutomationTask) -> bool:
+        """Return whether this task belongs to the currently active epoch."""
+        if task.task_type not in _EXTERNAL_EFFECT_TASK_TYPES:
+            return True
+        activation = self.runtime_context()
+        return bool(
+            activation.mode == "active"
+            and activation.active_epoch
+            and task.created_mode == "active"
+            and task.active_epoch == activation.active_epoch
+        )
+
+    def event_external_effect_allowed(
+        self,
+        *,
+        created_mode: str | None,
+        active_epoch: str | None,
+    ) -> bool:
+        """Authorize reconciliation only for an explicitly current-era event."""
+        activation = self.runtime_context()
+        return bool(
+            activation.mode == "active"
+            and activation.active_epoch
+            and created_mode == "active"
+            and active_epoch == activation.active_epoch
+        )
+
+    def _creation_metadata(self) -> tuple[str | None, str | None]:
+        activation = self.runtime_context()
+        if activation.mode not in {"disabled", "shadow", "active"}:
+            return None, None
+        return activation.mode, activation.active_epoch
 
     def create_or_get(
         self,
@@ -92,6 +281,7 @@ class SQLiteAutomationTaskRepository:
         """Create a pending task, or return the existing deduplicated task."""
         with self._lock:
             task_id = uuid.uuid4().hex
+            created_mode, active_epoch = self._creation_metadata()
             payload_json = json.dumps(
                 dict(payload or {}),
                 ensure_ascii=False,
@@ -109,14 +299,17 @@ class SQLiteAutomationTaskRepository:
                 dedupe_key,
                 _datetime_text(created_at),
                 _datetime_text(created_at),
+                created_mode,
+                active_epoch,
             )
             if dedupe_key is None:
                 self.connection.execute(
                     """
                     INSERT INTO automation_tasks (
                         id, task_type, entity_type, entity_id, due_at, status,
-                        payload_json, dedupe_key, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload_json, dedupe_key, created_at, updated_at,
+                        created_mode, active_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     values,
                 )
@@ -125,8 +318,9 @@ class SQLiteAutomationTaskRepository:
                     """
                     INSERT INTO automation_tasks (
                         id, task_type, entity_type, entity_id, due_at, status,
-                        payload_json, dedupe_key, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload_json, dedupe_key, created_at, updated_at,
+                        created_mode, active_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(dedupe_key) DO NOTHING
                     """,
                     values,
@@ -187,6 +381,7 @@ class SQLiteAutomationTaskRepository:
             separators=(",", ":"),
         )
         with self._lock:
+            created_mode, active_epoch = self._creation_metadata()
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 if task_type == "RECONCILE_ALARM_EVENT":
@@ -308,8 +503,9 @@ class SQLiteAutomationTaskRepository:
                     """
                     INSERT INTO automation_tasks (
                         id, task_type, entity_type, entity_id, due_at, status,
-                        payload_json, dedupe_key, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload_json, dedupe_key, created_at, updated_at,
+                        created_mode, active_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -322,6 +518,8 @@ class SQLiteAutomationTaskRepository:
                         dedupe_key,
                         _datetime_text(created_at),
                         _datetime_text(created_at),
+                        created_mode,
+                        active_epoch,
                     ),
                 )
                 self.connection.commit()
@@ -371,6 +569,11 @@ class SQLiteAutomationTaskRepository:
             raise ValueError("lease_for must be positive")
         now_text = _datetime_text(now)
         lease_until_text = _datetime_text(now + lease_for)
+        # Re-check at claim time as a restart-safe last line of defence.  A
+        # task inserted by a previous mode/epoch is moved to LEGACY_PENDING
+        # before it can enter RUNNING, even if startup reconciliation raced
+        # with the first scheduler poll.
+        self.quarantine_legacy_external_tasks(now=now)
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -560,6 +763,8 @@ class SQLiteAutomationTaskRepository:
             worker_id=row["worker_id"],
             attempt_count=row["attempt_count"],
             last_error=row["last_error"],
+            created_mode=row["created_mode"],
+            active_epoch=row["active_epoch"],
         )
 
 

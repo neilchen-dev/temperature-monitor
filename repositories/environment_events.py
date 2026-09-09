@@ -553,6 +553,7 @@ class SQLiteEnvironmentEventRepository:
             record.event_id
             for record in records
             if not record.payload.get("feishu_record_id")
+            and record.payload.get("external_effect_policy") != "SHADOW_ONLY"
             and record.payload.get("feishu_binding_status") == "PENDING"
         }
         try:
@@ -589,9 +590,18 @@ class SQLiteEnvironmentEventRepository:
         return tuple(
             record
             for record in records
-            if (record.event_id in candidates and not record.payload.get("feishu_record_id"))
-            or record.payload.get("feishu_recovery_pending")
-            or record.payload.get("feishu_update_pending")
+            if (
+                record.event_id in candidates
+                and not record.payload.get("feishu_record_id")
+                and record.payload.get("external_effect_policy") != "SHADOW_ONLY"
+            )
+            or (
+                record.payload.get("external_effect_policy") != "SHADOW_ONLY"
+                and (
+                    record.payload.get("feishu_recovery_pending")
+                    or record.payload.get("feishu_update_pending")
+                )
+            )
         )
 
     def claim_external_create(
