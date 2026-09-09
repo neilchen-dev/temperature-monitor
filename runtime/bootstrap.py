@@ -132,7 +132,9 @@ def _active_action_enabled(action: Any) -> bool:
     return True
 
 
-def active_block_reason() -> str | None:
+def active_block_reason(
+    *, task_repository: SQLiteAutomationTaskRepository | None = None
+) -> str | None:
     """Why Active writes are blocked; None when not attempting Active mode."""
     if str(config.AUTOMATION_MODE).strip().lower() != AutomationMode.ACTIVE.value:
         return None
@@ -145,6 +147,32 @@ def active_block_reason() -> str | None:
             "(legacy owner for ACTIVE_DEVICE_IDS must be disabled or excluded; "
             "other devices may retain legacy workflows during Canary)"
         )
+    repository = task_repository
+    if repository is None and _last_components is not None:
+        repository = getattr(_last_components, "task_repository", None)
+    if repository is not None:
+        try:
+            task_health = repository.active_readiness()
+        except Exception:  # noqa: BLE001 - a broken health gate fails closed
+            task_health = {
+                "active_readiness": False,
+                "blocker_reasons": [
+                    "automation task health unavailable"
+                ],
+                "active_readiness_blockers": [
+                    "automation task health unavailable"
+                ],
+            }
+        if not task_health.get("active_readiness", False):
+            reasons.append(
+                "automation task health blocked: "
+                + ", ".join(
+                    task_health.get(
+                        "blocker_reasons",
+                        task_health.get("active_readiness_blockers", ()),
+                    )
+                )
+            )
     return "; ".join(reasons) if reasons else None
 
 
@@ -165,10 +193,16 @@ def active_canary_status() -> dict[str, Any]:
         "standard_source": None,
         "standards_ready": False,
     }
+    task_health: dict[str, Any] = {
+        "active_readiness": True,
+        "blocker_reasons": [],
+        "active_readiness_blockers": [],
+    }
     if _last_components is not None:
         try:
             runtime_context = _last_components.task_repository.runtime_context()
             live_readiness = _last_components.standards_readiness()
+            task_health = _last_components.task_repository.active_readiness()
             readiness.update(
                 {
                     key: live_readiness[key]
@@ -184,6 +218,16 @@ def active_canary_status() -> dict[str, Any]:
             )
         except Exception:  # noqa: BLE001 - status must remain fail-closed
             logger.exception("读取 Active Canary standards readiness 失败")
+            readiness["standards_ready"] = False
+            task_health = {
+                "active_readiness": False,
+                "blocker_reasons": [
+                    "runtime readiness unavailable"
+                ],
+                "active_readiness_blockers": [
+                    "runtime readiness unavailable"
+                ],
+            }
     return {
         "active_device_ids": active_device_ids,
         "active_device_count": len(active_device_ids),
@@ -193,7 +237,9 @@ def active_canary_status() -> dict[str, Any]:
             and config.ACTIVE_CUTOVER_ACK == config.ACTIVE_CUTOVER_ACK_EXPECTED
             and active_device_ids
             and readiness["standards_ready"]
+            and task_health["active_readiness"]
         ),
+        "automation_tasks": task_health,
         **readiness,
     }
 
@@ -457,8 +503,9 @@ def build_runtime(
         },
         recorder=run_repository,
         action_enabled_provider=_active_action_enabled,
-        standards_ready_provider=lambda: standard_repository.standards_ready(
-            expected_device_ids=devices.keys()
+        standards_ready_provider=lambda: (
+            standard_repository.standards_ready(expected_device_ids=devices.keys())
+            and task_repository.active_readiness()["active_readiness"]
         ),
         active_epoch_provider=lambda: task_repository.runtime_context().active_epoch,
     )
@@ -497,7 +544,7 @@ def build_runtime(
     missing = _missing_configuration()
     reason_parts = [part for part in (mode_error, device_error, *missing) if part]
     if mode == AutomationMode.ACTIVE.value:
-        active_block = active_block_reason()
+        active_block = active_block_reason(task_repository=task_repository)
         if active_block:
             reason_parts.append(
                 f"Active mode blocked: {active_block}; no Feishu writes are enabled"

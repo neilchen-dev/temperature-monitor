@@ -104,6 +104,10 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(components.status()["mode"], "shadow")
         self.assertTrue(components.status()["available"])
+        task_health = components.status()["automation_tasks"]
+        self.assertIn("historical_failed_tasks", task_health)
+        self.assertIn("current_epoch_failed_tasks", task_health)
+        self.assertIn("pending_external_effects", task_health)
         self.assertFalse(components.runtime.monitor_service.action_executor.mode.value == "active")
         components.start()
         self.assertTrue(components.status()["scheduler_running"])

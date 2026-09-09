@@ -65,6 +65,7 @@ class RuntimeActivation:
     mode: str
     active_epoch: str | None
     active_cutover_at: datetime | None
+    updated_at: datetime | None = None
 
 
 class TaskStateError(ValueError):
@@ -77,6 +78,15 @@ def _datetime_text(value: datetime) -> str:
 
 def _datetime_value(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value is not None else None
+
+
+def _at_or_before(value: datetime, reference: datetime) -> bool:
+    """Compare task timestamps while tolerating legacy naive timestamps."""
+    if value.tzinfo is None and reference.tzinfo is not None:
+        value = value.replace(tzinfo=reference.tzinfo)
+    elif value.tzinfo is not None and reference.tzinfo is None:
+        reference = reference.replace(tzinfo=value.tzinfo)
+    return value <= reference
 
 
 class SQLiteAutomationTaskRepository:
@@ -177,12 +187,225 @@ class SQLiteAutomationTaskRepository:
             "SELECT * FROM automation_runtime_state WHERE singleton_id = 1"
         ).fetchone()
         if row is None:
-            return RuntimeActivation("unknown", None, None)
+            return RuntimeActivation("unknown", None, None, None)
         return RuntimeActivation(
             mode=str(row["current_mode"]),
             active_epoch=row["active_epoch"],
             active_cutover_at=_datetime_value(row["active_cutover_at"]),
+            updated_at=_datetime_value(row["updated_at"]),
         )
+
+    def health_summary(
+        self,
+        *,
+        now: datetime | None = None,
+        stale_after: timedelta = timedelta(minutes=5),
+    ) -> dict[str, Any]:
+        """Return task health using the current runtime boundary.
+
+        ``FAILED`` is a terminal audit state: ``claim_due`` never claims it.
+        The cumulative terminal count is therefore intentionally separated
+        from failures created during the current mode boundary/Active epoch.
+        This keeps old Shadow history visible without letting it block a new
+        Active Canary.
+        """
+        if stale_after <= timedelta(0):
+            raise ValueError("stale_after must be positive")
+
+        current_time = now or datetime.now().astimezone()
+        activation = self.runtime_context()
+        current_boundary = activation.active_cutover_at or activation.updated_at
+
+        def count(query: str, params: tuple[Any, ...] = ()) -> int:
+            row = self.connection.execute(query, params).fetchone()
+            return int(row[0] or 0) if row is not None else 0
+
+        total_failed = count(
+            "SELECT COUNT(*) FROM automation_tasks WHERE status = 'FAILED'"
+        )
+        current_failed = 0
+        current_failed_by_type: dict[str, int] = {}
+        current_failed_rows: list[sqlite3.Row] = []
+        if current_boundary is not None:
+            boundary_text = _datetime_text(current_boundary)
+            current_failed = count(
+                """
+                SELECT COUNT(*) FROM automation_tasks
+                WHERE status = 'FAILED' AND created_at >= ?
+                """,
+                (boundary_text,),
+            )
+            grouped = self.connection.execute(
+                """
+                SELECT task_type, COUNT(*) AS count
+                FROM automation_tasks
+                WHERE status = 'FAILED' AND created_at >= ?
+                GROUP BY task_type
+                ORDER BY task_type
+                """,
+                (boundary_text,),
+            ).fetchall()
+            current_failed_by_type = {
+                str(row["task_type"]): int(row["count"])
+                for row in grouped
+            }
+            current_failed_rows = self.connection.execute(
+                """
+                SELECT payload_json
+                FROM automation_tasks
+                WHERE status = 'FAILED' AND created_at >= ?
+                """,
+                (boundary_text,),
+            ).fetchall()
+
+        current_epoch_failed = 0
+        if activation.active_epoch:
+            current_epoch_failed = count(
+                """
+                SELECT COUNT(*) FROM automation_tasks
+                WHERE status = 'FAILED' AND active_epoch = ?
+                """,
+                (activation.active_epoch,),
+            )
+
+        retryable_failed = sum(
+            1
+            for row in current_failed_rows
+            if self._payload_has_retry_marker(row["payload_json"])
+        )
+
+        legacy_pending = count(
+            "SELECT COUNT(*) FROM automation_tasks WHERE status = 'LEGACY_PENDING'"
+        )
+        placeholders = ",".join("?" for _ in _EXTERNAL_EFFECT_TASK_TYPES)
+        external_params = tuple(_EXTERNAL_EFFECT_TASK_TYPES)
+        pending_external = count(
+            f"""
+            SELECT COUNT(*) FROM automation_tasks
+            WHERE task_type IN ({placeholders})
+              AND status IN ('PENDING', 'RUNNING')
+            """,
+            external_params,
+        )
+        if activation.mode == "active" and activation.active_epoch:
+            unisolated_external = count(
+                f"""
+                SELECT COUNT(*) FROM automation_tasks
+                WHERE task_type IN ({placeholders})
+                  AND status IN ('PENDING', 'RUNNING')
+                  AND NOT (created_mode = 'active' AND active_epoch = ?)
+                """,
+                (*external_params, activation.active_epoch),
+            )
+        else:
+            unisolated_external = pending_external
+
+        stale_cutoff = current_time - stale_after
+        stale = 0
+        unfinished_rows = self.connection.execute(
+            """
+            SELECT status, due_at, lease_until
+            FROM automation_tasks
+            WHERE status IN ('PENDING', 'RUNNING')
+            """
+        ).fetchall()
+        for row in unfinished_rows:
+            if row["status"] == "RUNNING":
+                lease_until = _datetime_value(row["lease_until"])
+                if lease_until is not None and _at_or_before(lease_until, current_time):
+                    stale += 1
+                continue
+            due_at = _datetime_value(row["due_at"])
+            if due_at is not None and _at_or_before(due_at, stale_cutoff):
+                stale += 1
+
+        return {
+            "current_mode": activation.mode,
+            "active_epoch": activation.active_epoch,
+            "active_cutover_at": _datetime_text(activation.active_cutover_at)
+            if activation.active_cutover_at is not None
+            else None,
+            "current_boundary_at": _datetime_text(current_boundary)
+            if current_boundary is not None
+            else None,
+            "failed_tasks_total": total_failed,
+            "historical_failed_tasks": max(total_failed - current_failed, 0),
+            "current_failed_tasks": current_failed,
+            "current_failed_by_type": current_failed_by_type,
+            "current_epoch_failed_tasks": current_epoch_failed,
+            "retryable_failed_tasks": retryable_failed,
+            "claimable_failed_tasks": 0,
+            "legacy_pending_tasks": legacy_pending,
+            "stale_tasks": stale,
+            "pending_external_effects": pending_external,
+            "unisolated_external_effects": unisolated_external,
+        }
+
+    def active_readiness(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Return whether task state is safe for a new Active Canary.
+
+        Historical terminal failures and ``LEGACY_PENDING`` rows are audit
+        evidence, not automatic blockers. Current failures, retryable failure
+        lineage, stale unfinished work, and unisolated external-effect work
+        remain blockers.
+        """
+        summary = self.health_summary(now=now)
+        blockers: list[str] = []
+        if summary["current_failed_tasks"]:
+            blockers.append(
+                f"current_failed_tasks={summary['current_failed_tasks']}"
+            )
+        if summary["current_epoch_failed_tasks"]:
+            blockers.append(
+                "current_epoch_failed_tasks="
+                f"{summary['current_epoch_failed_tasks']}"
+            )
+        if summary["retryable_failed_tasks"]:
+            blockers.append(
+                f"retryable_failed_tasks={summary['retryable_failed_tasks']}"
+            )
+        if summary["claimable_failed_tasks"]:
+            blockers.append(
+                f"claimable_failed_tasks={summary['claimable_failed_tasks']}"
+            )
+        if summary["stale_tasks"]:
+            blockers.append(f"stale_tasks={summary['stale_tasks']}")
+        if summary["pending_external_effects"]:
+            blockers.append(
+                "pending_external_effects="
+                f"{summary['pending_external_effects']}"
+            )
+        if summary["unisolated_external_effects"]:
+            blockers.append(
+                "unisolated_external_effects="
+                f"{summary['unisolated_external_effects']}"
+            )
+        summary["active_readiness"] = not blockers
+        summary["blocker_reasons"] = blockers
+        # Compatibility alias for callers of the pre-release field name.
+        summary["active_readiness_blockers"] = blockers
+        return summary
+
+    @staticmethod
+    def _payload_has_retry_marker(payload_json: str | None) -> bool:
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        if payload.get("retryable") is True:
+            return True
+        if any(payload.get(key) is not None for key in (
+            "next_retry_at", "next_retry", "next_attempt_at", "retry_at",
+        )):
+            return True
+        try:
+            return int(payload.get("retry_attempt", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
 
     def quarantine_legacy_external_tasks(
         self,

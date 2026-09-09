@@ -84,6 +84,134 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
                 error="must not run",
             )
 
+    def test_health_summary_excludes_historical_terminal_failures_from_readiness(self) -> None:
+        historical = self.repository.create_or_get(
+            task_type="SHADOW_COMPARE",
+            entity_type="DEVICE",
+            entity_id="TH-03",
+            due_at=self.created_at,
+            payload={"expected": {"device_id": "TH-03"}},
+            dedupe_key="SHADOW_COMPARE:historical",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(now=self.created_at, worker_id="worker-a")
+        self.repository.mark_failed(
+            historical.task_id,
+            finished_at=self.created_at + timedelta(seconds=1),
+            error="historical Shadow comparison failure",
+            worker_id="worker-a",
+        )
+        boundary = self.created_at + timedelta(minutes=10)
+        self.repository.set_runtime_context(mode="shadow", now=boundary)
+
+        summary = self.repository.active_readiness(now=boundary)
+
+        self.assertEqual(summary["failed_tasks_total"], 1)
+        self.assertEqual(summary["historical_failed_tasks"], 1)
+        self.assertEqual(summary["current_failed_tasks"], 0)
+        self.assertEqual(summary["current_epoch_failed_tasks"], 0)
+        self.assertEqual(summary["retryable_failed_tasks"], 0)
+        self.assertEqual(summary["claimable_failed_tasks"], 0)
+        self.assertEqual(summary["blocker_reasons"], [])
+        self.assertTrue(summary["active_readiness"])
+
+    def test_health_summary_blocks_current_epoch_retryable_failure(self) -> None:
+        activation = self.repository.set_runtime_context(
+            mode="active", now=self.created_at
+        )
+        task = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-current",
+            due_at=self.created_at,
+            payload={"event_id": "event-current", "retry_attempt": 1},
+            dedupe_key="NOTIFY_ALARM:event-current",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(now=self.created_at, worker_id="worker-a")
+        self.repository.mark_failed(
+            task.task_id,
+            finished_at=self.created_at + timedelta(seconds=1),
+            error="temporary Feishu failure exhausted retries",
+            worker_id="worker-a",
+        )
+
+        summary = self.repository.active_readiness(
+            now=self.created_at + timedelta(seconds=2)
+        )
+
+        self.assertEqual(summary["active_epoch"], activation.active_epoch)
+        self.assertEqual(summary["current_failed_tasks"], 1)
+        self.assertEqual(summary["current_epoch_failed_tasks"], 1)
+        self.assertEqual(summary["retryable_failed_tasks"], 1)
+        self.assertEqual(summary["claimable_failed_tasks"], 0)
+        self.assertIn("current_failed_tasks=1", summary["blocker_reasons"])
+        self.assertFalse(summary["active_readiness"])
+
+    def test_health_summary_treats_legacy_pending_as_audit_only(self) -> None:
+        self.repository.set_runtime_context(mode="shadow", now=self.created_at)
+        task = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-legacy",
+            due_at=self.created_at,
+            payload={"event_id": "event-legacy"},
+            dedupe_key="NOTIFY_ALARM:event-legacy",
+            created_at=self.created_at,
+        )
+        activation = self.repository.set_runtime_context(
+            mode="active", now=self.created_at + timedelta(minutes=1)
+        )
+        self.assertEqual(
+            self.repository.quarantine_legacy_external_tasks(
+                now=self.created_at + timedelta(minutes=1),
+                active_epoch=activation.active_epoch,
+            ),
+            1,
+        )
+
+        summary = self.repository.active_readiness(
+            now=self.created_at + timedelta(minutes=1)
+        )
+
+        self.assertEqual(summary["legacy_pending_tasks"], 1)
+        self.assertEqual(summary["pending_external_effects"], 0)
+        self.assertEqual(summary["claimable_failed_tasks"], 0)
+        self.assertEqual(summary["blocker_reasons"], [])
+        self.assertTrue(summary["active_readiness"])
+        self.assertEqual(self.repository.claim_due(now=self.created_at + timedelta(minutes=1)), ())
+        self.assertEqual(
+            self.repository.get(task.task_id).status,
+            AutomationTaskStatus.LEGACY_PENDING,
+        )
+
+    def test_health_summary_blocks_stale_running_external_task(self) -> None:
+        self.repository.set_runtime_context(mode="active", now=self.created_at)
+        task = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-stale",
+            due_at=self.created_at,
+            payload={"event_id": "event-stale"},
+            dedupe_key="NOTIFY_ALARM:event-stale",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(
+            now=self.created_at,
+            worker_id="worker-a",
+            lease_for=timedelta(seconds=1),
+        )
+
+        summary = self.repository.active_readiness(
+            now=self.created_at + timedelta(seconds=2)
+        )
+
+        self.assertEqual(summary["pending_external_effects"], 1)
+        self.assertEqual(summary["stale_tasks"], 1)
+        self.assertIn("pending_external_effects=1", summary["blocker_reasons"])
+        self.assertFalse(summary["active_readiness"])
+        self.assertEqual(self.repository.get(task.task_id).status, AutomationTaskStatus.RUNNING)
+
 
 class GlobalSyncTaskDeduplicationTests(unittest.TestCase):
     def setUp(self) -> None:

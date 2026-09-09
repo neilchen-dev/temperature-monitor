@@ -431,6 +431,9 @@ class ShadowRuntime:
             standards_ready = bool(readiness["standards_ready"])
             runtime_context = getattr(self.task_repository, "runtime_context", None)
             activation = runtime_context() if callable(runtime_context) else None
+            task_health = self.task_repository.active_readiness(
+                now=self.now_provider()
+            )
             status = RuntimeStatus(
                 mode=self.mode,
                 available=self.available,
@@ -470,6 +473,11 @@ class ShadowRuntime:
                 last_shadow_diff=self._last_shadow_diff,
             ).as_dict()
             status["scheduler"] = {"running": scheduler_running}
+            status["automation_tasks"] = task_health
+            status["active_canary_enabled"] = bool(
+                status["active_canary_enabled"]
+                and task_health["active_readiness"]
+            )
             return status
 
     def shadow_summary(self, *, hours: int = 24, now: datetime | None = None) -> dict[str, Any]:
