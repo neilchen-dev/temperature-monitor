@@ -37,7 +37,9 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "automation_runs": (
         "id", "device_id", "sample_time", "mode", "action_type", "action_status",
-        "alarm_id", "planned_run_at", "python_monitor_result_json",
+        "alarm_id", "event_id", "automation_task_id", "dedupe_key",
+        "recipient", "message_id", "result", "error_code", "sent_at",
+        "planned_run_at", "python_monitor_result_json",
         "python_alarm_transition_json", "feishu_observed_state_json", "matched",
         "difference_type", "details_json", "context_json", "error", "created_at",
         "standard_id", "standard_revision", "standard_source",

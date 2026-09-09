@@ -21,8 +21,9 @@ from domain.models import MonitorResult, MonitorSample
 from domain.operation import OperationAction, OperationObservation
 
 from .feishu_records import FeishuRawRecord
-from services.feishu import normalize_client_token
-from services.event_identity import epoch_milliseconds
+from services.feishu import FeishuAPIError, normalize_client_token
+from services.event_identity import epoch_milliseconds, external_effect_key
+from repositories.environment_events import ExternalCreateOutcome
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,42 @@ def _event_time_matches(value: Any, expected: datetime) -> bool:
 
 class FeishuWriteError(RuntimeError):
     """A write was rejected because the ledger state is unsafe or ambiguous."""
+
+
+class FeishuCreateNotPersistedError(FeishuWriteError):
+    """The caller has explicit evidence that CREATE did not reach Feishu."""
+
+
+class FeishuCreateOutcomeUnknownError(FeishuWriteError):
+    """CREATE may have reached Feishu; lookup must precede any retry."""
+
+
+class FeishuCreateNotRetryableError(FeishuWriteError):
+    """The request is invalid or otherwise must not be retried."""
+
+
+def _create_failure_outcome(exc: Exception) -> str:
+    """Classify a failed POST without guessing that an unknown write is safe."""
+    if isinstance(exc, FeishuCreateNotPersistedError):
+        return ExternalCreateOutcome.RETRYABLE
+    if isinstance(exc, FeishuCreateNotRetryableError):
+        return ExternalCreateOutcome.NOT_RETRYABLE
+    if isinstance(exc, FeishuCreateOutcomeUnknownError):
+        return ExternalCreateOutcome.UNKNOWN
+    if isinstance(exc, FeishuAPIError):
+        return (
+            ExternalCreateOutcome.UNKNOWN
+            if exc.outcome_unknown
+            else ExternalCreateOutcome.NOT_RETRYABLE
+        )
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return ExternalCreateOutcome.UNKNOWN
+    # An injected transport adapter can raise a generic RuntimeError. Treat it
+    # as ambiguous; only the explicit NotPersisted exception opens a safe POST
+    # retry path.
+    if isinstance(exc, RuntimeError):
+        return ExternalCreateOutcome.UNKNOWN
+    return ExternalCreateOutcome.NOT_RETRYABLE
 
 
 class FeishuRecordWriter(Protocol):
@@ -502,6 +539,7 @@ class FeishuEnvironmentEventWriter:
         idempotency_key: str | None = None,
         allow_existing: bool = False,
         local_event_id: str | None = None,
+        outcome_at: datetime | None = None,
     ) -> Mapping[str, Any]:
         normalized_device = _device_id(device_id)
         # 业务幂等键 = (监测点, 开始时间)。飞书 API 超时但实际已写入时，
@@ -553,7 +591,7 @@ class FeishuEnvironmentEventWriter:
         if local_event_id is not None and not self.event_repository.reserve_external_post(local_event_id):
             self._binding_log("binding_retry", local_event_id)
             raise FeishuWriteError(
-                f"binding_retry: event={local_event_id}; CREATE outcome uncertain or remote deleted; lookup only/manual review"
+                f"binding_retry: event={local_event_id}; CREATE/reconciliation outcome uncertain or remote deleted; lookup only/manual review"
             )
         try:
             response = self.writer.create(
@@ -563,10 +601,12 @@ class FeishuEnvironmentEventWriter:
             )
             self._binding_log("binding_created", local_event_id)
             return response
-        except Exception:
+        except Exception as exc:
             # A timeout/disconnect (and Feishu 1254608 for the same token) is
             # ambiguous: the remote row may already exist. Recover it by the
-            # exact business key before allowing a later retry to CREATE.
+            # exact business key before allowing a later retry to CREATE. A
+            # caller with explicit no-persist evidence is the sole exception:
+            # it is durably marked RETRYABLE and may reuse this identity.
             existing_after_error = self._find_event_by_business_key(
                 normalized_device, start_time
             )
@@ -577,6 +617,13 @@ class FeishuEnvironmentEventWriter:
                     "idempotent": True,
                     "record_id": existing_after_error.record_id,
                 }
+            if local_event_id is not None and self.event_repository is not None:
+                self.event_repository.mark_external_create_outcome(
+                    local_event_id,
+                    outcome=_create_failure_outcome(exc),
+                    error=str(exc),
+                    observed_at=outcome_at,
+                )
             raise
 
     def update_event(
@@ -817,6 +864,30 @@ class FeishuEnvironmentEventWriter:
                     and event.payload.get("feishu_create_attempted")
                     and transition.get("reason") != "alarm_event_reconciliation"):
                 raise FeishuWriteError("binding_retry: durable reconciliation owns uncertain CREATE")
+        effect_key: str | None = None
+        effect_at = _parse_datetime(
+            context.get("created_at") or context.get("sample_time")
+        ) or datetime.now(timezone.utc)
+        if action_type in {"UPDATE_ALARM_EVENT", "MARK_ALARM_RECOVERED"}:
+            effect_key = external_effect_key(
+                action_type,
+                local_event_id or "",
+                sample_time=context.get("sample_time"),
+                recovered_at=context.get("recovered_at") or context.get("created_at"),
+                sample=sample,
+                result=result,
+            )
+            marker = self.event_repository.get_external_effect(
+                local_event_id, effect_key
+            )
+            if marker is not None and marker.get("status") == "SUCCEEDED":
+                return
+            self.event_repository.mark_external_effect_pending(
+                local_event_id,
+                effect_key=effect_key,
+                action_type=action_type,
+                requested_at=effect_at,
+            )
         if action_type == "CREATE_ALARM_EVENT":
             started_at = _parse_datetime(
                 transition.get("violation_started_at")
@@ -840,6 +911,7 @@ class FeishuEnvironmentEventWriter:
                 humidity_status=str(result.get("humidity_status") or ""),
                 idempotency_key=f"ENV:{device_id}:{_datetime_cell(started_at)}",
                 allow_existing=True,
+                outcome_at=effect_at,
             )
             self._bind_external_record(local_event_id, created)
             return
@@ -890,15 +962,29 @@ class FeishuEnvironmentEventWriter:
                     local_event_id, feishu_update_pending=True,
                     feishu_update_snapshot=update_snapshot,
                 )
-            updated = self.update_event(
-                    record_id=record_id,
-                    temperature=_number_value(sample.get("temperature")),
-                    humidity=_number_value(sample.get("humidity")),
-                    temperature_status=str(result.get("temperature_status") or ""),
-                    humidity_status=str(result.get("humidity_status") or ""),
+            try:
+                updated = self.update_event(
+                        record_id=record_id,
+                        temperature=_number_value(sample.get("temperature")),
+                        humidity=_number_value(sample.get("humidity")),
+                        temperature_status=str(result.get("temperature_status") or ""),
+                        humidity_status=str(result.get("humidity_status") or ""),
+                )
+                if updated.get("skipped") or updated.get("code", 0) != 0:
+                    raise FeishuWriteError("UPDATE_ALARM_EVENT did not complete a remote update")
+            except Exception as exc:
+                self.event_repository.mark_external_effect_failed(
+                    local_event_id,
+                    effect_key=effect_key or "",
+                    failed_at=effect_at,
+                    error=str(exc),
+                )
+                raise
+            self.event_repository.mark_external_effect_succeeded(
+                local_event_id,
+                effect_key=effect_key or "",
+                completed_at=effect_at,
             )
-            if updated.get("skipped") or updated.get("code", 0) != 0:
-                raise FeishuWriteError("UPDATE_ALARM_EVENT did not complete a remote update")
             if self.event_repository is not None and local_event_id is not None:
                 self.event_repository.patch_external_projection(local_event_id, feishu_update_pending=False)
             return
@@ -919,14 +1005,28 @@ class FeishuEnvironmentEventWriter:
             record_id = self._resolve_record_id(local_event_id, device_id, started_at)
             if record_id is None:
                 raise FeishuWriteError("无法关联本次报警对应的飞书异常记录")
-            recovered = self.recover_event(
-                record_id=record_id,
-                recovered_at=recovered_at,
-                temperature=_number_value(sample.get("temperature")),
-                humidity=_number_value(sample.get("humidity")),
+            try:
+                recovered = self.recover_event(
+                    record_id=record_id,
+                    recovered_at=recovered_at,
+                    temperature=_number_value(sample.get("temperature")),
+                    humidity=_number_value(sample.get("humidity")),
+                )
+                if recovered.get("code", 0) != 0:
+                    raise FeishuWriteError("MARK_ALARM_RECOVERED did not complete a remote update")
+            except Exception as exc:
+                self.event_repository.mark_external_effect_failed(
+                    local_event_id,
+                    effect_key=effect_key or "",
+                    failed_at=effect_at,
+                    error=str(exc),
+                )
+                raise
+            self.event_repository.mark_external_effect_succeeded(
+                local_event_id,
+                effect_key=effect_key or "",
+                completed_at=effect_at,
             )
-            if recovered.get("code", 0) != 0:
-                raise FeishuWriteError("MARK_ALARM_RECOVERED did not complete a remote update")
             if local_event_id is not None and self.event_repository is not None:
                 self.event_repository.patch_external_projection(
                     local_event_id, feishu_recovery_pending=False

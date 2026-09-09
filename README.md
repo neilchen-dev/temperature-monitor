@@ -143,6 +143,8 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 - **`shadow`**：只读读取飞书业务状态，计算预期监控结果并与观察状态比对，持久化任务、运行记录和差异，不调用外部动作 handler；
 - **`active`**：启用 Python 的异常事件自动写入；作业登记和仓库点检可通过受保护 API 写入。必须同时设置 `FEISHU_WRITE_ENABLED=true` 和正确的 `ACTIVE_CUTOVER_ACK`，否则 Runtime 自动降级为 disabled；恢复只回写 `恢复时间`，异常关闭仍要求人工填写闭环资料。Active action 还必须命中 `ACTIVE_DEVICE_IDS`；白名单外设备保留为 `PLANNED`，不会调用 handler。
 
+Python-owned Feishu 私聊通知是独立副作用：`NOTIFY_ALARM` 和 `NOTIFY_RECOVERY` 分别受 `FEISHU_ALARM_NOTIFY_ENABLED`、`FEISHU_RECOVERY_NOTIFY_ENABLED` 控制，并且仍需通过 Active、`FEISHU_WRITE_ENABLED`、`ACTIVE_CUTOVER_ACK`、`standards_ready` 和设备白名单 gate。责任人按异常事件责任人、设备默认异常责任人顺序解析；显示名称不会直接作为 `receive_id`，解析到的 `receive_id_type`、消息 ID、任务 ID 和去重键会写入审计。通知链不依赖旧 workflow #17；TH-01 Active Canary 前必须确认 #17 的 legacy owner 已 disabled/excluded，其他设备保持 Shadow。
+
 此外，工业采集与本地镜像可以独立开关：
 
 - **Modbus 模式**：开启 `MODBUS_ENABLED=true`，选择 `MODBUS_TRANSPORT=tcp` 或 `rtu`；
@@ -232,6 +234,11 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID |
 | `FEISHU_OPERATION_INTERVAL_TABLE_ID` / `FEISHU_INSPECTION_TABLE_ID` | 当前台账表 ID | 作业区间和仓库点检写入目标表 |
 | `FEISHU_WRITE_ENABLED` | `false` | 飞书写入总开关；只有与 `AUTOMATION_MODE=active` 同时启用才生效 |
+| `FEISHU_ALARM_NOTIFY_ENABLED` / `FEISHU_RECOVERY_NOTIFY_ENABLED` | `false` | Python 飞书异常/恢复私聊独立 gate；默认关闭，且仍需完整 Active gate |
+| `FEISHU_ALARM_CHAT_ID` | 空 | 责任人无法解析时的显式 chat_id fallback；不会把显示名称当作 receive_id |
+| `FEISHU_NOTIFY_RECEIVE_ID_TYPE` | `open_id` | 责任人 ID 类型；实际使用类型写入通知审计 |
+| `FEISHU_NOTIFY_MAX_RETRIES` / `FEISHU_NOTIFY_BACKOFF_SECONDS` / `FEISHU_NOTIFY_MAX_BACKOFF_SECONDS` | `5` / `30` / `600` | 通知任务的持久化重试次数、基础退避秒数和上限 |
+| `FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS` | `5` | 单次通知外部请求超时；调度器负责跨任务重试 |
 | `ACTIVE_EVENT_RECONCILIATION_*` | `30` / `600` | Active 异常事件 CREATE/UPDATE 失败后的持久化 reconciliation 退避秒数与上限 |
 | `SHADOW_*_SECONDS` | 见 `.env.example` | Shadow 调度、作业同步、标准同步和飞书延迟窗口 |
 | `TEMPERATURE_API_KEY` | 空 | 可选的温度上报接口共享密钥 |

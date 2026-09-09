@@ -17,6 +17,16 @@ class EnvironmentEventStatus(str):
     CLOSED = "CLOSED"
 
 
+class ExternalCreateOutcome(str):
+    """Durable outcome classification for one external CREATE attempt."""
+
+    IN_FLIGHT = "IN_FLIGHT"
+    RETRYABLE = "RETRYABLE"
+    UNKNOWN = "UNKNOWN"
+    NOT_RETRYABLE = "NOT_RETRYABLE"
+    SUCCEEDED = "SUCCEEDED"
+
+
 @dataclass(frozen=True)
 class EnvironmentEventRecord:
     event_id: str
@@ -207,28 +217,101 @@ class SQLiteEnvironmentEventRepository:
                 raise
 
     def reserve_external_post(self, event_id: str) -> bool:
-        """One durable POST permit, never renewed by lease expiry or restart.
+        """Reserve a POST unless a previous result is still unsafe to replay.
 
-        A crash after reservation is ambiguous and requires lookup/manual review.
-        This intentionally favors no duplicate over blindly retrying a POST.
+        Legacy rows with only ``feishu_create_attempted`` remain conservative:
+        their outcome is unknown and reconciliation must lookup first.  A
+        caller may explicitly classify a failed request as ``RETRYABLE``;
+        that is the only state which re-opens the same local event identity for
+        another POST.
         """
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
-                if payload.get("feishu_create_attempted") or payload.get("feishu_record_id"):
+                if payload.get("feishu_record_id"):
+                    self.connection.commit()
+                    return False
+                create_state = payload.get("feishu_create_state")
+                if payload.get("feishu_create_attempted") and create_state != ExternalCreateOutcome.RETRYABLE:
                     self.connection.commit()
                     return False
                 payload["feishu_create_attempted"] = True
+                payload["feishu_create_state"] = ExternalCreateOutcome.IN_FLIGHT
+                payload["feishu_create_attempt_count"] = int(
+                    payload.get("feishu_create_attempt_count", 0)
+                ) + 1
                 self.connection.execute(
                     "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                    (json.dumps(payload, ensure_ascii=False), event_id),
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        event_id,
+                    ),
                 )
                 self.connection.commit()
                 return True
             except Exception:
                 self.connection.rollback()
+                raise
+
+    def mark_external_create_outcome(
+        self,
+        event_id: str,
+        *,
+        outcome: str,
+        error: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> EnvironmentEventRecord:
+        """Persist whether the last CREATE was retryable, unknown, or done."""
+        allowed = {
+            ExternalCreateOutcome.IN_FLIGHT,
+            ExternalCreateOutcome.RETRYABLE,
+            ExternalCreateOutcome.UNKNOWN,
+            ExternalCreateOutcome.NOT_RETRYABLE,
+            ExternalCreateOutcome.SUCCEEDED,
+        }
+        if outcome not in allowed:
+            raise ValueError(f"unsupported external CREATE outcome: {outcome}")
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                payload["feishu_create_state"] = outcome
+                if error:
+                    payload["feishu_create_last_error"] = str(error)
+                else:
+                    payload.pop("feishu_create_last_error", None)
+                if observed_at is not None:
+                    payload["feishu_create_outcome_at"] = _time_text(observed_at)
+                self.connection.execute(
+                    """
+                    UPDATE environment_events
+                    SET payload_json = ?, external_create_owner = NULL,
+                        external_create_lease_until = NULL
+                    WHERE event_id = ?
+                    """,
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        event_id,
+                    ),
+                )
+                self.connection.commit()
+                return self._require(event_id)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
                 raise
 
     def bind_external_record(
@@ -265,6 +348,8 @@ class SQLiteEnvironmentEventRepository:
                         )
                 payload["feishu_record_id"] = record_id
                 payload["feishu_binding_status"] = "BOUND"
+                payload["feishu_create_state"] = ExternalCreateOutcome.SUCCEEDED
+                payload.pop("feishu_create_last_error", None)
                 if record.closed_at is not None:
                     payload.setdefault("feishu_recovered_at", record.closed_at.isoformat())
                     payload.setdefault("feishu_recovery_pending", True)
@@ -275,6 +360,131 @@ class SQLiteEnvironmentEventRepository:
                         external_create_lease_until = NULL
                     WHERE event_id = ?
                     """,
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        event_id,
+                    ),
+                )
+                self.connection.commit()
+                return self._require(event_id)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
+    def get_external_effect(
+        self, event_id: str, effect_key: str,
+    ) -> Mapping[str, Any] | None:
+        """Return one durable external-effect marker for an event."""
+        record = self.get(event_id)
+        if record is None:
+            raise KeyError(f"unknown environment event: {event_id}")
+        effects = record.payload.get("feishu_external_effects", {})
+        if not isinstance(effects, Mapping):
+            return None
+        marker = effects.get(effect_key)
+        return dict(marker) if isinstance(marker, Mapping) else None
+
+    def mark_external_effect_pending(
+        self,
+        event_id: str,
+        *,
+        effect_key: str,
+        action_type: str,
+        requested_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EnvironmentEventRecord:
+        """Record that a deterministic external effect is being attempted."""
+        values: dict[str, Any] = {
+            "action_type": action_type,
+            "status": "PENDING",
+            "requested_at": _time_text(requested_at),
+        }
+        if metadata:
+            values.update(dict(metadata))
+        return self._patch_external_effect(
+            event_id,
+            effect_key=effect_key,
+            values=values,
+        )
+
+    def mark_external_effect_succeeded(
+        self,
+        event_id: str,
+        *,
+        effect_key: str,
+        completed_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EnvironmentEventRecord:
+        """Persist proof that the external effect completed successfully."""
+        values: dict[str, Any] = {
+            "status": "SUCCEEDED",
+            "completed_at": _time_text(completed_at),
+            "error": None,
+        }
+        if metadata:
+            values.update(dict(metadata))
+        return self._patch_external_effect(
+            event_id,
+            effect_key=effect_key,
+            values=values,
+        )
+
+    def mark_external_effect_failed(
+        self,
+        event_id: str,
+        *,
+        effect_key: str,
+        failed_at: datetime,
+        error: str,
+        status: str = "FAILED",
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EnvironmentEventRecord:
+        """Persist a failed attempt without replacing a prior success."""
+        values: dict[str, Any] = {
+            "status": status,
+            "failed_at": _time_text(failed_at),
+            "error": str(error),
+        }
+        if metadata:
+            values.update(dict(metadata))
+        return self._patch_external_effect(
+            event_id,
+            effect_key=effect_key,
+            values=values,
+        )
+
+    def _patch_external_effect(
+        self,
+        event_id: str,
+        *,
+        effect_key: str,
+        values: Mapping[str, Any],
+    ) -> EnvironmentEventRecord:
+        if not effect_key.strip():
+            raise ValueError("effect_key cannot be empty")
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                effects = payload.get("feishu_external_effects", {})
+                effects = dict(effects) if isinstance(effects, Mapping) else {}
+                existing = effects.get(effect_key)
+                if isinstance(existing, Mapping) and existing.get("status") == "SUCCEEDED":
+                    self.connection.commit()
+                    return record
+                marker = dict(existing) if isinstance(existing, Mapping) else {}
+                marker.update(values)
+                effects[effect_key] = marker
+                payload["feishu_external_effects"] = effects
+                self.connection.execute(
+                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
                     (
                         json.dumps(
                             payload,

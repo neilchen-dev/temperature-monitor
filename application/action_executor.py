@@ -65,6 +65,7 @@ class ActionExecutor:
         active_device_ids: Iterable[str] | str | None = None,
         recorder: ActionRunRecorder | None = None,
         standards_ready_provider: Callable[[], bool] | None = None,
+        action_enabled_provider: Callable[[AlarmAction | ApplicationAction], bool] | None = None,
     ) -> None:
         self.mode = AutomationMode(mode)
         self.active_device_ids = normalize_device_ids(active_device_ids)
@@ -78,6 +79,7 @@ class ActionExecutor:
         }
         self.recorder = recorder
         self.standards_ready_provider = standards_ready_provider
+        self.action_enabled_provider = action_enabled_provider
 
     def standards_ready(self) -> bool:
         """Return the current production-standard gate, failing closed."""
@@ -109,9 +111,24 @@ class ActionExecutor:
         action_context = dict(context or {})
         executions: list[ActionExecution] = []
         for action in actions:
+            per_action_context = dict(action_context)
+            task_id = getattr(action, "task_id", None)
+            if task_id is not None:
+                per_action_context["automation_task_id"] = task_id
+            event_id = getattr(action, "alarm_id", None)
+            if event_id is not None:
+                per_action_context["event_id"] = event_id
+            dedupe_key = getattr(action, "dedupe_key", None)
+            if dedupe_key is not None:
+                per_action_context["dedupe_key"] = dedupe_key
+            payload = getattr(action, "payload", None)
+            if isinstance(payload, Mapping) and payload.get("external_effect_key"):
+                per_action_context["external_effect_key"] = payload[
+                    "external_effect_key"
+                ]
             execution = self._execute_one(
                 action,
-                context=action_context,
+                context=per_action_context,
                 created_at=created_at,
             )
             executions.append(execution)
@@ -211,6 +228,24 @@ class ActionExecutor:
                 context=context,
                 created_at=created_at,
             )
+
+        if self.action_enabled_provider is not None:
+            try:
+                enabled = bool(self.action_enabled_provider(action))
+            except Exception:  # noqa: BLE001 - a broken feature gate fails closed
+                enabled = False
+            if not enabled:
+                return ActionExecution(
+                    action=action,
+                    mode=self.mode,
+                    status=ActionExecutionStatus.SKIPPED,
+                    error=(
+                        f"action {action.action_type.value} is disabled by its "
+                        "runtime feature gate"
+                    ),
+                    context=context,
+                    created_at=created_at,
+                )
 
         context_handler = self.context_handlers.get(action.action_type)
         handler = self.handlers.get(action.action_type)

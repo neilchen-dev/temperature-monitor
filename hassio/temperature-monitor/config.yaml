@@ -37,6 +37,15 @@ options:
   feishu_operation_interval_table_id: tblZ9JHVhDCSqfhp
   feishu_inspection_table_id: tblwkQNdeEan8LKf
   feishu_write_enabled: false
+  feishu_alarm_notify_enabled: false
+  feishu_recovery_notify_enabled: false
+  feishu_alarm_chat_id: ""
+  feishu_notify_receive_id_type: open_id
+  feishu_event_table_url: ""
+  feishu_notify_max_retries: 5
+  feishu_notify_backoff_seconds: 30
+  feishu_notify_max_backoff_seconds: 600
+  feishu_notify_attempt_timeout_seconds: 5
   shadow_worker_id: ""
   shadow_scheduler_poll_seconds: 1
   shadow_operation_sync_seconds: 30
@@ -97,6 +106,15 @@ schema:
   feishu_operation_interval_table_id: str
   feishu_inspection_table_id: str
   feishu_write_enabled: bool
+  feishu_alarm_notify_enabled: bool
+  feishu_recovery_notify_enabled: bool
+  feishu_alarm_chat_id: str
+  feishu_notify_receive_id_type: list(open_id|user_id|union_id|email|chat_id)
+  feishu_event_table_url: str
+  feishu_notify_max_retries: int(1,20)
+  feishu_notify_backoff_seconds: int(1,3600)
+  feishu_notify_max_backoff_seconds: int(1,86400)
+  feishu_notify_attempt_timeout_seconds: int(1,60)
   shadow_worker_id: str
   shadow_scheduler_poll_seconds: int(1,60)
   shadow_operation_sync_seconds: int(5,86400)

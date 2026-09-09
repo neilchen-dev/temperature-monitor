@@ -584,6 +584,14 @@ class ShadowRuntime:
                 now=self.now_provider(),
             )
 
+    def handle_notification_task(self, task: Any) -> None:
+        """Run one independently retryable Feishu IM notification task."""
+        with self._execution_lock:
+            self.monitor_service.execute_notification_task(
+                task=task,
+                now=self.now_provider(),
+            )
+
     def handle_feishu_projection(self, task: Any) -> None:
         """Retry a deferred Feishu projection for one device.
 

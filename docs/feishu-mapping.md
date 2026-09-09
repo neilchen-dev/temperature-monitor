@@ -292,7 +292,7 @@
 | 14 | `wkf1GcvyxQZY3KN7` | TH-04作业登记、快照与超限判定同步 | 登记有效且监测点=TH-04 | 同上，固定 TH-04 | 作业状态同步 | 启用 |
 | 15 | `wkftYXjlmcwlJsyd` | TH-03作业登记、快照与超限判定同步 | 登记有效且监测点=TH-03 | 同上，固定 TH-03 | 作业状态同步 | 启用 |
 | 16 | `wkfwU9mfJnBWKi84` | 温湿度恢复正常后完整重置警报计时 | 主表状态变化 | 发现非超限且处于计时/已发警报后先等待 1 分钟复核；满足条件则清报警状态、清计时起点并给未恢复事件写恢复时间 | 超限/恢复 | 启用 |
-| 17 | `wkfLFxXFsm3hJhjo` | 温湿度连续超限5分钟后稳健复核并发起警报 | 主表状态变化 | 超限且允许控制、责任人存在、未触发时置计时；Delay 5 分钟后重新读主表复核，仍超限则创建事件、置已发警报并通知 | 超限/恢复 | 启用 |
+| 17 | `wkfLFxXFsm3hJhjo` | 温湿度连续超限5分钟后稳健复核并发起警报 | 主表状态变化 | 历史 legacy owner；Python 通知链不依赖它。任一设备切换 Python Active 前，该设备对应 owner 必须保持 disabled 或排除 | 超限/恢复 | Active Canary 前置约束：disabled |
 
 ### 5.2 规则细节
 
@@ -563,7 +563,7 @@ Python 的 expected 由 `StandardResolver + monitor_engine + AlarmStateMachine` 
 以下能力即使业务规则已经冻结，在真实标准表、只读观察接线和 Shadow 证据完成前，也不建议切换为 Python Active：
 
 1. **不直接把 `设备温湿度记录` 当标准版本库**。独立 `环境标准表` 已建立，但模板记录仍禁用；正式标准必须经过来源确认和 StandardSyncService 校验。
-2. **不关闭 17 条飞书工作流**。先 Shadow；#16/#17 按冻结的 5/1 分钟规则比对，#3 仍保持停用。
+2. **旧 workflow #17 不得与 Python Active 并行**。对进入 `ACTIVE_DEVICE_IDS` 的设备，先确认 #17 legacy owner 已保持 disabled 或排除；Python 通知链不调用 #17，也不修改线上 workflow。其他未纳入 Active 的设备继续 Shadow，#3 仍保持停用。
 3. **不把人工闭环表单全部迁走**。闭环反馈、原因、措施、产品影响仍适合先保留在飞书；Python 只做规范化读取和 Shadow。
 4. **不先迁移提醒消息的用户体验**。点检提醒、6 小时提醒、24 小时提醒、资料完整性提醒可以继续由飞书发出，Python 先记录 expected action。
 5. **不自动替代点检异常建事件工作流**。当前 Python 点检写入已支持快照，但 `异常/报警编号` 的数字类型与 ENV 编号、区域责任人和历史重复事件仍需业务治理。

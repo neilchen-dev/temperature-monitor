@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlencode
 
 import config
@@ -183,11 +184,213 @@ def _request_bitable_json(
     return {"code": -3, "msg": f"飞书{operation}失败"}
 
 
-def _require_success(result: dict[str, Any], operation: str) -> dict[str, Any]:
-    if int(result.get("code", -1)) != 0:
-        raise RuntimeError(
+class FeishuAPIError(RuntimeError):
+    """A Feishu response that did not confirm a successful operation."""
+
+    def __init__(self, result: Mapping[str, Any], operation: str) -> None:
+        self.operation = operation
+        self.code = int(result.get("code", -1))
+        self.http_status = result.get("http_status")
+        self.result = dict(result)
+        super().__init__(
             f"飞书{operation}失败: code={result.get('code')}, msg={result.get('msg')}"
         )
+
+    @property
+    def outcome_unknown(self) -> bool:
+        """Whether the server may have committed the request."""
+        return (
+            (
+                self.http_status is not None
+                and (
+                    int(self.http_status) == 429
+                    or int(self.http_status) >= 500
+                )
+            )
+            or self.code in _TRANSIENT_BITABLE_CODES
+            or self.code < 0
+        )
+
+
+class FeishuIMError(RuntimeError):
+    """A Feishu IM send that did not produce an auditable message id."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        retryable: bool,
+        outcome_unknown: bool = False,
+        http_status: int | None = None,
+        result: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.error_code = error_code
+        self.retryable = retryable
+        self.outcome_unknown = outcome_unknown
+        self.http_status = http_status
+        self.result = dict(result or {})
+        super().__init__(message)
+
+
+class FeishuIMClient:
+    """Minimal tenant-token client for the official Feishu IM API.
+
+    The scheduler owns retry cadence.  A notification task therefore invokes
+    this client with ``max_attempts=1`` so a single task attempt does one
+    bounded network request and can be retried with the same UUID later.
+    """
+
+    _ALLOWED_RECEIVE_ID_TYPES = {"open_id", "user_id", "union_id", "email", "chat_id"}
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "https://open.feishu.cn",
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def send_text(
+        self,
+        receive_id: str,
+        receive_id_type: str,
+        text: str,
+        *,
+        idempotency_key: str | None = None,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> Mapping[str, Any]:
+        normalized_id = str(receive_id).strip()
+        normalized_type = str(receive_id_type).strip().lower()
+        if not normalized_id:
+            raise FeishuIMError(
+                "Feishu IM recipient is empty",
+                error_code="invalid_recipient",
+                retryable=False,
+                outcome_unknown=False,
+            )
+        if normalized_type not in self._ALLOWED_RECEIVE_ID_TYPES:
+            raise FeishuIMError(
+                f"unsupported Feishu receive_id_type: {normalized_type}",
+                error_code="invalid_receive_id_type",
+                retryable=False,
+                outcome_unknown=False,
+            )
+        if not str(text).strip():
+            raise FeishuIMError(
+                "Feishu IM message text is empty",
+                error_code="invalid_message",
+                retryable=False,
+                outcome_unknown=False,
+            )
+        try:
+            token = get_token(attempts=max_attempts, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - classify token transport/config errors
+            message = str(exc)
+            lowered = message.lower()
+            retryable = any(
+                marker in lowered
+                for marker in ("timeout", "timed out", "connection", "tempor")
+            )
+            raise FeishuIMError(
+                f"Feishu tenant token unavailable: {message}",
+                error_code="token_unavailable",
+                retryable=retryable,
+                outcome_unknown=False,
+            ) from exc
+
+        url = (
+            f"{self.base_url}/open-apis/im/v1/messages?"
+            f"{urlencode({'receive_id_type': normalized_type})}"
+        )
+        body = {
+            "receive_id": normalized_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": str(text)}, ensure_ascii=False),
+            "uuid": normalize_client_token(idempotency_key),
+        }
+        try:
+            response = request_with_retry(
+                "POST",
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json_data=body,
+                # Do not hide scheduler backoff behind this API helper.
+                attempts=max_attempts,
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - transport outcome is ambiguous
+            raise FeishuIMError(
+                f"Feishu IM transport failed: {exc}",
+                error_code="network_error",
+                retryable=True,
+                outcome_unknown=True,
+            ) from exc
+
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise FeishuIMError(
+                "Feishu IM returned non-JSON content",
+                error_code="invalid_response",
+                retryable=False,
+                outcome_unknown=True,
+                http_status=response.status_code,
+            ) from exc
+        if not isinstance(result, Mapping):
+            raise FeishuIMError(
+                "Feishu IM response is not an object",
+                error_code="invalid_response",
+                retryable=False,
+                outcome_unknown=True,
+                http_status=response.status_code,
+            )
+
+        code = int(result.get("code", -1))
+        if response.status_code != 200 or code != 0:
+            status = int(response.status_code)
+            retryable = status == 429 or status >= 500 or code in _TRANSIENT_BITABLE_CODES
+            if code == 99991663:
+                clear_token()
+                retryable = True
+            if status in {400, 401, 403, 404} and code not in _TRANSIENT_BITABLE_CODES:
+                retryable = False
+            error_code = (
+                "rate_limited" if status == 429 or code in _TRANSIENT_BITABLE_CODES
+                else "permission_denied" if status == 403
+                else "unauthorized" if status == 401
+                else "invalid_request" if 400 <= status < 500
+                else "feishu_http_error"
+            )
+            raise FeishuIMError(
+                f"Feishu IM send failed: HTTP={status}, code={code}, "
+                f"msg={result.get('msg')}",
+                error_code=error_code,
+                retryable=retryable,
+                outcome_unknown=retryable or status >= 500,
+                http_status=status,
+                result=result,
+            )
+
+        data = result.get("data")
+        message_id = data.get("message_id") if isinstance(data, Mapping) else None
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise FeishuIMError(
+                "Feishu IM success response is missing message_id",
+                error_code="message_id_missing",
+                retryable=False,
+                outcome_unknown=True,
+                http_status=response.status_code,
+                result=result,
+            )
+        return result
+
+def _require_success(result: dict[str, Any], operation: str) -> dict[str, Any]:
+    if int(result.get("code", -1)) != 0:
+        raise FeishuAPIError(result, operation)
     return result
 
 

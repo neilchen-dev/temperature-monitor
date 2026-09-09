@@ -80,6 +80,15 @@ def _load_hassio_options() -> None:
         "feishu_projection_backoff_seconds": "FEISHU_PROJECTION_BACKOFF_SECONDS",
         "feishu_projection_inline_suppress_seconds": "FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS",
         "feishu_projection_attempt_timeout_seconds": "FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS",
+        "feishu_alarm_notify_enabled": "FEISHU_ALARM_NOTIFY_ENABLED",
+        "feishu_recovery_notify_enabled": "FEISHU_RECOVERY_NOTIFY_ENABLED",
+        "feishu_alarm_chat_id": "FEISHU_ALARM_CHAT_ID",
+        "feishu_notify_receive_id_type": "FEISHU_NOTIFY_RECEIVE_ID_TYPE",
+        "feishu_event_table_url": "FEISHU_EVENT_TABLE_URL",
+        "feishu_notify_max_retries": "FEISHU_NOTIFY_MAX_RETRIES",
+        "feishu_notify_backoff_seconds": "FEISHU_NOTIFY_BACKOFF_SECONDS",
+        "feishu_notify_max_backoff_seconds": "FEISHU_NOTIFY_MAX_BACKOFF_SECONDS",
+        "feishu_notify_attempt_timeout_seconds": "FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -399,6 +408,27 @@ FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = max(
 # 调度下一次尝试。普通 /temperature 内联路径不受影响（仍用完整重试）。
 FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS = max(
     1.0, _get_float("FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS", 5.0)
+)
+# Python-owned Feishu IM notifications are independently gated from event-table
+# writes.  Both defaults are deliberately off, including recovery messages.
+FEISHU_ALARM_NOTIFY_ENABLED = _get_bool("FEISHU_ALARM_NOTIFY_ENABLED", False)
+FEISHU_RECOVERY_NOTIFY_ENABLED = _get_bool("FEISHU_RECOVERY_NOTIFY_ENABLED", False)
+FEISHU_ALARM_CHAT_ID = os.getenv("FEISHU_ALARM_CHAT_ID", "").strip()
+FEISHU_NOTIFY_RECEIVE_ID_TYPE = (
+    os.getenv("FEISHU_NOTIFY_RECEIVE_ID_TYPE", "open_id").strip().lower()
+    or "open_id"
+)
+FEISHU_EVENT_TABLE_URL = os.getenv("FEISHU_EVENT_TABLE_URL", "").strip()
+FEISHU_NOTIFY_MAX_RETRIES = max(1, _get_int("FEISHU_NOTIFY_MAX_RETRIES", 5))
+FEISHU_NOTIFY_BACKOFF_SECONDS = max(
+    1.0, _get_float("FEISHU_NOTIFY_BACKOFF_SECONDS", 30.0)
+)
+FEISHU_NOTIFY_MAX_BACKOFF_SECONDS = max(
+    FEISHU_NOTIFY_BACKOFF_SECONDS,
+    _get_float("FEISHU_NOTIFY_MAX_BACKOFF_SECONDS", 600.0),
+)
+FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS = max(
+    1.0, _get_float("FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS", 5.0)
 )
 # Active alarm event writes are armed before the external call.  If the call
 # fails, the durable reconciliation task retries with exponential backoff;

@@ -33,6 +33,8 @@ from integrations.feishu_writers import (
     FeishuInspectionRecordWriter,
     FeishuOperationRecordWriter,
 )
+from integrations.feishu_notifications import FeishuNotificationWriter
+from services.feishu import FeishuIMClient
 from repositories import (
     SQLiteAlarmStateRepository,
     SQLiteAutomationRunRepository,
@@ -88,6 +90,7 @@ class RuntimeComponents:
     operation_writer: FeishuOperationRecordWriter
     event_writer: FeishuEnvironmentEventWriter
     inspection_writer: FeishuInspectionRecordWriter
+    notification_writer: FeishuNotificationWriter
 
     def start(self) -> None:
         self.runtime.start()
@@ -117,6 +120,16 @@ def _active_write_allowed(mode: str) -> bool:
         and config.FEISHU_WRITE_ENABLED
         and config.ACTIVE_CUTOVER_ACK == config.ACTIVE_CUTOVER_ACK_EXPECTED
     )
+
+
+def _active_action_enabled(action: Any) -> bool:
+    """Apply the independent message switch after the common Active gate."""
+    action_type = str(getattr(getattr(action, "action_type", None), "value", ""))
+    if action_type == AlarmActionType.NOTIFY_ALARM.value:
+        return bool(config.FEISHU_ALARM_NOTIFY_ENABLED)
+    if action_type == AlarmActionType.NOTIFY_RECOVERY.value:
+        return bool(config.FEISHU_RECOVERY_NOTIFY_ENABLED)
+    return True
 
 
 def active_block_reason() -> str | None:
@@ -347,6 +360,15 @@ def build_runtime(
         device_table_id=device_table_id,
         source=source,
     )
+    notification_writer = FeishuNotificationWriter(
+        sender=FeishuIMClient(),
+        source=source,
+        event_table_id=event_table_id,
+        device_table_id=device_table_id,
+        event_repository=event_repository,
+        event_table_url=config.FEISHU_EVENT_TABLE_URL,
+        attempt_timeout=config.FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS,
+    )
     observation_source = FeishuBitableObservationSource(
         source=source,
         device_table_id=device_table_id,
@@ -400,8 +422,11 @@ def build_runtime(
             AlarmActionType.UPDATE_ALARM_EVENT: event_writer.handle_alarm_action,
             AlarmActionType.START_RECOVERY: event_writer.handle_alarm_action,
             AlarmActionType.MARK_ALARM_RECOVERED: event_writer.handle_alarm_action,
+            AlarmActionType.NOTIFY_ALARM: notification_writer.handle_notification_action,
+            AlarmActionType.NOTIFY_RECOVERY: notification_writer.handle_notification_action,
         },
         recorder=run_repository,
+        action_enabled_provider=_active_action_enabled,
         standards_ready_provider=lambda: standard_repository.standards_ready(
             expected_device_ids=devices.keys()
         ),
@@ -423,7 +448,7 @@ def build_runtime(
         standard_resolver=SQLiteStandardResolver(standard_repository),
         alarm_state_repository=SQLiteAlarmStateRepository(runtime_connection),
         alarm_state_machine=AlarmStateMachine(),
-        action_mapper=ApplicationActionMapper(),
+        action_mapper=ApplicationActionMapper(emit_notifications=True),
         action_executor=action_executor,
         now_provider=now_provider,
         task_repository=task_repository,
@@ -463,6 +488,8 @@ def build_runtime(
             "VERIFY_ALARM": lambda task: runtime_holder["runtime"].handle_verify_alarm(task),
             "VERIFY_RECOVERY": lambda task: runtime_holder["runtime"].handle_verify_recovery(task),
             "RECONCILE_ALARM_EVENT": lambda task: runtime_holder["runtime"].handle_reconcile_alarm_event(task),
+            "NOTIFY_ALARM": lambda task: runtime_holder["runtime"].handle_notification_task(task),
+            "NOTIFY_RECOVERY": lambda task: runtime_holder["runtime"].handle_notification_task(task),
             "SHADOW_COMPARE": lambda task: runtime_holder["runtime"].handle_shadow_compare(task),
             "SYNC_STANDARD": lambda task: runtime_holder["runtime"].handle_standard_sync(task),
             "SYNC_OPERATIONS": lambda task: runtime_holder["runtime"].handle_operation_sync(task),
@@ -515,6 +542,7 @@ def build_runtime(
         operation_writer=operation_writer,
         event_writer=event_writer,
         inspection_writer=inspection_writer,
+        notification_writer=notification_writer,
     )
 
 
