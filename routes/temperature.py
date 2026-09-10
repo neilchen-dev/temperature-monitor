@@ -287,3 +287,93 @@ def temperature():
 @temperature_bp.get("/health")
 def health():
     return jsonify({"status": "ok", "sqlite": db.get_stats()}), 200
+
+
+@temperature_bp.post("/temperature/heartbeat")
+def temperature_heartbeat():
+    """Accept HA liveness without creating a historical measurement.
+
+    The optional values are used as the current runtime value, but the
+    presence table keeps them separate from ``device_samples`` so an
+    unchanged sensor does not look like a fresh measurement.
+    """
+    auth_error = _temperature_auth_error()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "error": "请求体必须是 JSON 对象"}), 400
+
+    device = str(data.get("device", "")).strip().upper()
+    if not device:
+        return jsonify({"status": "error", "error": "缺少 device"}), 400
+    availability = data.get("availability", data.get("status"))
+    if availability is None:
+        return jsonify({
+            "status": "error",
+            "error": "缺少 availability",
+            "device": device,
+        }), 400
+    final_status = devices.normalize_status(availability)
+    if final_status is None:
+        return jsonify({
+            "status": "error",
+            "error": "availability 必须是 online 或 unavailable",
+            "device": device,
+        }), 400
+    offline = final_status == devices.STATUS_OFFLINE
+
+    temperature_value: float | None = None
+    humidity_value: float | None = None
+    if not offline:
+        try:
+            if "temperature" in data and data.get("temperature") not in (None, ""):
+                temperature_value = normalize_temperature(data.get("temperature"))
+            if "humidity" in data and data.get("humidity") not in (None, ""):
+                humidity_value = normalize_humidity(data.get("humidity"))
+        except ValueError as exc:
+            return jsonify({"status": "error", "error": str(exc), "device": device}), 400
+
+    devices.note_heartbeat_request(device)
+    bitable_device = config.DEVICE_NAME_MAP.get(device, device)
+    outcome = devices.persist_heartbeat(
+        device=bitable_device,
+        source=devices.SOURCE_HOME_ASSISTANT,
+        availability=final_status,
+        temperature=temperature_value,
+        humidity=humidity_value,
+    )
+    if outcome.sample is None:
+        logger.error(
+            "heartbeat rejected | device=%s | reason=%s",
+            device,
+            outcome.reason,
+        )
+        return jsonify({
+            "status": "error",
+            "error": outcome.reason or "heartbeat persistence failed",
+            "device": device,
+        }), 503
+
+    # Heartbeats have no Feishu projection.  They are runtime observations,
+    # so existing alarm/prewarning timers continue to advance on stable data.
+    devices.dispatch_sample(outcome.sample)
+    logger.info(
+        "heartbeat_received | device=%s | status=%s | heartbeat_time_ms=%s",
+        bitable_device,
+        final_status,
+        outcome.heartbeat_time_ms,
+    )
+    return jsonify({
+        "status": "success",
+        "device": device,
+        "record_type": "HEARTBEAT",
+        "availability": final_status,
+        "heartbeat_time_ms": outcome.heartbeat_time_ms,
+        "measurement_time": (
+            outcome.sample.measurement_time.isoformat()
+            if outcome.sample.measurement_time is not None
+            else None
+        ),
+    }), 200

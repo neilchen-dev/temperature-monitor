@@ -1791,6 +1791,18 @@ def _sample_dict(sample: MonitorSample) -> dict[str, Any]:
         "humidity": sample.humidity,
         "online_status": sample.online_status,
         "data_quality": _enum_value(quality) if quality is not None else None,
+        "record_type": sample.record_type,
+        "measurement_time": (
+            sample.measurement_time.isoformat()
+            if sample.measurement_time is not None
+            else None
+        ),
+        "heartbeat_time": (
+            sample.heartbeat_time.isoformat()
+            if sample.heartbeat_time is not None
+            else None
+        ),
+        "availability": sample.availability,
     }
 
 

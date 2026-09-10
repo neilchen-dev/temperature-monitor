@@ -181,7 +181,8 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "latest_monitor_samples": (
         "device_id", "sample_time", "temperature", "humidity",
-        "online_status", "data_quality",
+        "online_status", "data_quality", "record_type", "measurement_time",
+        "heartbeat_time", "availability",
     ),
     "operation_observations_current": (
         "device_id", "area_id", "action", "operation_type", "work_order",

@@ -90,6 +90,22 @@ CREATE TABLE IF NOT EXISTS device_samples (
 CREATE INDEX IF NOT EXISTS idx_device_samples_device_time
     ON device_samples(device, sample_time_ms);
 
+-- Durable liveness state, separate from measurement history.  Heartbeats
+-- refresh this table without fabricating device_samples rows.
+CREATE TABLE IF NOT EXISTS device_presence (
+    device TEXT NOT NULL,
+    source TEXT NOT NULL,
+    last_measurement_at_ms INTEGER,
+    last_heartbeat_at_ms INTEGER,
+    availability TEXT NOT NULL DEFAULT 'unknown',
+    temperature REAL,
+    humidity REAL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (device, source)
+);
+CREATE INDEX IF NOT EXISTS idx_device_presence_device
+    ON device_presence(device, source);
+
 CREATE TABLE IF NOT EXISTS device_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
@@ -162,6 +178,49 @@ def _apply_column_migrations(connection: sqlite3.Connection) -> None:
                 table, column, config.SQLITE_DB_PATH,
             )
 
+
+def _backfill_device_presence(connection: sqlite3.Connection) -> None:
+    """Seed derived presence state from the latest pre-migration sample.
+
+    The migration is additive and idempotent.  Reusing the old timestamp as
+    the initial heartbeat is conservative: an old row remains stale rather
+    than becoming fresh merely because the table was created.
+    """
+    connection.execute(
+        """
+        INSERT INTO device_presence (
+            device, source, last_measurement_at_ms, last_heartbeat_at_ms,
+            availability, temperature, humidity, updated_at
+        )
+        SELECT
+            sample.device,
+            sample.source,
+            sample.sample_time_ms,
+            sample.sample_time_ms,
+            CASE
+                WHEN lower(sample.status) IN ('offline', '离线')
+                THEN 'offline'
+                ELSE 'online'
+            END,
+            sample.temperature,
+            sample.humidity,
+            sample.created_at
+        FROM device_samples AS sample
+        WHERE NOT EXISTS (
+            SELECT 1 FROM device_presence AS existing
+            WHERE existing.device = sample.device
+              AND existing.source = sample.source
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM device_samples AS newer
+            WHERE newer.device = sample.device
+              AND newer.source = sample.source
+              AND newer.sample_time_ms > sample.sample_time_ms
+        )
+        """
+    )
+    connection.commit()
+
 # Keep the existing name because every mirror helper already uses it. The
 # shared lock closes the gap between HTTP/projection writes and Runtime writes
 # without introducing a lock around external calls.
@@ -189,6 +248,7 @@ def _get_connection() -> sqlite3.Connection | None:
             connection.executescript(_SCHEMA)
             connection.commit()
             _apply_column_migrations(connection)
+            _backfill_device_presence(connection)
             _connection = connection
             logger.info(
                 "SQLite 本地镜像已启用 | path=%s", config.SQLITE_DB_PATH
@@ -545,6 +605,7 @@ def save_device_sample(
     temperature: Any,
     humidity: Any,
     status: str,
+    heartbeat_at_ms: int | None = None,
 ) -> bool:
     """Insert one unified sample; (device, source, ts) makes retries idempotent.
 
@@ -573,6 +634,28 @@ def save_device_sample(
                     _now_text(),
                 ),
             )
+            _upsert_device_presence_locked(
+                connection,
+                device=device,
+                source=source,
+                measurement_at_ms=(
+                    int(sample_time_ms)
+                    if str(status).strip().lower() not in {"offline", "离线"}
+                    else None
+                ),
+                heartbeat_at_ms=(
+                    int(heartbeat_at_ms)
+                    if heartbeat_at_ms is not None
+                    else int(sample_time_ms)
+                ),
+                availability=(
+                    "offline"
+                    if str(status).strip().lower() in {"offline", "离线"}
+                    else "online"
+                ),
+                temperature=temperature,
+                humidity=humidity,
+            )
             connection.commit()
         return True
     except sqlite3.Error:
@@ -580,6 +663,139 @@ def save_device_sample(
         _write_failures += 1
         logger.exception("SQLite 写入统一设备样本失败 | device=%s", device)
         return False
+
+
+def _upsert_device_presence_locked(
+    connection: sqlite3.Connection,
+    *,
+    device: str,
+    source: str,
+    measurement_at_ms: int | None,
+    heartbeat_at_ms: int,
+    availability: str,
+    temperature: Any,
+    humidity: Any,
+) -> None:
+    """Update one presence row; caller owns ``_lock`` and the transaction."""
+    connection.execute(
+        """
+        INSERT INTO device_presence (
+            device, source, last_measurement_at_ms, last_heartbeat_at_ms,
+            availability, temperature, humidity, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(device, source) DO UPDATE SET
+            last_measurement_at_ms = COALESCE(
+                excluded.last_measurement_at_ms,
+                device_presence.last_measurement_at_ms
+            ),
+            last_heartbeat_at_ms = excluded.last_heartbeat_at_ms,
+            availability = excluded.availability,
+            temperature = COALESCE(excluded.temperature, device_presence.temperature),
+            humidity = COALESCE(excluded.humidity, device_presence.humidity),
+            updated_at = excluded.updated_at
+        """,
+        (
+            device,
+            source,
+            measurement_at_ms,
+            heartbeat_at_ms,
+            availability,
+            temperature if isinstance(temperature, (int, float)) else None,
+            humidity if isinstance(humidity, (int, float)) else None,
+            _now_text(),
+        ),
+    )
+
+
+def save_device_heartbeat(
+    *,
+    device: str,
+    source: str,
+    heartbeat_at_ms: int,
+    availability: str,
+    temperature: Any = None,
+    humidity: Any = None,
+) -> dict[str, Any] | None:
+    """Persist liveness without adding a row to ``device_samples``."""
+    connection = _get_connection()
+    if connection is None:
+        return None
+
+    try:
+        with _lock:
+            _upsert_device_presence_locked(
+                connection,
+                device=device,
+                source=source,
+                measurement_at_ms=None,
+                heartbeat_at_ms=int(heartbeat_at_ms),
+                availability=availability,
+                temperature=temperature,
+                humidity=humidity,
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT * FROM device_presence WHERE device = ? AND source = ?",
+                (device, source),
+            ).fetchone()
+        return dict(row) if row is not None else None
+    except sqlite3.Error:
+        global _write_failures
+        _write_failures += 1
+        logger.exception("SQLite 写入设备 heartbeat 失败 | device=%s", device)
+        return None
+
+
+def fetch_latest_device_presence() -> list[dict[str, Any]]:
+    """Return the current presence row for each (device, source)."""
+    connection = _get_connection()
+    if connection is None:
+        return []
+    try:
+        with _lock:
+            rows = connection.execute(
+                """
+                SELECT device, source, last_measurement_at_ms,
+                       last_heartbeat_at_ms, availability, temperature,
+                       humidity, updated_at
+                FROM device_presence
+                ORDER BY device, source
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        logger.exception("SQLite 查询设备 presence 失败")
+        return []
+
+
+def fetch_device_presence(
+    device: str, source: str | None = None
+) -> dict[str, Any] | None:
+    """Read one device/source presence row for delayed runtime checks."""
+    connection = _get_connection()
+    if connection is None:
+        return None
+    query = (
+        "SELECT device, source, last_measurement_at_ms,"
+        " last_heartbeat_at_ms, availability, temperature, humidity, updated_at"
+        " FROM device_presence WHERE device = ?"
+    )
+    params: list[Any] = [device]
+    if source is not None:
+        query += " AND source = ?"
+        params.append(source)
+    query += " ORDER BY last_heartbeat_at_ms DESC LIMIT 1"
+    try:
+        with _lock:
+            row = connection.execute(query, params).fetchone()
+        return dict(row) if row is not None else None
+    except sqlite3.Error:
+        logger.exception(
+            "SQLite 查询设备 presence 失败 | device=%s | source=%s",
+            device,
+            source,
+        )
+        return None
 
 
 def fetch_previous_device_sample(

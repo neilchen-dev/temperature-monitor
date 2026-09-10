@@ -26,7 +26,7 @@ from application.shadow import (
     expected_state_from,
 )
 from application.standard_sync import StandardSyncService
-from domain.models import DeviceContext, MonitorSample
+from domain.models import DataQualityStatus, DeviceContext, MonitorSample
 from integrations.feishu_operation import FeishuOperationAdapter
 from repositories.automation_runs import purge_automation_runs
 from repositories.automation_tasks import (
@@ -783,9 +783,10 @@ class ShadowRuntime:
             sample = self.latest_sample_repository.get(task.entity_id)
             if sample is None:
                 raise RuntimeError(f"no latest sample for verification device {task.entity_id}")
+            evaluated_sample = self._fresh_sample_or_offline(sample)
             result = self.monitor_service.handle_sample(
                 device=self.devices[task.entity_id],
-                sample=sample,
+                sample=evaluated_sample,
                 now=self.now_provider(),
                 scheduler_task_id=task.task_id,
             )
@@ -807,7 +808,42 @@ class ShadowRuntime:
                 humidity_status=result.monitor_result.humidity_status.value,
                 operation_type=result.operation_state.operation_type,
             )
-            self._schedule_shadow_compare(expected, sample_time=sample.sample_time)
+            self._schedule_shadow_compare(
+                expected, sample_time=evaluated_sample.sample_time
+            )
+
+    def _fresh_sample_or_offline(self, sample: MonitorSample) -> MonitorSample:
+        """Do not advance a verification timer from an expired observation."""
+        now = self.now_provider()
+        availability = str(
+            sample.availability or sample.online_status or ""
+        ).strip().lower()
+        heartbeat_time = sample.heartbeat_time or sample.sample_time
+        age_seconds = (now - heartbeat_time).total_seconds()
+        if (
+            availability in {"offline", "unavailable", "unknown", "离线"}
+            or age_seconds > config.DEVICE_MODEL_STALE_SECONDS
+        ):
+            logger.warning(
+                "verification sample is not fresh; keeping runtime state unknown | "
+                "device=%s | record_type=%s | age_seconds=%.1f | availability=%s",
+                sample.device_id,
+                sample.record_type,
+                age_seconds,
+                availability or "missing",
+            )
+            return replace(
+                sample,
+                sample_time=now,
+                temperature=None,
+                humidity=None,
+                online_status="offline",
+                data_quality=DataQualityStatus.OFFLINE,
+                record_type="HEARTBEAT",
+                heartbeat_time=now,
+                availability="offline",
+            )
+        return sample
 
     def _schedule_shadow_compare(
         self,

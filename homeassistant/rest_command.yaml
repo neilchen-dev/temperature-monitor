@@ -15,6 +15,22 @@ rest_command:
         "humidity": "{{ humidity }}"
       }
 
+  python_heartbeat:
+    # Heartbeats refresh device presence only; they do not append a
+    # device_samples measurement row or advance measurement_time.
+    url: "http://<temperature-monitor-host>:5000/temperature/heartbeat"
+    method: POST
+    headers:
+      Content-Type: application/json
+      # X-Temperature-Key: !secret temperature_monitor_temperature_api_key
+    payload: >
+      {
+        "device": "{{ device }}",
+        "availability": "{{ availability }}",
+        "temperature": "{{ temperature }}",
+        "humidity": "{{ humidity }}"
+      }
+
   temperature_history_sample:
     url: "http://<temperature-monitor-host>:5000/history/sample"
     method: POST

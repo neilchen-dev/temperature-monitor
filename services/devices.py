@@ -2,14 +2,17 @@
 
 Design notes:
 
-- The SQLite ``device_samples`` table — not an in-memory registry — is the
-  source of truth. Reads (/api/*) query the database directly, so state
-  survives restarts and there is no process-local cache to invalidate.
+- The SQLite ``device_samples`` table remains the source of truth for real
+  measurements.  ``device_presence`` is the separate durable source of truth
+  for availability and heartbeat freshness. Reads (/api/*) query the database
+  directly, so state survives restarts and there is no process-local cache to
+  invalidate.
 - ``record_sample`` is an isolation boundary like ``services.db``: any
   failure (invalid input, sqlite error) is logged and swallowed so callers
   on the request path (HA webhook) are never affected.
-- Sources currently: ``home_assistant`` (webhook hook), ``modbus`` (poller).
-  OPC UA and friends only need to call ``record_sample`` with a new source.
+- Sources currently: ``home_assistant`` (measurement webhook and heartbeat),
+  ``modbus`` (poller). OPC UA and friends only need to call ``record_sample``
+  with a new source.
 """
 
 from __future__ import annotations
@@ -45,7 +48,9 @@ _device_model_stats: dict[str, Any] = {
     "last_error": None,
     "last_error_time": None,
     "last_success_time": None,
+    "last_heartbeat_success_time": None,
     "last_temperature_request_time": None,
+    "last_heartbeat_request_time": None,
 }
 _device_model_stats_lock = threading.Lock()
 
@@ -56,9 +61,21 @@ def note_temperature_request(device: str) -> None:
         _device_model_stats["last_temperature_request_time"] = time.time()
 
 
+def note_heartbeat_request(device: str) -> None:
+    """Record that the HA liveness endpoint received a heartbeat."""
+    del device  # reserved for future per-device request counters
+    with _device_model_stats_lock:
+        _device_model_stats["last_heartbeat_request_time"] = time.time()
+
+
 def _note_record_success() -> None:
     with _device_model_stats_lock:
         _device_model_stats["last_success_time"] = time.time()
+
+
+def _note_heartbeat_success() -> None:
+    with _device_model_stats_lock:
+        _device_model_stats["last_heartbeat_success_time"] = time.time()
 
 
 def _note_record_error(exc: BaseException) -> None:
@@ -77,7 +94,9 @@ def _reset_device_model_stats() -> None:
                 "last_error": None,
                 "last_error_time": None,
                 "last_success_time": None,
+                "last_heartbeat_success_time": None,
                 "last_temperature_request_time": None,
+                "last_heartbeat_request_time": None,
             }
         )
 
@@ -91,11 +110,10 @@ def _iso_local_timestamp(value: float | None) -> str | None:
 def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
     """Unified-device-model health snapshot for /api/system/status.
 
-    degraded = /temperature 仍在收到上报，但统一样本超过阈值没有成功落库。
-    覆盖两类断流：record_sample 自身异常（显式计数），以及 SQLite 镜像
-    静默写失败（通过 device_samples 最新落库时间间接判断）。同时按
-    SHADOW_DEVICE_IDS 检查逐台新鲜度，避免“某一台设备仍在上报”掩盖
-    另一台设备已经断流而 /api/system/status 仍显示健康。
+    Measurement freshness describes the last real value report.  Effective
+    freshness additionally accepts a recent heartbeat while the source is
+    available, so a stable sensor value does not become stale merely because
+    HA emitted no changed event.
     """
     current = time.time() if now is None else now
     with _device_model_stats_lock:
@@ -106,23 +124,101 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
         logger.exception("读取统一设备模型健康快照失败")
         last_persisted_ms = None
     stale_devices: list[str] = []
+    unavailable_devices: list[str] = []
     missing_devices: list[str] = []
+    device_states: list[dict[str, Any]] = []
     try:
-        latest_by_device: dict[str, int] = {}
-        for row in db.fetch_latest_device_states():
+        presence_rows = db.fetch_latest_device_presence()
+        # Fallback keeps diagnostics/tests compatible with a pre-migration
+        # mirror and is conservative: a legacy sample is also the baseline
+        # heartbeat, so it can only be fresh for the normal window.
+        if not presence_rows:
+            presence_rows = [
+                {
+                    "device": row.get("device"),
+                    "source": row.get("source"),
+                    "last_measurement_at_ms": row.get("sample_time_ms"),
+                    "last_heartbeat_at_ms": row.get("sample_time_ms"),
+                    # Old test/diagnostic rows may omit status; their
+                    # presence is inferred from the fact that a sample row
+                    # exists, preserving the pre-migration stale check.
+                    "availability": row.get("status") or "online",
+                    "temperature": row.get("temperature"),
+                    "humidity": row.get("humidity"),
+                    "updated_at": row.get("sample_time_iso"),
+                }
+                for row in db.fetch_latest_device_states()
+            ]
+
+        # Prefer HA presence when a device has both HA and Modbus sources;
+        # otherwise use the newest available source.  This prevents a stale
+        # HA entity from being masked by an unrelated source's poll.
+        selected: dict[str, dict[str, Any]] = {}
+        for row in presence_rows:
             device = str(row.get("device") or "").strip().upper()
-            sample_time_ms = row.get("sample_time_ms")
-            if not device or sample_time_ms is None:
+            if not device:
                 continue
-            latest_by_device[device] = max(
-                latest_by_device.get(device, 0), int(sample_time_ms)
-            )
+            candidate = dict(row)
+            candidate["device"] = device
+            current_row = selected.get(device)
+            if current_row is None:
+                selected[device] = candidate
+                continue
+            if str(candidate.get("source") or "").lower() == SOURCE_HOME_ASSISTANT:
+                selected[device] = candidate
+
         for device in config.SHADOW_DEVICE_IDS:
             normalized_device = str(device).strip().upper()
-            sample_time_ms = latest_by_device.get(normalized_device)
-            if sample_time_ms is None:
+            row = selected.get(normalized_device)
+            if row is None:
                 missing_devices.append(normalized_device)
-            elif current - sample_time_ms / 1000.0 > config.DEVICE_MODEL_STALE_SECONDS:
+                continue
+
+            availability = normalize_status(row.get("availability")) or "unknown"
+            measurement_ms = row.get("last_measurement_at_ms")
+            heartbeat_ms = row.get("last_heartbeat_at_ms")
+
+            def age_seconds(value: Any) -> float | None:
+                if value is None:
+                    return None
+                return round(max(0.0, current - int(value) / 1000.0), 3)
+
+            measurement_age = age_seconds(measurement_ms)
+            heartbeat_age = age_seconds(heartbeat_ms)
+            measurement_fresh = (
+                measurement_age is not None
+                and measurement_age <= config.DEVICE_MODEL_STALE_SECONDS
+            )
+            heartbeat_fresh = (
+                heartbeat_age is not None
+                and heartbeat_age <= config.DEVICE_MODEL_STALE_SECONDS
+            )
+            effective_fresh = (
+                availability == STATUS_ONLINE
+                and (measurement_fresh or heartbeat_fresh)
+            )
+            state = {
+                "device": normalized_device,
+                "source": row.get("source"),
+                "temperature": row.get("temperature"),
+                "humidity": row.get("humidity"),
+                "availability": availability,
+                "last_measurement_at": _iso_local_timestamp(
+                    int(measurement_ms) / 1000.0 if measurement_ms is not None else None
+                ),
+                "last_heartbeat_at": _iso_local_timestamp(
+                    int(heartbeat_ms) / 1000.0 if heartbeat_ms is not None else None
+                ),
+                "last_measurement_age_seconds": measurement_age,
+                "last_heartbeat_age_seconds": heartbeat_age,
+                "measurement_fresh": measurement_fresh,
+                "heartbeat_fresh": heartbeat_fresh,
+                "effective_fresh": effective_fresh,
+            }
+            device_states.append(state)
+            if availability == STATUS_OFFLINE:
+                unavailable_devices.append(normalized_device)
+            elif not effective_fresh:
                 stale_devices.append(normalized_device)
     except Exception:  # noqa: BLE001 - health endpoint must never raise
         logger.exception("读取逐台统一设备模型健康快照失败")
@@ -136,7 +232,11 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
             degraded_reasons.append(
                 "temperature reports active but no unified sample persisted"
             )
-        elif current - last_persisted_ms / 1000.0 > config.DEVICE_MODEL_STALE_SECONDS:
+        elif (
+            not device_states
+            and current - last_persisted_ms / 1000.0
+            > config.DEVICE_MODEL_STALE_SECONDS
+        ):
             degraded_reasons.append(
                 "temperature reports active but unified samples are stale"
             )
@@ -147,8 +247,13 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
         )
     if stale_devices:
         degraded_reasons.append(
-            "configured shadow devices have stale unified samples: "
+            "configured shadow devices have stale effective presence: "
             + ",".join(stale_devices)
+        )
+    if unavailable_devices:
+        degraded_reasons.append(
+            "configured shadow devices are unavailable: "
+            + ",".join(unavailable_devices)
         )
     return {
         "device_sample_error_count": stats.get("error_count", 0),
@@ -159,9 +264,14 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
         "last_successful_sample_time": _iso_local_timestamp(
             stats.get("last_success_time")
         ),
+        "last_successful_heartbeat_time": _iso_local_timestamp(
+            stats.get("last_heartbeat_success_time")
+        ),
         "last_persisted_sample_time_ms": last_persisted_ms,
         "stale_threshold_seconds": config.DEVICE_MODEL_STALE_SECONDS,
+        "device_states": sorted(device_states, key=lambda item: item["device"]),
         "stale_devices": stale_devices,
+        "unavailable_devices": unavailable_devices,
         "missing_devices": missing_devices,
         "degraded": bool(degraded_reasons),
         "degraded_reasons": degraded_reasons,
@@ -263,6 +373,134 @@ class SamplePersistOutcome:
         return self.persisted or self.duplicate
 
 
+@dataclass(frozen=True)
+class HeartbeatPersistOutcome:
+    """Presence update result; heartbeat rows never enter measurement history."""
+
+    sample: MonitorSample | None
+    heartbeat_time_ms: int | None
+    persisted: bool
+    reason: str | None
+
+
+def persist_heartbeat(
+    device: str,
+    source: str,
+    availability: str,
+    temperature: Any = None,
+    humidity: Any = None,
+) -> HeartbeatPersistOutcome:
+    """Persist source liveness and build a runtime heartbeat observation.
+
+    The server receipt time is used for freshness.  Optional values are the
+    source's current values for evaluation only; they do not advance the
+    measurement timestamp or create a historical measurement row.
+    """
+    try:
+        normalized_device = str(device or "").strip().upper()
+        normalized_source = str(source or "").strip().lower()
+        normalized_status = normalize_status(availability)
+        if not normalized_device:
+            return HeartbeatPersistOutcome(None, None, False, "empty_device")
+        if normalized_source not in KNOWN_SOURCES:
+            return HeartbeatPersistOutcome(None, None, False, "unknown_source")
+        if normalized_status is None:
+            return HeartbeatPersistOutcome(None, None, False, "unknown_status")
+
+        current_temperature = _coerce_number(temperature)
+        current_humidity = _coerce_number(humidity)
+        heartbeat_time_ms = int(time.time() * 1000)
+        presence = db.save_device_heartbeat(
+            device=normalized_device,
+            source=normalized_source,
+            heartbeat_at_ms=heartbeat_time_ms,
+            availability=normalized_status,
+            temperature=(
+                current_temperature if normalized_status == STATUS_ONLINE else None
+            ),
+            humidity=(
+                current_humidity if normalized_status == STATUS_ONLINE else None
+            ),
+        )
+        if presence is None:
+            return HeartbeatPersistOutcome(
+                None, heartbeat_time_ms, False, "persistence_unavailable"
+            )
+
+        # A heartbeat with no values still updates health immediately.  The
+        # runtime receives the last known value when available so a stable
+        # over-limit sample can continue its pending/alarm timer.
+        if normalized_status == STATUS_OFFLINE:
+            effective_temperature = None
+            effective_humidity = None
+        else:
+            effective_temperature = (
+                current_temperature
+                if current_temperature is not None
+                else presence.get("temperature")
+            )
+            effective_humidity = (
+                current_humidity
+                if current_humidity is not None
+                else presence.get("humidity")
+            )
+        measurement_ms = presence.get("last_measurement_at_ms")
+        heartbeat_time = datetime.fromtimestamp(
+            heartbeat_time_ms / 1000
+        ).astimezone()
+        measurement_time = (
+            datetime.fromtimestamp(int(measurement_ms) / 1000).astimezone()
+            if measurement_ms is not None
+            else None
+        )
+        sample = MonitorSample(
+            device_id=normalized_device,
+            sample_time=heartbeat_time,
+            temperature=effective_temperature,
+            humidity=effective_humidity,
+            online_status=normalized_status,
+            data_quality=(
+                DataQualityStatus.OFFLINE
+                if normalized_status == STATUS_OFFLINE
+                else None
+            ),
+            record_type="HEARTBEAT",
+            measurement_time=measurement_time,
+            heartbeat_time=heartbeat_time,
+            availability=normalized_status,
+        )
+        _note_heartbeat_success()
+        return HeartbeatPersistOutcome(sample, heartbeat_time_ms, True, None)
+    except Exception as exc:  # noqa: BLE001 - heartbeat is an isolation boundary
+        _note_record_error(exc)
+        logger.exception(
+            "统一设备 heartbeat 入库失败 | device=%s | source=%s",
+            device,
+            source,
+        )
+        return HeartbeatPersistOutcome(None, None, False, "exception")
+
+
+def record_heartbeat(
+    device: str,
+    source: str,
+    availability: str,
+    temperature: Any = None,
+    humidity: Any = None,
+) -> MonitorSample | None:
+    """Persist one heartbeat and dispatch it to Runtime/Shadow listeners."""
+    outcome = persist_heartbeat(
+        device=device,
+        source=source,
+        availability=availability,
+        temperature=temperature,
+        humidity=humidity,
+    )
+    if outcome.sample is not None:
+        dispatch_sample(outcome.sample)
+    return outcome.sample
+
+
 def record_sample(
     device: str,
     source: str,
@@ -314,15 +552,39 @@ def sample_from_row(
 ) -> MonitorSample:
     """Build the normalized MonitorSample for a persisted/previous row."""
     status = str(row.get("status") or STATUS_ONLINE)
+    sample_time = datetime.fromtimestamp(now_ms / 1000).astimezone()
+    presence = db.fetch_device_presence(device, row.get("source"))
+    measurement_ms = (
+        presence.get("last_measurement_at_ms")
+        if presence is not None
+        else now_ms
+    )
+    heartbeat_ms = (
+        presence.get("last_heartbeat_at_ms")
+        if presence is not None
+        else None
+    )
     return MonitorSample(
         device_id=device,
-        sample_time=datetime.fromtimestamp(now_ms / 1000).astimezone(),
+        sample_time=sample_time,
         temperature=row.get("temperature"),
         humidity=row.get("humidity"),
         online_status=status,
         data_quality=(
             DataQualityStatus.OFFLINE if status == STATUS_OFFLINE else None
         ),
+        record_type="MEASUREMENT",
+        measurement_time=(
+            datetime.fromtimestamp(int(measurement_ms) / 1000).astimezone()
+            if measurement_ms is not None
+            else None
+        ),
+        heartbeat_time=(
+            datetime.fromtimestamp(int(heartbeat_ms) / 1000).astimezone()
+            if heartbeat_ms is not None
+            else None
+        ),
+        availability=(presence.get("availability") if presence else status),
     )
 
 
@@ -433,6 +695,7 @@ def persist_sample(
                 temperature=current["temperature"],
                 humidity=current["humidity"],
                 status=normalized_status,
+                heartbeat_at_ms=int(time.time() * 1000),
             )
 
             transitions = evaluate_transitions(previous, current)
@@ -458,6 +721,10 @@ def persist_sample(
                 if normalized_status == STATUS_OFFLINE
                 else None
             ),
+            record_type="MEASUREMENT",
+            measurement_time=datetime.fromtimestamp(now_ms / 1000).astimezone(),
+            heartbeat_time=datetime.now().astimezone(),
+            availability=normalized_status,
         )
         if transitions:
             logger.info(

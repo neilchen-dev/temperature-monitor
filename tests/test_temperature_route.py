@@ -175,6 +175,37 @@ class TemperatureRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.get_json()["status"], "error")
 
+    def test_heartbeat_updates_presence_without_measurement_history(self) -> None:
+        with patch("routes.temperature.devices.dispatch_sample") as dispatch:
+            response = self.client.post(
+                "/temperature/heartbeat",
+                json={
+                    "device": "warehouse-temp",
+                    "availability": "online",
+                    "temperature": 24.6,
+                    "humidity": 52.0,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["record_type"], "HEARTBEAT")
+        dispatch.assert_called_once()
+        self.assertEqual(db.fetch_device_samples("DEV-01"), [])
+        presence = db.fetch_latest_device_presence()
+        self.assertEqual(len(presence), 1)
+        self.assertEqual(presence[0]["availability"], "online")
+
+    def test_unavailable_heartbeat_is_accepted_without_waiting_for_stale_window(self) -> None:
+        response = self.client.post(
+            "/temperature/heartbeat",
+            json={"device": "warehouse-temp", "availability": "unavailable"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["availability"], "offline")
+        presence = db.fetch_latest_device_presence()
+        self.assertEqual(presence[0]["availability"], "offline")
+
 
 if __name__ == "__main__":
     unittest.main()

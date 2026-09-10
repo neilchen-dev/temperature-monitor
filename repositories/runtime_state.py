@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS latest_monitor_samples (
     temperature REAL,
     humidity REAL,
     online_status TEXT,
-    data_quality TEXT
+    data_quality TEXT,
+    record_type TEXT NOT NULL DEFAULT 'MEASUREMENT',
+    measurement_time TEXT,
+    heartbeat_time TEXT,
+    availability TEXT
 );
 
 CREATE TABLE IF NOT EXISTS operation_observations_current (
@@ -406,6 +410,22 @@ class SQLiteLatestSampleRepository:
         self._lock = SQLITE_WRITE_LOCK
         with self._lock:
             self.connection.executescript(_SCHEMA)
+            columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(latest_monitor_samples)"
+                )
+            }
+            for column, definition in (
+                ("record_type", "TEXT NOT NULL DEFAULT 'MEASUREMENT'"),
+                ("measurement_time", "TEXT"),
+                ("heartbeat_time", "TEXT"),
+                ("availability", "TEXT"),
+            ):
+                if column not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE latest_monitor_samples ADD COLUMN {column} {definition}"
+                    )
             self.connection.commit()
 
     @retry_sqlite_write
@@ -417,14 +437,19 @@ class SQLiteLatestSampleRepository:
                 """
                 INSERT INTO latest_monitor_samples (
                     device_id, sample_time, temperature, humidity,
-                    online_status, data_quality
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    online_status, data_quality, record_type,
+                    measurement_time, heartbeat_time, availability
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     sample_time = excluded.sample_time,
                     temperature = excluded.temperature,
                     humidity = excluded.humidity,
                     online_status = excluded.online_status,
-                    data_quality = excluded.data_quality
+                    data_quality = excluded.data_quality,
+                    record_type = excluded.record_type,
+                    measurement_time = excluded.measurement_time,
+                    heartbeat_time = excluded.heartbeat_time,
+                    availability = excluded.availability
                 """,
                 (
                     sample.device_id,
@@ -433,6 +458,10 @@ class SQLiteLatestSampleRepository:
                     sample.humidity,
                     sample.online_status,
                     quality_value,
+                    sample.record_type or "MEASUREMENT",
+                    _time(sample.measurement_time),
+                    _time(sample.heartbeat_time),
+                    sample.availability or sample.online_status,
                 ),
             )
             self.connection.commit()
@@ -451,6 +480,18 @@ class SQLiteLatestSampleRepository:
             humidity=row["humidity"],
             online_status=row["online_status"],
             data_quality=(DataQualityStatus(quality) if quality else None),
+            record_type=row["record_type"] or "MEASUREMENT",
+            measurement_time=(
+                _parse(row["measurement_time"])
+                if row["measurement_time"]
+                else datetime.fromisoformat(row["sample_time"])
+            ),
+            heartbeat_time=(
+                _parse(row["heartbeat_time"])
+                if row["heartbeat_time"]
+                else None
+            ),
+            availability=row["availability"] or row["online_status"],
         )
 
 

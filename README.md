@@ -106,9 +106,11 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 常见数据流如下：
 
-1. Home Assistant 在温度、湿度或在线状态变化时调用 `/temperature`。
-2. 服务校验设备和数值，完成单位转换，并更新飞书实时记录。
-3. 同一份数据镜像到 SQLite，并更新统一设备状态与状态迁移事件。
+1. Home Assistant 在温度、湿度变化时调用 `/temperature`；每分钟以及
+   `available/unavailable` 状态变化时调用 `/temperature/heartbeat`。
+2. `/temperature` 校验设备和数值、完成单位转换并更新飞书实时记录；
+   heartbeat 只更新 presence 并驱动运行时观察。
+3. 测量数据镜像到 SQLite，并更新统一设备状态与状态迁移事件。
 4. 每个整十分钟，Home Assistant 调用 `/history/sample`；服务读取实时表，为配置的监测点生成历史快照。
 5. Modbus collector 按轮询周期读取设备，直接进入统一设备模型和本地查询链路。
 6. Shadow Runtime 读取飞书业务数据，经过领域判定后持久化预期状态、运行结果和比对差异；写入仍由独立开关保护。
@@ -117,6 +119,7 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 | --- | --- | --- |
 | `GET /health` | 服务与 SQLite 健康摘要 | 无 |
 | `POST /temperature` | 接收 Home Assistant 温湿度上报 | `TEMPERATURE_API_KEY` 可选 |
+| `POST /temperature/heartbeat` | 接收 Home Assistant 在线心跳，不新增测量历史 | `TEMPERATURE_API_KEY` 可选 |
 | `POST /history/sample` | 生成历史快照 | `X-History-Key` |
 | `GET /console` | 工业监控台 | 页面壳无；数据请求需 `X-History-Key` |
 | `GET /dashboard` | 本地分析看板 | `HISTORY_API_KEY` 登录 |
@@ -275,7 +278,10 @@ python tools/modbus_simulator.py --port 5020
 
 ### Home Assistant Container
 
-参考 [`homeassistant/rest_command.yaml`](homeassistant/rest_command.yaml) 和 [`homeassistant/automation_history_sample.yaml`](homeassistant/automation_history_sample.yaml)。实时上报和历史采样分别调用：
+参考 [`homeassistant/rest_command.yaml`](homeassistant/rest_command.yaml)、
+[`homeassistant/automation_th01.example.yaml`](homeassistant/automation_th01.example.yaml)、
+[`homeassistant/automation_th01_heartbeat.example.yaml`](homeassistant/automation_th01_heartbeat.example.yaml)
+和 [`docs/ha-freshness.md`](docs/ha-freshness.md)。实时测量、在线心跳和历史采样分别调用：
 
 ```yaml
 rest_command:
@@ -298,7 +304,23 @@ rest_command:
       Content-Type: application/json
       X-History-Key: !secret temperature_monitor_history_api_key
     payload: "{}"
+
+  temperature_monitor_heartbeat:
+    url: "http://<temperature-monitor-host>:5000/temperature/heartbeat"
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: >
+      {
+        "device": "{{ device }}",
+        "availability": "{{ availability }}",
+        "temperature": "{{ temperature }}",
+        "humidity": "{{ humidity }}"
+      }
 ```
+
+心跳只推进设备 presence 的 `last_heartbeat_at`，不会把不变的数值伪装成
+新的 `last_measurement_at`；详细 freshness 合同见上述文档。
 
 `<temperature-monitor-host>` 取决于容器网络：HA 使用 host 网络时通常为 `127.0.0.1`；普通 bridge 网络应填写 Docker 主机的局域网 IP；同一自定义网络中可以填写服务容器名。不要在 HA Container 中使用 `localhost` 代替 Docker 主机地址。
 

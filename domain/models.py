@@ -129,6 +129,13 @@ class MonitorSample:
     humidity: float | None
     online_status: str | None = None
     data_quality: DataQualityStatus | str | None = None
+    # ``sample_time`` is the observation/processing time.  For a heartbeat it
+    # is deliberately different from ``measurement_time`` so a stable value
+    # can keep the runtime alive without pretending a new measurement occurred.
+    record_type: str = "MEASUREMENT"
+    measurement_time: datetime | None = None
+    heartbeat_time: datetime | None = None
+    availability: str | None = None
 
 
 @dataclass(frozen=True)

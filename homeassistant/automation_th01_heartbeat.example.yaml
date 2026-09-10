@@ -1,0 +1,31 @@
+alias: TH-01 heartbeat
+description: "每分钟确认 TH-01 仍在线；数值不变时也维持 freshness"
+
+triggers:
+  - trigger: time_pattern
+    minutes: "/1"
+  - trigger: state
+    entity_id:
+      - sensor.th01_temperature
+      - sensor.th01_humidity
+    to:
+      - "unavailable"
+      - "unknown"
+
+conditions: []
+
+actions:
+  - action: rest_command.python_heartbeat
+    data:
+      device: TH-01
+      availability: >-
+        {% if has_value('sensor.th01_temperature') and
+              has_value('sensor.th01_humidity') %}online{% else %}unavailable{% endif %}
+      temperature: >-
+        {{ states('sensor.th01_temperature') if
+           has_value('sensor.th01_temperature') else '' }}
+      humidity: >-
+        {{ states('sensor.th01_humidity') if
+           has_value('sensor.th01_humidity') else '' }}
+
+mode: restart
