@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
+import sqlite3
 from typing import Callable, Mapping
 
 from domain.models import AutomationTask
 from repositories.automation_tasks import SQLiteAutomationTaskRepository
+from repositories.sqlite import is_sqlite_lock_error
+
+
+logger = logging.getLogger("temperature_monitor")
 
 
 TaskHandler = Callable[[AutomationTask], None]
@@ -114,6 +120,27 @@ class TaskScheduler:
         if not callable(wait):
             raise TypeError("stop_event must provide wait(timeout) -> bool")
         while True:
-            self.run_once()
+            try:
+                self.run_once()
+            except sqlite3.OperationalError as exc:
+                if is_sqlite_lock_error(exc):
+                    logger.warning(
+                        "Task scheduler iteration skipped after transient SQLite lock; "
+                        "continuing next poll | worker_id=%s | error=%s",
+                        self.worker_id,
+                        str(exc),
+                    )
+                else:
+                    logger.exception(
+                        "Task scheduler iteration failed; continuing next poll | "
+                        "worker_id=%s",
+                        self.worker_id,
+                    )
+            except Exception:  # noqa: BLE001 - one iteration must not kill worker
+                logger.exception(
+                    "Task scheduler iteration failed; continuing next poll | "
+                    "worker_id=%s",
+                    self.worker_id,
+                )
             if wait(self.poll_interval):
                 return

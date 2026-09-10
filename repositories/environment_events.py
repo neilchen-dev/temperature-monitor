@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import sqlite3
-import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+
+from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
 
 
 class EnvironmentEventStatus(str):
@@ -72,11 +73,12 @@ class SQLiteEnvironmentEventRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        self.connection.executescript(_SCHEMA)
-        with self.connection:
-            self.connection.execute("BEGIN IMMEDIATE")
-            self._apply_migrations()
+        self._lock = SQLITE_WRITE_LOCK
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                self._apply_migrations()
 
     def _apply_migrations(self) -> None:
         columns = {
@@ -89,6 +91,7 @@ class SQLiteEnvironmentEventRepository:
                     f"ALTER TABLE environment_events ADD COLUMN {column} TEXT"
                 )
 
+    @retry_sqlite_write
     def create_or_get_active(
         self,
         *,
@@ -157,6 +160,7 @@ class SQLiteEnvironmentEventRepository:
                 raise
             return self._require(event_id)
 
+    @retry_sqlite_write
     def close(
         self,
         event_id: str,
@@ -198,6 +202,7 @@ class SQLiteEnvironmentEventRepository:
         """
         return self.close(event_id, closed_at=recovered_at)
 
+    @retry_sqlite_write
     def patch_external_projection(self, event_id: str, **values: Any) -> EnvironmentEventRecord:
         """Merge projection metadata under a database write transaction."""
         with self._lock:
@@ -216,6 +221,7 @@ class SQLiteEnvironmentEventRepository:
                 self.connection.rollback()
                 raise
 
+    @retry_sqlite_write
     def reserve_external_post(self, event_id: str) -> bool:
         """Reserve a POST unless a previous result is still unsafe to replay.
 
@@ -260,6 +266,7 @@ class SQLiteEnvironmentEventRepository:
                 self.connection.rollback()
                 raise
 
+    @retry_sqlite_write
     def mark_external_create_outcome(
         self,
         event_id: str,
@@ -314,6 +321,7 @@ class SQLiteEnvironmentEventRepository:
                     self.connection.rollback()
                 raise
 
+    @retry_sqlite_write
     def bind_external_record(
         self,
         event_id: str,
@@ -459,6 +467,7 @@ class SQLiteEnvironmentEventRepository:
             values=values,
         )
 
+    @retry_sqlite_write
     def _patch_external_effect(
         self,
         event_id: str,
@@ -502,6 +511,7 @@ class SQLiteEnvironmentEventRepository:
                     self.connection.rollback()
                 raise
 
+    @retry_sqlite_write
     def mark_external_binding_pending(
         self,
         event_id: str,
@@ -604,6 +614,7 @@ class SQLiteEnvironmentEventRepository:
             )
         )
 
+    @retry_sqlite_write
     def claim_external_create(
         self,
         event_id: str,

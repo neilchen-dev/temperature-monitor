@@ -7,7 +7,6 @@ are deliberately separate from the legacy ``services.db`` mirror.
 from __future__ import annotations
 
 import sqlite3
-import threading
 from datetime import datetime
 
 from domain.models import (
@@ -20,6 +19,7 @@ from domain.models import (
     OperationStatus,
 )
 from domain.operation import OperationAction, OperationObservation
+from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
 
 
 _SCHEMA = """
@@ -95,9 +95,10 @@ class SQLiteAlarmStateRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        self.connection.executescript(_SCHEMA)
-        self.connection.commit()
+        self._lock = SQLITE_WRITE_LOCK
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            self.connection.commit()
 
     def get(self, device_id: str) -> AlarmState | None:
         row = self.connection.execute(
@@ -115,6 +116,7 @@ class SQLiteAlarmStateRepository:
             pending_task_id=row["pending_task_id"],
         )
 
+    @retry_sqlite_write
     def save(self, state: AlarmState) -> None:
         now = datetime.now().astimezone()
         with self._lock:
@@ -153,10 +155,12 @@ class SQLiteLatestSampleRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        self.connection.executescript(_SCHEMA)
-        self.connection.commit()
+        self._lock = SQLITE_WRITE_LOCK
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            self.connection.commit()
 
+    @retry_sqlite_write
     def save(self, sample: MonitorSample) -> None:
         quality = sample.data_quality
         quality_value = quality.value if hasattr(quality, "value") else quality
@@ -208,9 +212,10 @@ class SQLiteOperationRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        self.connection.executescript(_SCHEMA)
-        self.connection.commit()
+        self._lock = SQLITE_WRITE_LOCK
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            self.connection.commit()
 
     def get_current(self, device_id: str) -> OperationObservation | None:
         row = self.connection.execute(
@@ -230,6 +235,7 @@ class SQLiteOperationRepository:
             observed_at=datetime.fromisoformat(row["observed_at"]),
         )
 
+    @retry_sqlite_write
     def save_current(self, observation: OperationObservation) -> None:
         with self._lock:
             self.connection.execute(
@@ -304,6 +310,7 @@ class SQLiteOperationRepository:
             self._audit_no_commit(observation, accepted=True, reason="accepted_newer_source_record")
             self.connection.commit()
 
+    @retry_sqlite_write
     def record_stale(self, observation: OperationObservation) -> None:
         with self._lock:
             self._audit_no_commit(

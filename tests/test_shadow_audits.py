@@ -245,8 +245,20 @@ class ShadowAuditTests(unittest.TestCase):
                 stop_event.set()
 
         components.runtime.scheduler.run_once = flaky_run_once  # type: ignore[method-assign]
+
+        original_periodic = components.runtime._ensure_periodic_tasks
+        periodic_calls: list[int] = []
+
+        def flaky_periodic(*, now: datetime, immediate: bool = False) -> None:
+            periodic_calls.append(1)
+            if len(periodic_calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            original_periodic(now=now, immediate=immediate)
+
+        components.runtime._ensure_periodic_tasks = flaky_periodic  # type: ignore[method-assign]
         components.runtime._run_scheduler(stop_event)
         self.assertEqual(len(calls), 3)
+        self.assertEqual(len(periodic_calls), 3)
         components.stop()
 
     def test_purge_automation_history_bounds_growth(self) -> None:

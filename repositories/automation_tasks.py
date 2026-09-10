@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from domain.models import AutomationTask, AutomationTaskStatus
+from repositories.sqlite import (
+    SQLITE_WRITE_LOCK,
+    retry_sqlite_write,
+    run_sqlite_write_with_retry,
+)
 
 
 _SCHEMA = """
@@ -94,12 +98,16 @@ class SQLiteAutomationTaskRepository:
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
-        self._lock = threading.RLock()
+        # All Runtime repositories share the process-wide SQLite write lock.
+        # It protects only local transactions; task handlers perform external
+        # I/O outside repository methods.
+        self._lock = SQLITE_WRITE_LOCK
         self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(_SCHEMA)
-        with self.connection:
-            self.connection.execute("BEGIN IMMEDIATE")
-            self._apply_migrations()
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                self._apply_migrations()
 
     def _apply_migrations(self) -> None:
         columns = {
@@ -118,6 +126,7 @@ class SQLiteAutomationTaskRepository:
                     f"ALTER TABLE automation_tasks ADD COLUMN {column} {definition}"
                 )
 
+    @retry_sqlite_write
     def set_runtime_context(
         self,
         *,
@@ -432,6 +441,7 @@ class SQLiteAutomationTaskRepository:
         except (TypeError, ValueError):
             return False
 
+    @retry_sqlite_write
     def quarantine_legacy_external_tasks(
         self,
         *,
@@ -529,6 +539,7 @@ class SQLiteAutomationTaskRepository:
             return None, None
         return activation.mode, activation.active_epoch
 
+    @retry_sqlite_write
     def create_or_get(
         self,
         *,
@@ -603,6 +614,7 @@ class SQLiteAutomationTaskRepository:
                 raise RuntimeError("created task could not be read back")
             return self._from_row(row)
 
+    @retry_sqlite_write
     def create_or_get_unfinished(
         self,
         *,
@@ -814,6 +826,7 @@ class SQLiteAutomationTaskRepository:
         ).fetchone()
         return self._from_row(row) if row is not None else None
 
+    @retry_sqlite_write
     def claim_due(
         self,
         *,
@@ -908,6 +921,7 @@ class SQLiteAutomationTaskRepository:
             worker_id=worker_id,
         )
 
+    @retry_sqlite_write
     def reschedule_running(self, task: AutomationTask, *, due_at: datetime,
                            updated_at: datetime, payload: Mapping[str, Any]) -> None:
         """Keep the cycle's task id/key and attempts across a durable backoff."""
@@ -939,30 +953,33 @@ class SQLiteAutomationTaskRepository:
             worker_id=worker_id,
         )
 
+    @retry_sqlite_write
     def cancel(self, task_id: str, *, updated_at: datetime) -> AutomationTask:
-        task = self._require(task_id)
-        if task.status not in {
-            AutomationTaskStatus.PENDING,
-            AutomationTaskStatus.RUNNING,
-        }:
-            raise TaskStateError(f"cannot cancel task in state {task.status.value}")
-        self.connection.execute(
-            """
-            UPDATE automation_tasks
-            SET status = ?, updated_at = ?, finished_at = ?,
-                lease_until = NULL, worker_id = NULL
-            WHERE id = ?
-            """,
-            (
-                AutomationTaskStatus.CANCELLED.value,
-                _datetime_text(updated_at),
-                _datetime_text(updated_at),
-                task_id,
-            ),
-        )
-        self.connection.commit()
-        return self._require(task_id)
+        with self._lock:
+            task = self._require(task_id)
+            if task.status not in {
+                AutomationTaskStatus.PENDING,
+                AutomationTaskStatus.RUNNING,
+            }:
+                raise TaskStateError(f"cannot cancel task in state {task.status.value}")
+            self.connection.execute(
+                """
+                UPDATE automation_tasks
+                SET status = ?, updated_at = ?, finished_at = ?,
+                    lease_until = NULL, worker_id = NULL
+                WHERE id = ?
+                """,
+                (
+                    AutomationTaskStatus.CANCELLED.value,
+                    _datetime_text(updated_at),
+                    _datetime_text(updated_at),
+                    task_id,
+                ),
+            )
+            self.connection.commit()
+            return self._require(task_id)
 
+    @retry_sqlite_write
     def _finish(
         self,
         task_id: str,
@@ -972,32 +989,33 @@ class SQLiteAutomationTaskRepository:
         last_error: str | None,
         worker_id: str | None,
     ) -> AutomationTask:
-        task = self._require(task_id)
-        if task.status is not AutomationTaskStatus.RUNNING:
-            raise TaskStateError(f"cannot finish task in state {task.status.value}")
-        if worker_id is not None and task.worker_id != worker_id:
-            raise TaskStateError(
-                f"task is leased by worker {task.worker_id!r}, not {worker_id!r}"
+        with self._lock:
+            task = self._require(task_id)
+            if task.status is not AutomationTaskStatus.RUNNING:
+                raise TaskStateError(f"cannot finish task in state {task.status.value}")
+            if worker_id is not None and task.worker_id != worker_id:
+                raise TaskStateError(
+                    f"task is leased by worker {task.worker_id!r}, not {worker_id!r}"
+                )
+            if task.lease_until is not None and task.lease_until <= finished_at:
+                raise TaskStateError("task lease has expired")
+            self.connection.execute(
+                """
+                UPDATE automation_tasks
+                SET status = ?, updated_at = ?, finished_at = ?,
+                    lease_until = NULL, worker_id = NULL, last_error = ?
+                WHERE id = ?
+                """,
+                (
+                    status.value,
+                    _datetime_text(finished_at),
+                    _datetime_text(finished_at),
+                    last_error,
+                    task_id,
+                ),
             )
-        if task.lease_until is not None and task.lease_until <= finished_at:
-            raise TaskStateError("task lease has expired")
-        self.connection.execute(
-            """
-            UPDATE automation_tasks
-            SET status = ?, updated_at = ?, finished_at = ?,
-                lease_until = NULL, worker_id = NULL, last_error = ?
-            WHERE id = ?
-            """,
-            (
-                status.value,
-                _datetime_text(finished_at),
-                _datetime_text(finished_at),
-                last_error,
-                task_id,
-            ),
-        )
-        self.connection.commit()
-        return self._require(task_id)
+            self.connection.commit()
+            return self._require(task_id)
 
     def _require(self, task_id: str) -> AutomationTask:
         task = self.get(task_id)
@@ -1039,14 +1057,21 @@ def purge_finished_automation_tasks(
     SHADOW_COMPARE 每个采样建一条任务（dedupe=device+sample_time），不加
     清理会无限增长。只删 SUCCEEDED/FAILED/CANCELLED，运行中的不动。
     """
-    cursor = connection.execute(
-        """
-        DELETE FROM automation_tasks
-        WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
-          AND finished_at IS NOT NULL
-          AND finished_at < ?
-        """,
-        (_datetime_text(cutoff),),
+    def delete() -> int:
+        cursor = connection.execute(
+            """
+            DELETE FROM automation_tasks
+            WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+              AND finished_at IS NOT NULL
+              AND finished_at < ?
+            """,
+            (_datetime_text(cutoff),),
+        )
+        connection.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    return run_sqlite_write_with_retry(
+        connection,
+        "purge_finished_automation_tasks",
+        delete,
     )
-    connection.commit()
-    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0

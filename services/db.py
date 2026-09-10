@@ -26,20 +26,20 @@ Design notes / semantics:
   enabled exclusively from validated Feishu snapshots. The compatibility
   helpers remain for old database inspection and migration tests, but the API
   no longer exposes a write path to them.
-- Concurrency assumes a single process / single instance (Waitress threads
-  guarded by one lock). Multi-process or multi-container deployment would
-  need WAL-friendly coordination beyond the current scope.
+- Runtime and this legacy/projection mirror use separate connections to the
+  same file. Both paths therefore share the process-wide SQLite write lock;
+  the lock covers only short local DB sections and never Feishu network I/O.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
-import threading
 from datetime import datetime
 from typing import Any
 
 import config
+from repositories.sqlite import SQLITE_WRITE_LOCK, connect as connect_runtime_sqlite
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -162,7 +162,10 @@ def _apply_column_migrations(connection: sqlite3.Connection) -> None:
                 table, column, config.SQLITE_DB_PATH,
             )
 
-_lock = threading.RLock()
+# Keep the existing name because every mirror helper already uses it. The
+# shared lock closes the gap between HTTP/projection writes and Runtime writes
+# without introducing a lock around external calls.
+_lock = SQLITE_WRITE_LOCK
 _connection: sqlite3.Connection | None = None
 _init_failed = False
 _write_failures = 0
@@ -182,15 +185,7 @@ def _get_connection() -> sqlite3.Connection | None:
 
         try:
             config.SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(
-                str(config.SQLITE_DB_PATH),
-                check_same_thread=False,
-                timeout=5.0,
-            )
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute("PRAGMA synchronous=NORMAL")
+            connection = connect_runtime_sqlite(config.SQLITE_DB_PATH)
             connection.executescript(_SCHEMA)
             connection.commit()
             _apply_column_migrations(connection)

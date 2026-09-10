@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from domain.models import EnvironmentStandard, parse_control_type
 from domain.standard_resolver import StandardNotFoundError, select_standard
+from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
 
 
 _SCHEMA = """
@@ -131,60 +132,62 @@ class SQLiteStandardRepository:
         # error. A savepoint makes the additive schema migration atomic and
         # preserves any caller-owned outer transaction.
         savepoint = "standard_schema_migration"
-        self.connection.execute(f"SAVEPOINT {savepoint}")
-        try:
-            for statement in _SCHEMA.split(";"):
-                statement = statement.strip()
-                if statement:
-                    self.connection.execute(statement)
+        with SQLITE_WRITE_LOCK:
+            self.connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                for statement in _SCHEMA.split(";"):
+                    statement = statement.strip()
+                    if statement:
+                        self.connection.execute(statement)
 
-            columns = {
-                row["name"]
-                for row in self.connection.execute(
-                    "PRAGMA table_info(standard_versions)"
-                ).fetchall()
-            }
-            migrations = (
-                ("device_id", "TEXT"),
-                ("control_type", "TEXT"),
-                ("standard_source", "TEXT NOT NULL DEFAULT 'legacy'"),
-                ("validation_status", "TEXT NOT NULL DEFAULT 'UNVALIDATED'"),
-                ("validated_at", "TEXT"),
-            )
-            for column, definition in migrations:
-                if column not in columns:
-                    self.connection.execute(
-                        f"ALTER TABLE standard_versions ADD COLUMN {column} {definition}"
-                    )
-            sync_columns = {
-                row["name"]
-                for row in self.connection.execute(
-                    "PRAGMA table_info(standard_sync_runs)"
-                ).fetchall()
-            }
-            if "snapshot_id" not in sync_columns:
-                self.connection.execute(
-                    "ALTER TABLE standard_sync_runs ADD COLUMN snapshot_id TEXT"
+                columns = {
+                    row["name"]
+                    for row in self.connection.execute(
+                        "PRAGMA table_info(standard_versions)"
+                    ).fetchall()
+                }
+                migrations = (
+                    ("device_id", "TEXT"),
+                    ("control_type", "TEXT"),
+                    ("standard_source", "TEXT NOT NULL DEFAULT 'legacy'"),
+                    ("validation_status", "TEXT NOT NULL DEFAULT 'UNVALIDATED'"),
+                    ("validated_at", "TEXT"),
                 )
-            self.connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_standard_versions_device_context
-                ON standard_versions(device_id, area, operation_type, enabled, priority)
-                """
-            )
-            self.connection.execute(
-                """
-                INSERT OR IGNORE INTO standard_runtime_state (
-                    singleton_id, active_snapshot_id, last_known_good_snapshot_id
-                ) VALUES (1, NULL, NULL)
-                """
-            )
-            self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
-        except Exception:
-            self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
-            raise
+                for column, definition in migrations:
+                    if column not in columns:
+                        self.connection.execute(
+                            f"ALTER TABLE standard_versions ADD COLUMN {column} {definition}"
+                        )
+                sync_columns = {
+                    row["name"]
+                    for row in self.connection.execute(
+                        "PRAGMA table_info(standard_sync_runs)"
+                    ).fetchall()
+                }
+                if "snapshot_id" not in sync_columns:
+                    self.connection.execute(
+                        "ALTER TABLE standard_sync_runs ADD COLUMN snapshot_id TEXT"
+                    )
+                self.connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_standard_versions_device_context
+                    ON standard_versions(device_id, area, operation_type, enabled, priority)
+                    """
+                )
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO standard_runtime_state (
+                        singleton_id, active_snapshot_id, last_known_good_snapshot_id
+                    ) VALUES (1, NULL, NULL)
+                    """
+                )
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception:
+                self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
 
+    @retry_sqlite_write
     def apply_snapshot(
         self,
         standards: tuple[EnvironmentStandard, ...],
@@ -255,6 +258,7 @@ class SQLiteStandardRepository:
             raise
         return sync_id
 
+    @retry_sqlite_write
     def record_sync_failure(
         self,
         *,

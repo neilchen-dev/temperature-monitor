@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+from functools import wraps
+import logging
 import sqlite3
+import threading
+import time
 from pathlib import Path
+from typing import Any, Callable, TypeVar
+
+
+logger = logging.getLogger("temperature_monitor")
+
+# Runtime and the legacy/projection mirror intentionally use separate SQLite
+# connections.  SQLite serializes writers per database file, so a process-wide
+# re-entrant lock is the smallest coordination boundary for this deployment
+# model.  It covers only local SQLite work; callers must perform network I/O
+# before/after repository methods, never while this lock is held.
+SQLITE_WRITE_LOCK = threading.RLock()
+_SQLITE_LOCK_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2)
+_T = TypeVar("_T")
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -18,11 +35,87 @@ def connect(path: str | Path) -> sqlite3.Connection:
         timeout=5.0,
     )
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=5000")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    if path_value != ":memory:":
-        connection.execute("PRAGMA journal_mode=WAL")
+
+    def configure() -> None:
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        if path_value != ":memory:":
+            connection.execute("PRAGMA journal_mode=WAL")
+
+    run_sqlite_write_with_retry(connection, "connection.configure", configure)
     return connection
+
+
+def is_sqlite_lock_error(error: BaseException) -> bool:
+    """Return whether an SQLite error represents a bounded lock conflict."""
+    return isinstance(error, sqlite3.OperationalError) and "locked" in str(error).lower()
+
+
+def run_sqlite_write_with_retry(
+    connection: sqlite3.Connection,
+    operation: str,
+    callback: Callable[[], _T],
+) -> _T:
+    """Run one local write operation with short, bounded lock retries.
+
+    The callback must contain only SQLite work.  A failed operation-owned
+    transaction is rolled back before the next attempt so the connection never
+    carries a partial transaction forward.  Non-lock errors and an exhausted
+    retry budget are propagated to the caller for normal error handling.
+    """
+    max_attempts = len(_SQLITE_LOCK_RETRY_DELAYS) + 1
+    caller_transaction_open = connection.in_transaction
+    for attempt in range(max_attempts):
+        retry = False
+        with SQLITE_WRITE_LOCK:
+            try:
+                return callback()
+            except sqlite3.OperationalError as error:
+                if not is_sqlite_lock_error(error) or attempt >= max_attempts - 1:
+                    raise
+                retry = True
+                # A repository may be called inside a caller-owned savepoint
+                # (standard snapshot code supports this).  Only roll back a
+                # transaction opened by this operation; the callback owns the
+                # savepoint cleanup for an already-open outer transaction.
+                if not caller_transaction_open:
+                    try:
+                        if connection.in_transaction:
+                            connection.rollback()
+                    except sqlite3.Error:
+                        logger.warning(
+                            "SQLite lock retry rollback failed | operation=%s",
+                            operation,
+                            exc_info=True,
+                        )
+        if retry:
+            delay = _SQLITE_LOCK_RETRY_DELAYS[attempt]
+            logger.warning(
+                "SQLite write busy; retrying bounded operation | operation=%s "
+                "| attempt=%s/%s | backoff_seconds=%.3f",
+                operation,
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable SQLite retry state")
+
+
+def retry_sqlite_write(method: Callable[..., _T]) -> Callable[..., _T]:
+    """Retry a repository write method without holding a lock across callers."""
+    @wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> _T:
+        connection = getattr(self, "connection", None)
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("retry_sqlite_write requires self.connection")
+        return run_sqlite_write_with_retry(
+            connection,
+            f"{type(self).__name__}.{method.__name__}",
+            lambda: method(self, *args, **kwargs),
+        )
+
+    return wrapped
 
 
 # Runtime 所需的每张表的关键列。各仓储 __init__ 的 CREATE TABLE IF NOT

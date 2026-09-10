@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from application.action_executor import ActionExecution
 from application.shadow import AutomationDiff
+from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write, run_sqlite_write_with_retry
 
 
 _SCHEMA = """
@@ -67,41 +68,44 @@ class SQLiteAutomationRunRepository:
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
+        self._lock = SQLITE_WRITE_LOCK
         self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(_SCHEMA)
-        columns = {
-            row["name"]
-            for row in self.connection.execute(
-                "PRAGMA table_info(automation_runs)"
-            ).fetchall()
-        }
-        for column in (
-            "event_id",
-            "automation_task_id",
-            "dedupe_key",
-            "standard_id",
-            "standard_revision",
-            "standard_source",
-            "recipient",
-            "message_id",
-            "result",
-            "error_code",
-            "sent_at",
-        ):
-            if column not in columns:
-                self.connection.execute(
-                    f"ALTER TABLE automation_runs ADD COLUMN {column} TEXT"
-                )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_automation_runs_task "
-            "ON automation_runs(automation_task_id)"
-        )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_automation_runs_event "
-            "ON automation_runs(event_id)"
-        )
-        self.connection.commit()
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            columns = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(automation_runs)"
+                ).fetchall()
+            }
+            for column in (
+                "event_id",
+                "automation_task_id",
+                "dedupe_key",
+                "standard_id",
+                "standard_revision",
+                "standard_source",
+                "recipient",
+                "message_id",
+                "result",
+                "error_code",
+                "sent_at",
+            ):
+                if column not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE automation_runs ADD COLUMN {column} TEXT"
+                    )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_automation_runs_task "
+                "ON automation_runs(automation_task_id)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_automation_runs_event "
+                "ON automation_runs(event_id)"
+            )
+            self.connection.commit()
 
+    @retry_sqlite_write
     def record(self, execution: ActionExecution) -> str:
         context = dict(execution.context)
         created_at = execution.created_at or datetime.now().astimezone()
@@ -184,6 +188,7 @@ class SQLiteAutomationRunRepository:
         self.connection.commit()
         return run_id
 
+    @retry_sqlite_write
     def record_comparison(
         self,
         *,
@@ -229,9 +234,13 @@ class SQLiteAutomationRunRepository:
 
 def purge_automation_runs(connection: sqlite3.Connection, cutoff: datetime) -> int:
     """Delete comparison/action runs created before ``cutoff``; return count."""
-    cursor = connection.execute(
-        "DELETE FROM automation_runs WHERE created_at < ?",
-        (cutoff.isoformat(),),
-    )
-    connection.commit()
-    return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    def delete() -> int:
+        cursor = connection.execute(
+            "DELETE FROM automation_runs WHERE created_at < ?",
+            (cutoff.isoformat(),),
+        )
+        connection.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    return run_sqlite_write_with_retry(connection, "purge_automation_runs", delete)

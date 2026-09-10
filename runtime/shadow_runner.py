@@ -35,6 +35,7 @@ from repositories.automation_tasks import (
 )
 from repositories.environment_events import SQLiteEnvironmentEventRepository
 from repositories.runtime_state import SQLiteLatestSampleRepository
+from repositories.sqlite import is_sqlite_lock_error
 from scheduler.worker import TaskScheduler
 
 
@@ -303,26 +304,36 @@ class ShadowRuntime:
             # never be acquired in opposite orders by two threads.
             while not stop_event.is_set():
                 with self._execution_lock:
-                    self._maybe_purge()
-                    try:
-                        self._ensure_event_reconciliation_tasks(
+                    # Each phase is independently contained.  In particular,
+                    # maintenance is deliberately not a ``finally`` block:
+                    # a transient SQLite lock there must not escape the tick
+                    # and terminate the scheduler thread.
+                    self._run_scheduler_phase("purge", self._maybe_purge)
+                    self._run_scheduler_phase(
+                        "event_reconciliation",
+                        lambda: self._ensure_event_reconciliation_tasks(
                             now=self.now_provider()
-                        )
-                        self.scheduler.run_once()
-                    except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
-                        # run_once 已捕获 handler 异常；走到这里的是
-                        # claim/commit/lease 等基础层错误。以前会直接炸掉
-                        # 整个调度线程（VERIFY_ALARM/RECOVERY、SYNC、COMPARE
-                        # 全部停摆且无告警），现在记录后继续下一个 tick。
-                        logger.exception(
-                            "Shadow scheduler tick failed; continuing next poll"
-                        )
-                    finally:
-                        # Handlers return while their task is still RUNNING;
-                        # run_once marks it terminal before this point.  Only
-                        # then may the next recurring cycle be created.
-                        self._ensure_periodic_tasks(now=self.now_provider())
-                        self._ensure_projection_tasks(now=self.now_provider())
+                        ),
+                    )
+                    self._run_scheduler_phase(
+                        "task_dispatch", self.scheduler.run_once
+                    )
+                    # Handlers return while their task is still RUNNING;
+                    # run_once marks it terminal before the next recurring
+                    # cycle is created.  A failed maintenance phase is
+                    # retried on the next poll without killing the loop.
+                    self._run_scheduler_phase(
+                        "periodic_tasks",
+                        lambda: self._ensure_periodic_tasks(
+                            now=self.now_provider()
+                        ),
+                    )
+                    self._run_scheduler_phase(
+                        "projection_tasks",
+                        lambda: self._ensure_projection_tasks(
+                            now=self.now_provider()
+                        ),
+                    )
                 if stop_event.wait(self.scheduler.poll_interval):
                     return
         finally:
@@ -330,6 +341,30 @@ class ShadowRuntime:
                 if self._closed:
                     self._scheduler_thread = None
                     self._close_connection()
+
+    @staticmethod
+    def _run_scheduler_phase(phase: str, callback: Callable[[], Any]) -> None:
+        """Contain one scheduler phase so one transient fault cannot kill it."""
+        try:
+            callback()
+        except sqlite3.OperationalError as exc:
+            if is_sqlite_lock_error(exc):
+                logger.warning(
+                    "Shadow scheduler phase skipped after transient SQLite lock; "
+                    "continuing next poll | phase=%s | error=%s",
+                    phase,
+                    str(exc),
+                )
+            else:
+                logger.exception(
+                    "Shadow scheduler phase failed; continuing next poll | phase=%s",
+                    phase,
+                )
+        except Exception:  # noqa: BLE001 - one phase must not kill the loop
+            logger.exception(
+                "Shadow scheduler phase failed; continuing next poll | phase=%s",
+                phase,
+            )
 
     def _maybe_purge(self) -> None:
         """Bound automation_runs/automation_tasks growth (hourly, best-effort)."""
