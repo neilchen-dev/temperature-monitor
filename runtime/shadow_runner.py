@@ -509,6 +509,8 @@ class ShadowRuntime:
             ).as_dict()
             status["scheduler"] = {"running": scheduler_running}
             status["automation_tasks"] = task_health
+            status["prewarning_devices"] = self.monitor_service.prewarning_status()
+            status["prewarning_count"] = len(status["prewarning_devices"])
             status["active_canary_enabled"] = bool(
                 status["active_canary_enabled"]
                 and task_health["active_readiness"]

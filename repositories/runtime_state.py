@@ -6,8 +6,10 @@ are deliberately separate from the legacy ``services.db`` mirror.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
+from typing import Any, Mapping
 
 from domain.models import (
     AlarmLifecycleState,
@@ -31,8 +33,37 @@ CREATE TABLE IF NOT EXISTS alarm_states (
     recovery_started_at TEXT,
     active_alarm_id TEXT,
     pending_task_id TEXT,
+    prewarning_active INTEGER NOT NULL DEFAULT 0,
+    prewarning_started_at TEXT,
+    prewarning_episode_id TEXT,
+    prewarning_reasons_json TEXT NOT NULL DEFAULT '[]',
+    prewarning_details_json TEXT NOT NULL DEFAULT '{}',
+    prewarning_standard_id TEXT,
+    prewarning_standard_revision TEXT,
+    prewarning_notify_task_id TEXT,
+    prewarning_message_id TEXT,
+    prewarning_recovered_at TEXT,
+    prewarning_recovery_task_id TEXT,
+    prewarning_recovery_message_id TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS prewarning_external_effects (
+    effect_key TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    recipient TEXT,
+    receive_id_type TEXT,
+    message_id TEXT,
+    error TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_prewarning_effects_device
+    ON prewarning_external_effects(device_id, status);
 
 CREATE TABLE IF NOT EXISTS latest_monitor_samples (
     device_id TEXT PRIMARY KEY,
@@ -89,6 +120,14 @@ def _parse(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value is not None else None
 
 
+def _json_load(value: str | None, default: Any) -> Any:
+    try:
+        decoded = json.loads(value or "")
+    except (TypeError, ValueError):
+        return default
+    return decoded
+
+
 class SQLiteAlarmStateRepository:
     """Persist the alarm state machine state across process restarts."""
 
@@ -98,6 +137,28 @@ class SQLiteAlarmStateRepository:
         self._lock = SQLITE_WRITE_LOCK
         with self._lock:
             self.connection.executescript(_SCHEMA)
+            columns = {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(alarm_states)")
+            }
+            for column, definition in (
+                ("prewarning_active", "INTEGER NOT NULL DEFAULT 0"),
+                ("prewarning_started_at", "TEXT"),
+                ("prewarning_episode_id", "TEXT"),
+                ("prewarning_reasons_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("prewarning_details_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("prewarning_standard_id", "TEXT"),
+                ("prewarning_standard_revision", "TEXT"),
+                ("prewarning_notify_task_id", "TEXT"),
+                ("prewarning_message_id", "TEXT"),
+                ("prewarning_recovered_at", "TEXT"),
+                ("prewarning_recovery_task_id", "TEXT"),
+                ("prewarning_recovery_message_id", "TEXT"),
+            ):
+                if column not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE alarm_states ADD COLUMN {column} {definition}"
+                    )
             self.connection.commit()
 
     def get(self, device_id: str) -> AlarmState | None:
@@ -106,15 +167,7 @@ class SQLiteAlarmStateRepository:
         ).fetchone()
         if row is None:
             return None
-        return AlarmState(
-            device_id=row["device_id"],
-            state=AlarmLifecycleState(row["state"]),
-            violation_started_at=_parse(row["violation_started_at"]),
-            alarm_started_at=_parse(row["alarm_started_at"]),
-            recovery_started_at=_parse(row["recovery_started_at"]),
-            active_alarm_id=row["active_alarm_id"],
-            pending_task_id=row["pending_task_id"],
-        )
+        return self._from_row(row)
 
     @retry_sqlite_write
     def save(self, state: AlarmState) -> None:
@@ -124,8 +177,14 @@ class SQLiteAlarmStateRepository:
                 """
                 INSERT INTO alarm_states (
                     device_id, state, violation_started_at, alarm_started_at,
-                    recovery_started_at, active_alarm_id, pending_task_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    recovery_started_at, active_alarm_id, pending_task_id,
+                    prewarning_active, prewarning_started_at, prewarning_episode_id,
+                    prewarning_reasons_json, prewarning_details_json,
+                    prewarning_standard_id, prewarning_standard_revision,
+                    prewarning_notify_task_id, prewarning_message_id,
+                    prewarning_recovered_at, prewarning_recovery_task_id,
+                    prewarning_recovery_message_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     state = excluded.state,
                     violation_started_at = excluded.violation_started_at,
@@ -133,6 +192,18 @@ class SQLiteAlarmStateRepository:
                     recovery_started_at = excluded.recovery_started_at,
                     active_alarm_id = excluded.active_alarm_id,
                     pending_task_id = excluded.pending_task_id,
+                    prewarning_active = excluded.prewarning_active,
+                    prewarning_started_at = excluded.prewarning_started_at,
+                    prewarning_episode_id = excluded.prewarning_episode_id,
+                    prewarning_reasons_json = excluded.prewarning_reasons_json,
+                    prewarning_details_json = excluded.prewarning_details_json,
+                    prewarning_standard_id = excluded.prewarning_standard_id,
+                    prewarning_standard_revision = excluded.prewarning_standard_revision,
+                    prewarning_notify_task_id = excluded.prewarning_notify_task_id,
+                    prewarning_message_id = excluded.prewarning_message_id,
+                    prewarning_recovered_at = excluded.prewarning_recovered_at,
+                    prewarning_recovery_task_id = excluded.prewarning_recovery_task_id,
+                    prewarning_recovery_message_id = excluded.prewarning_recovery_message_id,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -143,7 +214,184 @@ class SQLiteAlarmStateRepository:
                     _time(state.recovery_started_at),
                     state.active_alarm_id,
                     state.pending_task_id,
+                    int(state.prewarning_active),
+                    _time(state.prewarning_started_at),
+                    state.prewarning_episode_id,
+                    json.dumps(list(state.prewarning_reasons), ensure_ascii=False),
+                    json.dumps(dict(state.prewarning_details), ensure_ascii=False, sort_keys=True),
+                    state.prewarning_standard_id,
+                    state.prewarning_standard_revision,
+                    state.prewarning_notify_task_id,
+                    state.prewarning_message_id,
+                    _time(state.prewarning_recovered_at),
+                    state.prewarning_recovery_task_id,
+                    state.prewarning_recovery_message_id,
                     now.isoformat(),
+                ),
+            )
+            self.connection.commit()
+
+    def list_prewarning_states(self) -> tuple[AlarmState, ...]:
+        """Return active/recent warning state without exposing recipients."""
+        rows = self.connection.execute(
+            "SELECT * FROM alarm_states WHERE prewarning_active = 1 "
+            "ORDER BY device_id"
+        ).fetchall()
+        return tuple(
+            state
+            for row in rows
+            if (state := self._from_row(row)) is not None
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> AlarmState:
+        reasons = _json_load(row["prewarning_reasons_json"], [])
+        details = _json_load(row["prewarning_details_json"], {})
+        return AlarmState(
+            device_id=row["device_id"],
+            state=AlarmLifecycleState(row["state"]),
+            violation_started_at=_parse(row["violation_started_at"]),
+            alarm_started_at=_parse(row["alarm_started_at"]),
+            recovery_started_at=_parse(row["recovery_started_at"]),
+            active_alarm_id=row["active_alarm_id"],
+            pending_task_id=row["pending_task_id"],
+            prewarning_active=bool(row["prewarning_active"]),
+            prewarning_started_at=_parse(row["prewarning_started_at"]),
+            prewarning_episode_id=row["prewarning_episode_id"],
+            prewarning_reasons=(
+                tuple(str(item) for item in reasons) if isinstance(reasons, list) else ()
+            ),
+            prewarning_details=details if isinstance(details, Mapping) else {},
+            prewarning_standard_id=row["prewarning_standard_id"],
+            prewarning_standard_revision=row["prewarning_standard_revision"],
+            prewarning_notify_task_id=row["prewarning_notify_task_id"],
+            prewarning_message_id=row["prewarning_message_id"],
+            prewarning_recovered_at=_parse(row["prewarning_recovered_at"]),
+            prewarning_recovery_task_id=row["prewarning_recovery_task_id"],
+            prewarning_recovery_message_id=row["prewarning_recovery_message_id"],
+        )
+
+
+class SQLitePrewarningEffectRepository:
+    """Durable idempotency markers for warning messages without formal events."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.connection.row_factory = sqlite3.Row
+        self._lock = SQLITE_WRITE_LOCK
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            self.connection.commit()
+
+    def get(self, effect_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM prewarning_external_effects WHERE effect_key = ?",
+            (effect_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["metadata"] = _json_load(result.pop("metadata_json", "{}"), {})
+        return result
+
+    @retry_sqlite_write
+    def mark_pending(
+        self,
+        *,
+        effect_key: str,
+        device_id: str,
+        action_type: str,
+        requested_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._upsert(
+            effect_key=effect_key,
+            device_id=device_id,
+            action_type=action_type,
+            status="PENDING",
+            requested_at=_time(requested_at),
+            metadata=metadata,
+        )
+
+    @retry_sqlite_write
+    def mark_succeeded(
+        self,
+        *,
+        effect_key: str,
+        completed_at: datetime,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        existing = self.get(effect_key)
+        if existing is None:
+            raise KeyError(f"unknown prewarning effect: {effect_key}")
+        self._upsert(
+            effect_key=effect_key,
+            device_id=str(existing["device_id"]),
+            action_type=str(existing["action_type"]),
+            status="SUCCEEDED",
+            completed_at=_time(completed_at),
+            metadata={**(existing.get("metadata") or {}), **dict(metadata or {})},
+        )
+
+    @retry_sqlite_write
+    def mark_failed(
+        self,
+        *,
+        effect_key: str,
+        failed_at: datetime,
+        error: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        existing = self.get(effect_key)
+        if existing is None:
+            raise KeyError(f"unknown prewarning effect: {effect_key}")
+        self._upsert(
+            effect_key=effect_key,
+            device_id=str(existing["device_id"]),
+            action_type=str(existing["action_type"]),
+            status="FAILED",
+            failed_at=_time(failed_at),
+            error=str(error),
+            metadata={**(existing.get("metadata") or {}), **dict(metadata or {})},
+        )
+
+    def _upsert(self, **values: Any) -> None:
+        metadata = values.pop("metadata", {}) or {}
+        values.setdefault("requested_at", None)
+        values.setdefault("completed_at", None)
+        values.setdefault("failed_at", None)
+        values.setdefault("recipient", None)
+        values.setdefault("receive_id_type", None)
+        values.setdefault("message_id", None)
+        values.setdefault("error", None)
+        values.setdefault("recipient", metadata.get("recipient"))
+        values.setdefault("receive_id_type", metadata.get("receive_id_type"))
+        values.setdefault("message_id", metadata.get("message_id"))
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO prewarning_external_effects (
+                    effect_key, device_id, action_type, status, requested_at,
+                    completed_at, failed_at, recipient, receive_id_type,
+                    message_id, error, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(effect_key) DO UPDATE SET
+                    status = excluded.status,
+                    requested_at = COALESCE(excluded.requested_at, prewarning_external_effects.requested_at),
+                    completed_at = COALESCE(excluded.completed_at, prewarning_external_effects.completed_at),
+                    failed_at = excluded.failed_at,
+                    recipient = COALESCE(excluded.recipient, prewarning_external_effects.recipient),
+                    receive_id_type = COALESCE(excluded.receive_id_type, prewarning_external_effects.receive_id_type),
+                    message_id = COALESCE(excluded.message_id, prewarning_external_effects.message_id),
+                    error = excluded.error,
+                    metadata_json = excluded.metadata_json
+                """,
+                (
+                    values["effect_key"], values["device_id"], values["action_type"],
+                    values["status"], values["requested_at"], values["completed_at"],
+                    values["failed_at"], values["recipient"], values["receive_id_type"],
+                    values["message_id"], values["error"],
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
                 ),
             )
             self.connection.commit()

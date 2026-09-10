@@ -117,6 +117,8 @@ class ApplicationActionMapper:
                 in {
                     AlarmActionType.NOTIFY_ALARM,
                     AlarmActionType.NOTIFY_RECOVERY,
+                    AlarmActionType.NOTIFY_PREWARNING,
+                    AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
                 }
                 else ApplicationActionKind.INTEGRATION
             )

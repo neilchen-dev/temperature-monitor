@@ -66,6 +66,7 @@ class FeishuNotificationWriter:
         event_table_id: str,
         device_table_id: str,
         event_repository: SQLiteEnvironmentEventRepository,
+        prewarning_effect_repository: Any | None = None,
         event_owner_field: str = "责任人",
         device_owner_field: str = "默认异常责任人",
         event_table_url: str = "",
@@ -76,6 +77,7 @@ class FeishuNotificationWriter:
         self.event_table_id = str(event_table_id).strip()
         self.device_table_id = str(device_table_id).strip()
         self.event_repository = event_repository
+        self.prewarning_effect_repository = prewarning_effect_repository
         self.event_owner_field = event_owner_field
         self.device_owner_field = device_owner_field
         self.event_table_url = event_table_url.strip()
@@ -94,12 +96,20 @@ class FeishuNotificationWriter:
         if action_type not in {
             AlarmActionType.NOTIFY_ALARM.value,
             AlarmActionType.NOTIFY_RECOVERY.value,
+            AlarmActionType.NOTIFY_PREWARNING.value,
+            AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
         }:
             raise FeishuNotificationError(
                 f"unsupported notification action: {action_type}",
                 error_code="invalid_action_type",
                 retryable=False,
             )
+        if action_type in {
+            AlarmActionType.NOTIFY_PREWARNING.value,
+            AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
+        }:
+            self._handle_prewarning_notification(action_type, action, context)
+            return
         event_id = str(
             getattr(action, "alarm_id", None)
             or context.get("event_id")
@@ -305,6 +315,182 @@ class FeishuNotificationWriter:
             effect_key,
         )
 
+    def _handle_prewarning_notification(
+        self,
+        action_type: str,
+        action: Any,
+        context: Mapping[str, Any],
+    ) -> None:
+        """Send a warning without creating a formal environment event.
+
+        The device default owner is the only allowed recipient.  In
+        particular, this path intentionally has no event-owner or chat-group
+        fallback because a prewarning has no formal event to own it.
+        """
+        device_id = _text(getattr(action, "device_id", None)) or _text(
+            context.get("device_id")
+        )
+        effect_key = _notification_effect_key(
+            action_type,
+            "",
+            context,
+            dedupe_key=_text(getattr(action, "dedupe_key", None))
+            or _text(context.get("dedupe_key")),
+        )
+        repository = self.prewarning_effect_repository
+        if repository is None:
+            self._set_context(context, result="FAILED", error_code="prewarning_marker_unavailable", retryable=False)
+            raise FeishuNotificationError(
+                "prewarning effect marker repository is not configured",
+                error_code="prewarning_marker_unavailable",
+                retryable=False,
+            )
+        marker = repository.get(effect_key)
+        if marker is not None and marker.get("status") == "SUCCEEDED":
+            self._set_context(
+                context,
+                result="ALREADY_SENT",
+                recipient=_text(marker.get("recipient")),
+                receive_id_type=_text(marker.get("receive_id_type")),
+                message_id=_text(marker.get("message_id")),
+                sent_at=_text(marker.get("completed_at")),
+                error_code=None,
+                retryable=False,
+            )
+            return
+        try:
+            recipient, receive_id_type = self._resolve_device_recipient(device_id)
+        except FeishuNotificationError as exc:
+            self._mark_prewarning_failed(effect_key, exc, context)
+            self._set_context(
+                context,
+                result="FAILED",
+                error_code=exc.error_code,
+                recipient=exc.recipient,
+                receive_id_type=receive_id_type if "receive_id_type" in locals() else None,
+                retryable=exc.retryable,
+                outcome_unknown=exc.outcome_unknown,
+            )
+            raise
+        requested_at = _attempt_time(context)
+        repository.mark_pending(
+            effect_key=effect_key,
+            device_id=device_id,
+            action_type=action_type,
+            requested_at=requested_at,
+            metadata={
+                "dedupe_key": effect_key,
+                "recipient": recipient,
+                "receive_id_type": receive_id_type,
+                "device_id": device_id,
+            },
+        )
+        message = self._message(
+            action_type=action_type,
+            event_id="",
+            record_id="",
+            context=context,
+        )
+        try:
+            response = self.sender.send_text(
+                recipient,
+                receive_id_type,
+                message,
+                idempotency_key=effect_key,
+                max_attempts=1,
+                timeout=self.attempt_timeout,
+            )
+            message_id = _message_id(response)
+            if not message_id:
+                raise FeishuNotificationError(
+                    "Feishu success response is missing message_id",
+                    error_code="message_id_missing",
+                    retryable=False,
+                    outcome_unknown=True,
+                    recipient=recipient,
+                )
+        except FeishuNotificationError as exc:
+            self._mark_prewarning_failed(effect_key, exc, context, recipient=recipient)
+            self._set_context(
+                context,
+                result="FAILED",
+                error_code=exc.error_code,
+                recipient=recipient,
+                receive_id_type=receive_id_type,
+                retryable=exc.retryable,
+                outcome_unknown=exc.outcome_unknown,
+            )
+            raise
+        except FeishuIMError as exc:
+            wrapped = FeishuNotificationError(
+                str(exc),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
+                outcome_unknown=exc.outcome_unknown,
+                recipient=recipient,
+            )
+            self._mark_prewarning_failed(effect_key, wrapped, context, recipient=recipient)
+            self._set_context(
+                context,
+                result="FAILED",
+                error_code=wrapped.error_code,
+                recipient=recipient,
+                receive_id_type=receive_id_type,
+                retryable=wrapped.retryable,
+                outcome_unknown=wrapped.outcome_unknown,
+            )
+            raise wrapped from exc
+        except Exception as exc:  # noqa: BLE001 - injected transport adapter
+            wrapped = FeishuNotificationError(
+                str(exc),
+                error_code="notification_error",
+                retryable=True,
+                outcome_unknown=True,
+                recipient=recipient,
+            )
+            self._mark_prewarning_failed(effect_key, wrapped, context, recipient=recipient)
+            self._set_context(
+                context,
+                result="FAILED",
+                error_code=wrapped.error_code,
+                recipient=recipient,
+                receive_id_type=receive_id_type,
+                retryable=True,
+                outcome_unknown=True,
+            )
+            raise wrapped from exc
+
+        sent_at = datetime.now(timezone.utc)
+        repository.mark_succeeded(
+            effect_key=effect_key,
+            completed_at=sent_at,
+            metadata={
+                "dedupe_key": effect_key,
+                "recipient": recipient,
+                "receive_id_type": receive_id_type,
+                "message_id": message_id,
+                "sent_at": sent_at.isoformat(),
+                "result": "SUCCEEDED",
+            },
+        )
+        self._set_context(
+            context,
+            result="SUCCEEDED",
+            error_code=None,
+            recipient=recipient,
+            receive_id_type=receive_id_type,
+            message_id=message_id,
+            sent_at=sent_at.isoformat(),
+            retryable=False,
+        )
+        logger.info(
+            "feishu_prewarning_sent | action_type=%s device_id=%s message_id=%s dedupe_key=%s",
+            action_type,
+            device_id,
+            message_id,
+            effect_key,
+        )
+
     def _resolve_recipient(self, *, event: Any, record_id: str) -> tuple[str, str]:
         event_record = self._read_record(self.event_table_id, record_id)
         candidate = (
@@ -338,6 +524,25 @@ class FeishuNotificationWriter:
             error_code="recipient_unresolved",
             retryable=False,
         )
+
+    def _resolve_device_recipient(self, device_id: str) -> tuple[str, str]:
+        device_record = self._read_device_record(device_id)
+        candidate = (
+            device_record.fields.get(self.device_owner_field)
+            if device_record is not None
+            else None
+        )
+        parsed = _parse_recipient(
+            candidate,
+            default_type=getattr(config, "FEISHU_NOTIFY_RECEIVE_ID_TYPE", "open_id"),
+        )
+        if parsed is None:
+            raise FeishuNotificationError(
+                "no device default Feishu recipient could be resolved",
+                error_code="recipient_unresolved",
+                retryable=False,
+            )
+        return parsed
 
     def _read_record(self, table_id: str, record_id: str) -> FeishuRawRecord | None:
         try:
@@ -383,6 +588,11 @@ class FeishuNotificationWriter:
         operation = _mapping(context.get("operation_state"))
         standard = _mapping(context.get("standard"))
         event_payload = _mapping(context.get("event_payload"))
+        if action_type in {
+            AlarmActionType.NOTIFY_PREWARNING.value,
+            AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
+        }:
+            return self._prewarning_message(action_type=action_type, context=context)
         area = _text(operation.get("area_id")) or _text(context.get("area")) or "未提供"
         if action_type == AlarmActionType.NOTIFY_RECOVERY.value:
             recovered_at = (
@@ -449,6 +659,49 @@ class FeishuNotificationWriter:
         link = self._event_link(record_id)
         return "\n".join((*lines, f"异常事件记录：{link}") if link else lines)
 
+    @staticmethod
+    def _prewarning_message(*, action_type: str, context: Mapping[str, Any]) -> str:
+        sample = _mapping(context.get("sample"))
+        result = _mapping(context.get("python_monitor_result"))
+        standard = _mapping(context.get("standard"))
+        device_id = _text(context.get("device_id")) or _text(sample.get("device_id"))
+        timestamp = _text(context.get("sample_time")) or _text(context.get("created_at")) or "未提供"
+        if action_type == AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value:
+            title = "[温湿度接近阈值预警解除]"
+            status = "已离开预警区，当前仍未触发正式告警。"
+        else:
+            title = "[温湿度接近阈值预警]"
+            status = "当前尚未超标，请提前关注。"
+        warning_reasons = result.get("prewarning_reasons") or context.get(
+            "prewarning_reasons"
+        )
+        details = _mapping(
+            result.get("prewarning_details") or context.get("prewarning_details")
+        )
+        lines = [
+            title,
+            f"设备 ID：{device_id}",
+            f"当前温度/湿度：{_number_text(sample.get('temperature'))} / {_number_text(sample.get('humidity'))}",
+            f"预警项：{_text(warning_reasons) or '未提供'}",
+        ]
+        for reason, detail in details.items():
+            item = _mapping(detail)
+            lines.append(
+                f"{reason}：当前 {_number_text(item.get('value'))}{_text(item.get('unit'))}，"
+                f"限值 {_number_text(item.get('limit'))}{_text(item.get('unit'))}，"
+                f"距离 {_number_text(item.get('distance'))}{_text(item.get('unit'))}"
+            )
+        lines.extend(
+            (
+                f"标准：{_text(standard.get('standard_id')) or _text(result.get('standard_id')) or '未提供'} "
+                f"revision={_text(standard.get('revision')) or _text(result.get('standard_revision')) or '未提供'} "
+                f"source={_text(standard.get('standard_source')) or _text(result.get('standard_source')) or '未提供'}",
+                f"时间：{timestamp}",
+                status,
+            )
+        )
+        return "\n".join(lines)
+
     def _event_link(self, record_id: str) -> str | None:
         if not self.event_table_url:
             return None
@@ -485,6 +738,29 @@ class FeishuNotificationWriter:
             },
         )
 
+    def _mark_prewarning_failed(
+        self,
+        effect_key: str,
+        error: FeishuNotificationError,
+        context: Mapping[str, Any],
+        *,
+        recipient: str | None = None,
+    ) -> None:
+        repository = self.prewarning_effect_repository
+        if repository is None:
+            return
+        repository.mark_failed(
+            effect_key=effect_key,
+            failed_at=_attempt_time(context),
+            error=str(error),
+            metadata={
+                "dedupe_key": effect_key,
+                "recipient": recipient,
+                "error_code": error.error_code,
+                "retryable": error.retryable,
+            },
+        )
+
     @staticmethod
     def _set_context(context: Mapping[str, Any], **values: Any) -> None:
         if isinstance(context, dict):
@@ -499,9 +775,22 @@ def _notification_effect_key(
     action_type: str,
     event_id: str,
     context: Mapping[str, Any],
+    *,
+    dedupe_key: str | None = None,
 ) -> str:
     if action_type == AlarmActionType.NOTIFY_ALARM.value:
         return f"NOTIFY_ALARM:{event_id}"
+    if action_type in {
+        AlarmActionType.NOTIFY_PREWARNING.value,
+        AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
+    }:
+        if not dedupe_key:
+            raise FeishuNotificationError(
+                "prewarning notification is missing dedupe_key",
+                error_code="dedupe_key_missing",
+                retryable=False,
+            )
+        return dedupe_key
     transition = _mapping(context.get("python_alarm_transition"))
     recovery_started = (
         _text(context.get("recovery_started_at"))

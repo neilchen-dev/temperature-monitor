@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import logging
+import uuid
 from typing import Any, Callable, Mapping, Protocol
 
 import config
@@ -184,11 +185,23 @@ class MonitorApplicationService:
             # A missing standard is a visible domain result, not a normal
             # reading and not a reason to create an alarm.
             standard = None
+        current_state = self.alarm_state_repository.get(device.device_id)
+        if current_state is None:
+            current_state = AlarmState.normal(device.device_id)
         monitor_result = MonitorEngine.evaluate(
             device=device,
             sample=sample,
             standard=standard,
             operation_state=operation_state,
+            previous_prewarning_reasons=(
+                current_state.prewarning_reasons
+                if current_state.prewarning_active
+                else ()
+            ),
+            temperature_prewarning_margin=config.TEMPERATURE_PREWARNING_MARGIN_C,
+            humidity_prewarning_margin=config.HUMIDITY_PREWARNING_MARGIN_RH,
+            temperature_prewarning_exit_margin=config.TEMPERATURE_PREWARNING_EXIT_MARGIN_C,
+            humidity_prewarning_exit_margin=config.HUMIDITY_PREWARNING_EXIT_MARGIN_RH,
         )
         if monitor_result.control_type_consistency == "mismatch" and standard is not None:
             legacy_control = getattr(device.control_type, "value", device.control_type)
@@ -202,13 +215,15 @@ class MonitorApplicationService:
                 legacy_control,
                 standard.standard_source,
             )
-        current_state = self.alarm_state_repository.get(device.device_id)
-        if current_state is None:
-            current_state = AlarmState.normal(device.device_id)
         evaluated_at = now or self.now_provider()
         transition = self.alarm_state_machine.apply(
             result=monitor_result,
             current_state=current_state,
+            now=evaluated_at,
+        )
+        transition = self._apply_prewarning_transition(
+            transition,
+            monitor_result=monitor_result,
             now=evaluated_at,
         )
         actions = self.action_mapper.map(transition)
@@ -256,6 +271,11 @@ class MonitorApplicationService:
             notification_task_ids,
             event_id=transition.next.active_alarm_id or transition.previous.active_alarm_id,
         )
+        transition = self._attach_prewarning_task_metadata(
+            transition,
+            actions,
+            notification_task_ids,
+        )
         self.alarm_state_repository.save(transition.next)
         runtime_context = self._runtime_context_metadata()
         context = {
@@ -276,6 +296,7 @@ class MonitorApplicationService:
             context=context,
             created_at=evaluated_at,
         )
+        self._persist_prewarning_outcomes(executions, updated_at=evaluated_at)
         self._finish_successful_event_reconciliation_tasks(
             event_reconciliation_task_ids,
             executions,
@@ -294,6 +315,128 @@ class MonitorApplicationService:
             executions=executions,
         )
 
+    def _apply_prewarning_transition(
+        self,
+        transition: StateTransition,
+        *,
+        monitor_result: MonitorResult,
+        now: datetime,
+    ) -> StateTransition:
+        """Add the near-limit episode while leaving formal alarm state intact."""
+        previous = transition.previous
+        next_state = transition.next
+        # A real breach always wins.  The formal state machine has already
+        # moved to PENDING/ALARM (or is recovering); clear the advisory signal
+        # without emitting a misleading prewarning recovery.
+        if monitor_result.overall_status.value == "VIOLATION" or next_state.state.value != "NORMAL":
+            if previous.prewarning_active:
+                next_state = replace(
+                    next_state,
+                    prewarning_active=False,
+                    prewarning_started_at=previous.prewarning_started_at,
+                    prewarning_reasons=previous.prewarning_reasons,
+                    prewarning_details=dict(previous.prewarning_details),
+                    prewarning_episode_id=previous.prewarning_episode_id,
+                    prewarning_standard_id=previous.prewarning_standard_id,
+                    prewarning_standard_revision=previous.prewarning_standard_revision,
+                    prewarning_notify_task_id=previous.prewarning_notify_task_id,
+                    prewarning_message_id=previous.prewarning_message_id,
+                    prewarning_recovered_at=previous.prewarning_recovered_at,
+                    prewarning_recovery_task_id=previous.prewarning_recovery_task_id,
+                    prewarning_recovery_message_id=previous.prewarning_recovery_message_id,
+                )
+            return replace(transition, next=next_state)
+
+        if monitor_result.overall_status.value != "NORMAL":
+            # Unknown/offline samples do not prove either entry or recovery.
+            # OPERATION_PERIOD + IDLE is explicitly suppressed instead.
+            if monitor_result.applicability.value == "NOT_APPLICABLE" and previous.prewarning_active:
+                next_state = replace(
+                    next_state,
+                    prewarning_active=False,
+                    prewarning_reasons=(),
+                    prewarning_details={},
+                    prewarning_recovered_at=None,
+                )
+            return replace(transition, next=next_state)
+
+        reasons = tuple(monitor_result.prewarning_reasons)
+        actions = list(transition.actions)
+        if reasons:
+            episode_id = previous.prewarning_episode_id if previous.prewarning_active else uuid.uuid4().hex
+            next_state = replace(
+                next_state,
+                prewarning_active=True,
+                prewarning_started_at=(
+                    previous.prewarning_started_at
+                    if previous.prewarning_active and previous.prewarning_started_at is not None
+                    else now
+                ),
+                prewarning_episode_id=episode_id,
+                prewarning_reasons=reasons,
+                prewarning_details=dict(monitor_result.prewarning_details),
+                prewarning_standard_id=monitor_result.standard_id,
+                prewarning_standard_revision=monitor_result.standard_revision,
+                prewarning_recovered_at=None,
+            )
+            if not previous.prewarning_active:
+                actions.append(
+                    AlarmAction(
+                        action_type=AlarmActionType.NOTIFY_PREWARNING,
+                        device_id=next_state.device_id,
+                    )
+                )
+            return replace(transition, next=next_state, actions=tuple(actions))
+
+        if previous.prewarning_active:
+            next_state = replace(
+                next_state,
+                prewarning_active=False,
+                prewarning_reasons=(),
+                prewarning_details={},
+                prewarning_recovered_at=now,
+                prewarning_standard_id=previous.prewarning_standard_id,
+                prewarning_standard_revision=previous.prewarning_standard_revision,
+            )
+            actions.append(
+                AlarmAction(
+                    action_type=AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
+                    device_id=next_state.device_id,
+                )
+            )
+        return replace(transition, next=next_state, actions=tuple(actions))
+
+    def prewarning_status(self) -> list[dict[str, Any]]:
+        """Return active prewarning episodes for read-only runtime status."""
+        lister = getattr(self.alarm_state_repository, "list_prewarning_states", None)
+        if not callable(lister):
+            return []
+        result: list[dict[str, Any]] = []
+        for state in lister():
+            sample = (
+                self.latest_sample_repository.get(state.device_id)
+                if self.latest_sample_repository is not None
+                else None
+            )
+            result.append(
+                {
+                    "device_id": state.device_id,
+                    "prewarning": True,
+                    "started_at": _iso_value(state.prewarning_started_at),
+                    "episode_id": state.prewarning_episode_id,
+                    "reasons": list(state.prewarning_reasons),
+                    "details": dict(state.prewarning_details),
+                    "standard_id": state.prewarning_standard_id,
+                    "revision": state.prewarning_standard_revision,
+                    "notify_task_id": state.prewarning_notify_task_id,
+                    "message_id": state.prewarning_message_id,
+                    "sample_time": _iso_value(sample.sample_time) if sample else None,
+                    "temperature": sample.temperature if sample else None,
+                    "humidity": sample.humidity if sample else None,
+                }
+            )
+        return result
+
     def execute_notification_task(
         self,
         *,
@@ -305,20 +448,31 @@ class MonitorApplicationService:
         if action_type not in {
             AlarmActionType.NOTIFY_ALARM,
             AlarmActionType.NOTIFY_RECOVERY,
+            AlarmActionType.NOTIFY_PREWARNING,
+            AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
         }:
             raise ValueError(f"unsupported notification task type: {task.task_type}")
         created_at = now or self.now_provider()
-        event_id = str(task.payload.get("event_id") or task.entity_id).strip()
+        is_prewarning = action_type in {
+            AlarmActionType.NOTIFY_PREWARNING,
+            AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
+        }
+        event_id = (
+            str(task.payload.get("event_id") or task.entity_id).strip()
+            if not is_prewarning
+            else ""
+        )
+        device_id = str(task.payload.get("device_id") or task.entity_id).strip()
         action = ApplicationAction(
             action_type=action_type,
             kind=ApplicationActionKind.NOTIFICATION,
-            device_id=str(task.payload.get("device_id") or event_id),
+            device_id=device_id,
             source=AlarmAction(
                 action_type=action_type,
-                device_id=str(task.payload.get("device_id") or event_id),
-                alarm_id=event_id,
+                device_id=device_id,
+                alarm_id=event_id or None,
             ),
-            alarm_id=event_id,
+            alarm_id=event_id or None,
             task_id=task.task_id,
             dedupe_key=task.dedupe_key,
             payload=dict(task.payload),
@@ -326,8 +480,8 @@ class MonitorApplicationService:
         context = dict(task.payload)
         context.update(
             {
-                "device_id": str(task.payload.get("device_id") or event_id),
-                "event_id": event_id,
+                "device_id": device_id,
+                "event_id": event_id or None,
                 "automation_task_id": task.task_id,
                 "dedupe_key": task.dedupe_key,
                 "created_mode": task.created_mode,
@@ -347,6 +501,7 @@ class MonitorApplicationService:
             created_at=created_at,
         )
         execution = executions[0]
+        self._persist_prewarning_outcomes(executions, updated_at=created_at)
         if execution.status is ActionExecutionStatus.SUCCEEDED:
             return executions
 
@@ -383,6 +538,48 @@ class MonitorApplicationService:
             or execution.context.get("error_code")
             or f"{action_type.value} failed"
         )
+
+    def _persist_prewarning_outcomes(
+        self,
+        executions: tuple[ActionExecution, ...],
+        *,
+        updated_at: datetime,
+    ) -> None:
+        if not executions:
+            return
+        for execution in executions:
+            action_type = execution.action.action_type
+            if action_type not in {
+                AlarmActionType.NOTIFY_PREWARNING,
+                AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
+            } or execution.status is not ActionExecutionStatus.SUCCEEDED:
+                continue
+            context = execution.context
+            device_id = str(
+                context.get("device_id") or execution.action.device_id
+            ).strip()
+            state = self.alarm_state_repository.get(device_id)
+            if state is None:
+                continue
+            message_id = context.get("message_id")
+            task_id = context.get("automation_task_id") or getattr(
+                execution.action, "task_id", None
+            )
+            if action_type is AlarmActionType.NOTIFY_PREWARNING:
+                state = replace(
+                    state,
+                    prewarning_notify_task_id=str(task_id) if task_id else state.prewarning_notify_task_id,
+                    prewarning_message_id=str(message_id) if message_id else state.prewarning_message_id,
+                )
+            else:
+                state = replace(
+                    state,
+                    prewarning_recovery_task_id=str(task_id) if task_id else state.prewarning_recovery_task_id,
+                    prewarning_recovery_message_id=(
+                        str(message_id) if message_id else state.prewarning_recovery_message_id
+                    ),
+                )
+            self.alarm_state_repository.save(state)
 
     def reconcile_alarm_event_task(
         self, *, task: AutomationTask, device: DeviceContext, now: datetime,
@@ -627,6 +824,8 @@ class MonitorApplicationService:
             elif action_type in {
                 AlarmActionType.NOTIFY_ALARM.value,
                 AlarmActionType.NOTIFY_RECOVERY.value,
+                AlarmActionType.NOTIFY_PREWARNING.value,
+                AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
             }:
                 # Notification tasks have their own durable identity.  Do not
                 # accidentally attribute them to the sample/verification task.
@@ -654,6 +853,57 @@ class MonitorApplicationService:
                 dedupe_key = f"NOTIFY_RECOVERY:{alarm_id}:{recovery_started_at.isoformat()}"
                 payload["notification_type"] = "RECOVERY"
                 payload["recovery_started_at"] = recovery_started_at.isoformat()
+            elif action_type in {
+                AlarmActionType.NOTIFY_PREWARNING.value,
+                AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
+            }:
+                episode_id = (
+                    transition.next.prewarning_episode_id
+                    or transition.previous.prewarning_episode_id
+                )
+                reasons = (
+                    transition.next.prewarning_reasons
+                    or transition.previous.prewarning_reasons
+                )
+                if episode_id is not None:
+                    direction = "|".join(reasons) or "unknown"
+                    standard_id = monitor_result.standard_id or "unknown"
+                    revision = monitor_result.standard_revision or "unknown"
+                    prefix = (
+                        "NOTIFY_PREWARNING"
+                        if action_type == AlarmActionType.NOTIFY_PREWARNING.value
+                        else "NOTIFY_PREWARNING_RECOVERY"
+                    )
+                    dedupe_key = (
+                        f"{prefix}:{sample.device_id}:{standard_id}:{revision}:"
+                        f"{direction}:{episode_id}"
+                    )
+                    payload.update(
+                        {
+                            "notification_type": (
+                                "PREWARNING"
+                                if action_type == AlarmActionType.NOTIFY_PREWARNING.value
+                                else "PREWARNING_RECOVERY"
+                            ),
+                            "prewarning_episode_id": episode_id,
+                            "prewarning_reasons": list(reasons),
+                            "prewarning_details": dict(
+                                transition.next.prewarning_details
+                                or transition.previous.prewarning_details
+                            ),
+                            "prewarning_started_at": (
+                                transition.next.prewarning_started_at
+                                or transition.previous.prewarning_started_at
+                            ).isoformat()
+                            if (
+                                transition.next.prewarning_started_at
+                                or transition.previous.prewarning_started_at
+                            )
+                            else None,
+                            "standard_id": standard_id,
+                            "standard_revision": revision,
+                        }
+                    )
             if alarm_id is not None and action_type in {
                 "CREATE_ALARM_EVENT",
                 "UPDATE_ALARM_EVENT",
@@ -733,15 +983,43 @@ class MonitorApplicationService:
                 and task_index < len(task_ids)
             ):
                 local_event_id = action.alarm_id or event_id
-                if local_event_id is not None:
-                    action = replace(
-                        action,
-                        task_id=task_ids[task_index],
-                        alarm_id=local_event_id,
-                    )
+                action = replace(
+                    action,
+                    task_id=task_ids[task_index],
+                    alarm_id=local_event_id,
+                )
                 task_index += 1
             enriched.append(action)
         return tuple(enriched)
+
+    @staticmethod
+    def _attach_prewarning_task_metadata(
+        transition: StateTransition,
+        actions: tuple[ApplicationAction, ...],
+        task_ids: tuple[str, ...],
+    ) -> StateTransition:
+        """Persist the durable task identity in the warning episode snapshot."""
+        if not task_ids:
+            return transition
+        next_state = transition.next
+        task_index = 0
+        for action in actions:
+            if action.kind is not ApplicationActionKind.NOTIFICATION:
+                continue
+            if action.action_type not in {
+                AlarmActionType.NOTIFY_PREWARNING,
+                AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
+            }:
+                continue
+            if task_index >= len(task_ids):
+                break
+            task_id = task_ids[task_index]
+            task_index += 1
+            if action.action_type is AlarmActionType.NOTIFY_PREWARNING:
+                next_state = replace(next_state, prewarning_notify_task_id=task_id)
+            else:
+                next_state = replace(next_state, prewarning_recovery_task_id=task_id)
+        return replace(transition, next=next_state)
 
     @staticmethod
     def _enrich_reconciliation_actions(
@@ -945,14 +1223,19 @@ class MonitorApplicationService:
                 continue
             event_id = action.alarm_id or context.get("event_id")
             dedupe_key = action.dedupe_key
-            if not event_id or not dedupe_key:
+            is_prewarning = action.action_type in {
+                AlarmActionType.NOTIFY_PREWARNING,
+                AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
+            }
+            if (not is_prewarning and not event_id) or not dedupe_key:
                 continue
             payload = dict(context)
+            payload.update(dict(action.payload))
             payload.update(
                 {
                     "device_id": str(context.get("device_id") or action.device_id),
-                    "event_id": event_id,
-                    "alarm_id": event_id,
+                    "event_id": event_id if not is_prewarning else None,
+                    "alarm_id": event_id if not is_prewarning else None,
                     "action_type": action.action_type.value,
                     "dedupe_key": dedupe_key,
                     "retry_attempt": _retry_attempt(payload),
@@ -974,8 +1257,8 @@ class MonitorApplicationService:
                 )
             task = self.task_repository.create_or_get(
                 task_type=action.action_type.value,
-                entity_type="EVENT",
-                entity_id=str(event_id),
+                entity_type="DEVICE" if is_prewarning else "EVENT",
+                entity_id=str(context.get("device_id") if is_prewarning else event_id),
                 due_at=created_at,
                 payload=payload,
                 dedupe_key=dedupe_key,
@@ -1031,6 +1314,8 @@ class MonitorApplicationService:
             if execution.action.action_type not in {
                 AlarmActionType.NOTIFY_ALARM,
                 AlarmActionType.NOTIFY_RECOVERY,
+                AlarmActionType.NOTIFY_PREWARNING,
+                AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
             }:
                 continue
             if task_index >= len(task_ids):
@@ -1100,6 +1385,12 @@ class MonitorApplicationService:
             return bool(getattr(config, "FEISHU_ALARM_NOTIFY_ENABLED", False))
         if action_type is AlarmActionType.NOTIFY_RECOVERY:
             return bool(getattr(config, "FEISHU_RECOVERY_NOTIFY_ENABLED", False))
+        if action_type is AlarmActionType.NOTIFY_PREWARNING:
+            return bool(getattr(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", False))
+        if action_type is AlarmActionType.NOTIFY_PREWARNING_RECOVERY:
+            return bool(
+                getattr(config, "FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED", False)
+            )
         return False
 
     def _project_local_actions(
@@ -1424,6 +1715,8 @@ def _monitor_result_dict(result: MonitorResult) -> dict[str, Any]:
         "control_type_source": result.control_type_source,
         "control_type_consistency": result.control_type_consistency,
         "reasons": result.reasons,
+        "prewarning_reasons": result.prewarning_reasons,
+        "prewarning_details": dict(result.prewarning_details),
     }
 
 
@@ -1457,6 +1750,20 @@ def _transition_dict(transition: StateTransition) -> dict[str, Any]:
             else None
         ),
         "active_alarm_id": active_alarm_id,
+        "prewarning_active": transition.next.prewarning_active,
+        "prewarning_started_at": (
+            transition.next.prewarning_started_at.isoformat()
+            if transition.next.prewarning_started_at is not None
+            else None
+        ),
+        "prewarning_episode_id": transition.next.prewarning_episode_id,
+        "prewarning_reasons": transition.next.prewarning_reasons,
+        "prewarning_details": dict(transition.next.prewarning_details),
+        "prewarning_recovered_at": (
+            transition.next.prewarning_recovered_at.isoformat()
+            if transition.next.prewarning_recovered_at is not None
+            else None
+        ),
     }
 
 

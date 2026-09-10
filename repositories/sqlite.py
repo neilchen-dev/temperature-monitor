@@ -166,7 +166,18 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "alarm_states": (
         "device_id", "state", "violation_started_at", "alarm_started_at",
-        "recovery_started_at", "active_alarm_id", "pending_task_id", "updated_at",
+        "recovery_started_at", "active_alarm_id", "pending_task_id",
+        "prewarning_active", "prewarning_started_at", "prewarning_episode_id",
+        "prewarning_reasons_json", "prewarning_details_json",
+        "prewarning_standard_id", "prewarning_standard_revision",
+        "prewarning_notify_task_id", "prewarning_message_id",
+        "prewarning_recovered_at", "prewarning_recovery_task_id",
+        "prewarning_recovery_message_id", "updated_at",
+    ),
+    "prewarning_external_effects": (
+        "effect_key", "device_id", "action_type", "status", "requested_at",
+        "completed_at", "failed_at", "recipient", "receive_id_type",
+        "message_id", "error", "metadata_json",
     ),
     "latest_monitor_samples": (
         "device_id", "sample_time", "temperature", "humidity",

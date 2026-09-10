@@ -58,6 +58,8 @@ _EXTERNAL_EFFECT_TASK_TYPES = frozenset(
         "RECONCILE_ALARM_EVENT",
         "NOTIFY_ALARM",
         "NOTIFY_RECOVERY",
+        "NOTIFY_PREWARNING",
+        "NOTIFY_PREWARNING_RECOVERY",
     }
 )
 

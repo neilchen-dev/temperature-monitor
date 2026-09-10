@@ -94,6 +94,8 @@ class AlarmActionType(str, Enum):
     START_RECOVERY = "START_RECOVERY"
     MARK_ALARM_RECOVERED = "MARK_ALARM_RECOVERED"
     NOTIFY_RECOVERY = "NOTIFY_RECOVERY"
+    NOTIFY_PREWARNING = "NOTIFY_PREWARNING"
+    NOTIFY_PREWARNING_RECOVERY = "NOTIFY_PREWARNING_RECOVERY"
 
 
 class AutomationTaskStatus(str, Enum):
@@ -248,6 +250,8 @@ class MonitorResult:
     resolved_control_type: ControlType | None = None
     control_type_source: str = "configuration_error"
     control_type_consistency: str = "standard_missing"
+    prewarning_reasons: tuple[str, ...] = ()
+    prewarning_details: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -261,6 +265,18 @@ class AlarmState:
     recovery_started_at: datetime | None = None
     active_alarm_id: str | None = None
     pending_task_id: str | None = None
+    prewarning_active: bool = False
+    prewarning_started_at: datetime | None = None
+    prewarning_episode_id: str | None = None
+    prewarning_reasons: tuple[str, ...] = ()
+    prewarning_details: Mapping[str, Any] = field(default_factory=dict)
+    prewarning_standard_id: str | None = None
+    prewarning_standard_revision: str | None = None
+    prewarning_notify_task_id: str | None = None
+    prewarning_message_id: str | None = None
+    prewarning_recovered_at: datetime | None = None
+    prewarning_recovery_task_id: str | None = None
+    prewarning_recovery_message_id: str | None = None
 
     @classmethod
     def normal(cls, device_id: str) -> "AlarmState":

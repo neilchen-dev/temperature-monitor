@@ -44,6 +44,7 @@ from repositories import (
     SQLiteOperationRepository,
     SQLiteStandardRepository,
     SQLiteStandardResolver,
+    SQLitePrewarningEffectRepository,
     connect,
 )
 from repositories.sqlite import verify_runtime_schema
@@ -129,6 +130,10 @@ def _active_action_enabled(action: Any) -> bool:
         return bool(config.FEISHU_ALARM_NOTIFY_ENABLED)
     if action_type == AlarmActionType.NOTIFY_RECOVERY.value:
         return bool(config.FEISHU_RECOVERY_NOTIFY_ENABLED)
+    if action_type == AlarmActionType.NOTIFY_PREWARNING.value:
+        return bool(config.FEISHU_PREWARNING_NOTIFY_ENABLED)
+    if action_type == AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value:
+        return bool(config.FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED)
     return True
 
 
@@ -359,6 +364,8 @@ def build_runtime(
     operation_repository = SQLiteOperationRepository(runtime_connection)
     latest_sample_repository = SQLiteLatestSampleRepository(runtime_connection)
     run_repository = SQLiteAutomationRunRepository(runtime_connection)
+    alarm_state_repository = SQLiteAlarmStateRepository(runtime_connection)
+    prewarning_effect_repository = SQLitePrewarningEffectRepository(runtime_connection)
     # 半旧 schema 拒绝启动：各仓储构造时会做增量迁移/建表，此处校验迁移后
     # 仍缺关键列时显式报错，绝不静默运行在残缺 schema 上（旧采集链路不受
     # 影响——build_runtime 的调用方会捕获并记录，legacy 继续可用）。
@@ -421,6 +428,7 @@ def build_runtime(
         event_table_id=event_table_id,
         device_table_id=device_table_id,
         event_repository=event_repository,
+        prewarning_effect_repository=prewarning_effect_repository,
         event_table_url=config.FEISHU_EVENT_TABLE_URL,
         attempt_timeout=config.FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS,
     )
@@ -500,6 +508,8 @@ def build_runtime(
             AlarmActionType.MARK_ALARM_RECOVERED: event_writer.handle_alarm_action,
             AlarmActionType.NOTIFY_ALARM: notification_writer.handle_notification_action,
             AlarmActionType.NOTIFY_RECOVERY: notification_writer.handle_notification_action,
+            AlarmActionType.NOTIFY_PREWARNING: notification_writer.handle_notification_action,
+            AlarmActionType.NOTIFY_PREWARNING_RECOVERY: notification_writer.handle_notification_action,
         },
         recorder=run_repository,
         action_enabled_provider=_active_action_enabled,
@@ -525,7 +535,7 @@ def build_runtime(
     monitor_service = MonitorApplicationService(
         operation_state_provider=operation_state_provider,
         standard_resolver=SQLiteStandardResolver(standard_repository),
-        alarm_state_repository=SQLiteAlarmStateRepository(runtime_connection),
+        alarm_state_repository=alarm_state_repository,
         alarm_state_machine=AlarmStateMachine(),
         action_mapper=ApplicationActionMapper(emit_notifications=True),
         action_executor=action_executor,
@@ -569,6 +579,8 @@ def build_runtime(
             "RECONCILE_ALARM_EVENT": lambda task: runtime_holder["runtime"].handle_reconcile_alarm_event(task),
             "NOTIFY_ALARM": lambda task: runtime_holder["runtime"].handle_notification_task(task),
             "NOTIFY_RECOVERY": lambda task: runtime_holder["runtime"].handle_notification_task(task),
+            "NOTIFY_PREWARNING": lambda task: runtime_holder["runtime"].handle_notification_task(task),
+            "NOTIFY_PREWARNING_RECOVERY": lambda task: runtime_holder["runtime"].handle_notification_task(task),
             "SHADOW_COMPARE": lambda task: runtime_holder["runtime"].handle_shadow_compare(task),
             "SYNC_STANDARD": lambda task: runtime_holder["runtime"].handle_standard_sync(task),
             "SYNC_OPERATIONS": lambda task: runtime_holder["runtime"].handle_operation_sync(task),

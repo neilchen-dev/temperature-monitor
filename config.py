@@ -82,6 +82,8 @@ def _load_hassio_options() -> None:
         "feishu_projection_attempt_timeout_seconds": "FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS",
         "feishu_alarm_notify_enabled": "FEISHU_ALARM_NOTIFY_ENABLED",
         "feishu_recovery_notify_enabled": "FEISHU_RECOVERY_NOTIFY_ENABLED",
+        "feishu_prewarning_notify_enabled": "FEISHU_PREWARNING_NOTIFY_ENABLED",
+        "feishu_prewarning_recovery_notify_enabled": "FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED",
         "feishu_alarm_chat_id": "FEISHU_ALARM_CHAT_ID",
         "feishu_notify_receive_id_type": "FEISHU_NOTIFY_RECEIVE_ID_TYPE",
         "feishu_event_table_url": "FEISHU_EVENT_TABLE_URL",
@@ -413,6 +415,10 @@ FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS = max(
 # writes.  Both defaults are deliberately off, including recovery messages.
 FEISHU_ALARM_NOTIFY_ENABLED = _get_bool("FEISHU_ALARM_NOTIFY_ENABLED", False)
 FEISHU_RECOVERY_NOTIFY_ENABLED = _get_bool("FEISHU_RECOVERY_NOTIFY_ENABLED", False)
+FEISHU_PREWARNING_NOTIFY_ENABLED = _get_bool("FEISHU_PREWARNING_NOTIFY_ENABLED", False)
+FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED = _get_bool(
+    "FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED", False
+)
 FEISHU_ALARM_CHAT_ID = os.getenv("FEISHU_ALARM_CHAT_ID", "").strip()
 FEISHU_NOTIFY_RECEIVE_ID_TYPE = (
     os.getenv("FEISHU_NOTIFY_RECEIVE_ID_TYPE", "open_id").strip().lower()
@@ -429,6 +435,23 @@ FEISHU_NOTIFY_MAX_BACKOFF_SECONDS = max(
 )
 FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS = max(
     1.0, _get_float("FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS", 5.0)
+)
+# Global near-limit margins.  They intentionally remain outside immutable
+# Feishu standards so changing notification sensitivity does not change the
+# formal compliance decision or revision chain.
+TEMPERATURE_PREWARNING_MARGIN_C = max(
+    0.0, _get_float("TEMPERATURE_PREWARNING_MARGIN_C", 0.2)
+)
+HUMIDITY_PREWARNING_MARGIN_RH = max(
+    0.0, _get_float("HUMIDITY_PREWARNING_MARGIN_RH", 2.0)
+)
+TEMPERATURE_PREWARNING_EXIT_MARGIN_C = max(
+    TEMPERATURE_PREWARNING_MARGIN_C,
+    _get_float("TEMPERATURE_PREWARNING_EXIT_MARGIN_C", 0.3),
+)
+HUMIDITY_PREWARNING_EXIT_MARGIN_RH = max(
+    HUMIDITY_PREWARNING_MARGIN_RH,
+    _get_float("HUMIDITY_PREWARNING_EXIT_MARGIN_RH", 3.0),
 )
 # Active alarm event writes are armed before the external call.  If the call
 # fails, the durable reconciliation task retries with exponential backoff;

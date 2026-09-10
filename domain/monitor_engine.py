@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Mapping
 
 from .models import (
     ApplicabilityStatus,
@@ -59,6 +60,76 @@ def _feishu_round_one_decimal(value: float) -> float:
         )
     except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"cannot round environmental value: {value!r}") from exc
+
+
+def evaluate_prewarning(
+    *,
+    sample: MonitorSample,
+    standard: EnvironmentStandard | None,
+    applicability: ApplicabilityStatus,
+    quality: DataQualityStatus,
+    overall_status: OverallStatus,
+    previous_reasons: tuple[str, ...] = (),
+    temperature_margin: float = 0.2,
+    humidity_margin: float = 2.0,
+    temperature_exit_margin: float = 0.3,
+    humidity_exit_margin: float = 3.0,
+) -> tuple[tuple[str, ...], Mapping[str, Mapping[str, Any]]]:
+    """Evaluate an in-range near-limit episode without changing compliance.
+
+    The formal compliance result always wins: a true breach returns no
+    prewarning so the existing NORMAL/PENDING/ALARM chain remains authoritative.
+    ``previous_reasons`` supplies hysteresis only for an already active episode.
+    """
+    if (
+        standard is None
+        or applicability is not ApplicabilityStatus.APPLICABLE
+        or quality is not DataQualityStatus.GOOD
+        or overall_status is not OverallStatus.NORMAL
+    ):
+        return (), {}
+
+    margins = {
+        "temperature": (temperature_margin, temperature_exit_margin),
+        "humidity": (humidity_margin, humidity_exit_margin),
+    }
+    values = {
+        "temperature": sample.temperature,
+        "humidity": sample.humidity,
+    }
+    bounds = {
+        "temperature": (standard.temperature_min, standard.temperature_max),
+        "humidity": (standard.humidity_min, standard.humidity_max),
+    }
+    warning_reasons: list[str] = []
+    details: dict[str, Mapping[str, Any]] = {}
+    previous = set(previous_reasons)
+    for dimension, value in values.items():
+        lower, upper = bounds[dimension]
+        if not _numeric(value):
+            continue
+        rounded = _feishu_round_one_decimal(float(value))
+        entry_margin, exit_margin = margins[dimension]
+        unit = "°C" if dimension == "temperature" else "%RH"
+        candidates = ()
+        if lower is not None and rounded >= lower:
+            candidates += (("LOW", lower, rounded - lower),)
+        if upper is not None and rounded <= upper:
+            candidates += (("HIGH", upper, upper - rounded),)
+        for direction, limit, distance in candidates:
+            reason = f"{dimension}_{direction.lower()}_near_limit"
+            threshold = exit_margin if reason in previous else entry_margin
+            if distance <= max(0.0, threshold) + 1e-9:
+                warning_reasons.append(reason)
+                details[reason] = {
+                    "dimension": dimension,
+                    "direction": direction,
+                    "value": rounded,
+                    "limit": limit,
+                    "distance": round(distance, 1),
+                    "unit": unit,
+                }
+    return tuple(warning_reasons), details
 
 
 def _quality_from_sample(
@@ -163,6 +234,11 @@ def evaluate_monitor_state(
     sample: MonitorSample,
     standard: EnvironmentStandard | None,
     operation_state: OperationState | None = None,
+    previous_prewarning_reasons: tuple[str, ...] = (),
+    temperature_prewarning_margin: float = 0.2,
+    humidity_prewarning_margin: float = 2.0,
+    temperature_prewarning_exit_margin: float = 0.3,
+    humidity_prewarning_exit_margin: float = 3.0,
 ) -> MonitorResult:
     """Return a deterministic compliance result for one sample.
 
@@ -231,6 +307,19 @@ def evaluate_monitor_state(
     else:
         overall_status = OverallStatus.NORMAL
 
+    prewarning_reasons, prewarning_details = evaluate_prewarning(
+        sample=sample,
+        standard=standard,
+        applicability=applicability,
+        quality=quality,
+        overall_status=overall_status,
+        previous_reasons=previous_prewarning_reasons,
+        temperature_margin=temperature_prewarning_margin,
+        humidity_margin=humidity_prewarning_margin,
+        temperature_exit_margin=temperature_prewarning_exit_margin,
+        humidity_exit_margin=humidity_prewarning_exit_margin,
+    )
+
     return MonitorResult(
         device_id=sample.device_id,
         sample_time=sample.sample_time,
@@ -248,6 +337,8 @@ def evaluate_monitor_state(
         resolved_control_type=resolved_control_type,
         control_type_source=control_type_source,
         control_type_consistency=control_type_consistency,
+        prewarning_reasons=prewarning_reasons,
+        prewarning_details=prewarning_details,
     )
 
 
@@ -261,10 +352,20 @@ class MonitorEngine:
         sample: MonitorSample,
         standard: EnvironmentStandard | None,
         operation_state: OperationState | None = None,
+        previous_prewarning_reasons: tuple[str, ...] = (),
+        temperature_prewarning_margin: float = 0.2,
+        humidity_prewarning_margin: float = 2.0,
+        temperature_prewarning_exit_margin: float = 0.3,
+        humidity_prewarning_exit_margin: float = 3.0,
     ) -> MonitorResult:
         return evaluate_monitor_state(
             device=device,
             sample=sample,
             standard=standard,
             operation_state=operation_state,
+            previous_prewarning_reasons=previous_prewarning_reasons,
+            temperature_prewarning_margin=temperature_prewarning_margin,
+            humidity_prewarning_margin=humidity_prewarning_margin,
+            temperature_prewarning_exit_margin=temperature_prewarning_exit_margin,
+            humidity_prewarning_exit_margin=humidity_prewarning_exit_margin,
         )
