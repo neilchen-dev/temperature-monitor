@@ -207,10 +207,98 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["pending_external_effects"], 1)
+        self.assertEqual(summary["current_epoch_pending_external_effects"], 1)
+        self.assertEqual(summary["historical_pending_external_effects"], 0)
+        self.assertEqual(summary["unisolated_external_effects"], 0)
         self.assertEqual(summary["stale_tasks"], 1)
-        self.assertIn("pending_external_effects=1", summary["blocker_reasons"])
+        self.assertNotIn("historical_pending_external_effects=1", summary["blocker_reasons"])
+        self.assertIn("stale_tasks=1", summary["blocker_reasons"])
         self.assertFalse(summary["active_readiness"])
         self.assertEqual(self.repository.get(task.task_id).status, AutomationTaskStatus.RUNNING)
+
+    def test_current_epoch_pending_external_task_does_not_block_readiness(self) -> None:
+        activation = self.repository.set_runtime_context(
+            mode="active", now=self.created_at
+        )
+        task = self.repository.create_or_get(
+            task_type="RECONCILE_ALARM_EVENT",
+            entity_type="EVENT",
+            entity_id="event-current",
+            due_at=self.created_at,
+            payload={"event_id": "event-current"},
+            dedupe_key="RECONCILE_ALARM_EVENT:event-current",
+            created_at=self.created_at,
+        )
+
+        summary = self.repository.active_readiness(
+            now=self.created_at + timedelta(seconds=1)
+        )
+
+        self.assertEqual(task.active_epoch, activation.active_epoch)
+        self.assertEqual(summary["pending_external_effects"], 1)
+        self.assertEqual(summary["current_epoch_pending_external_effects"], 1)
+        self.assertEqual(summary["historical_pending_external_effects"], 0)
+        self.assertEqual(summary["unisolated_external_effects"], 0)
+        self.assertEqual(summary["blocker_reasons"], [])
+        self.assertTrue(summary["active_readiness"])
+
+    def test_historical_pending_external_task_blocks_active_readiness(self) -> None:
+        self.repository.set_runtime_context(mode="shadow", now=self.created_at)
+        task = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-historical",
+            due_at=self.created_at,
+            payload={"event_id": "event-historical"},
+            dedupe_key="NOTIFY_ALARM:event-historical",
+            created_at=self.created_at,
+        )
+        activation = self.repository.set_runtime_context(
+            mode="active", now=self.created_at + timedelta(minutes=1)
+        )
+
+        summary = self.repository.active_readiness(
+            now=self.created_at + timedelta(minutes=1)
+        )
+
+        self.assertNotEqual(task.active_epoch, activation.active_epoch)
+        self.assertEqual(summary["pending_external_effects"], 1)
+        self.assertEqual(summary["current_epoch_pending_external_effects"], 0)
+        self.assertEqual(summary["historical_pending_external_effects"], 1)
+        self.assertEqual(summary["unisolated_external_effects"], 1)
+        self.assertIn(
+            "historical_pending_external_effects=1", summary["blocker_reasons"]
+        )
+        self.assertFalse(summary["active_readiness"])
+
+    def test_same_epoch_task_before_cutover_is_not_allowed(self) -> None:
+        activation = self.repository.set_runtime_context(
+            mode="active", now=self.created_at + timedelta(minutes=1)
+        )
+        task = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-before-cutover",
+            due_at=self.created_at,
+            payload={"event_id": "event-before-cutover"},
+            dedupe_key="NOTIFY_ALARM:event-before-cutover",
+            # Simulate a malformed/imported row that reuses the current epoch.
+            created_at=self.created_at,
+        )
+
+        self.assertEqual(task.active_epoch, activation.active_epoch)
+        self.assertFalse(self.repository.external_effect_allowed(task))
+        self.assertEqual(
+            self.repository.quarantine_legacy_external_tasks(
+                now=self.created_at + timedelta(minutes=1),
+                active_epoch=activation.active_epoch,
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.repository.get(task.task_id).status,
+            AutomationTaskStatus.LEGACY_PENDING,
+        )
 
 
 class GlobalSyncTaskDeduplicationTests(unittest.TestCase):

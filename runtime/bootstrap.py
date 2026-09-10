@@ -508,6 +508,7 @@ def build_runtime(
             and task_repository.active_readiness()["active_readiness"]
         ),
         active_epoch_provider=lambda: task_repository.runtime_context().active_epoch,
+        active_cutover_at_provider=lambda: task_repository.runtime_context().active_cutover_at,
     )
     if mode == AutomationMode.ACTIVE.value:
         if effective_mode == AutomationMode.ACTIVE.value and config.ACTIVE_DEVICE_IDS:

@@ -44,6 +44,26 @@ ContextActionHandler = Callable[
 ]
 
 
+def _coerce_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _at_or_after(value: datetime, reference: datetime) -> bool:
+    """Compare cutover timestamps while tolerating legacy naive values."""
+    if value.tzinfo is None and reference.tzinfo is not None:
+        value = value.replace(tzinfo=reference.tzinfo)
+    elif value.tzinfo is not None and reference.tzinfo is None:
+        reference = reference.replace(tzinfo=value.tzinfo)
+    return value >= reference
+
+
 class ActionRunRecorder(Protocol):
     """Persist an action plan or execution result for audit and comparison."""
 
@@ -67,6 +87,7 @@ class ActionExecutor:
         standards_ready_provider: Callable[[], bool] | None = None,
         action_enabled_provider: Callable[[AlarmAction | ApplicationAction], bool] | None = None,
         active_epoch_provider: Callable[[], str | None] | None = None,
+        active_cutover_at_provider: Callable[[], datetime | str | None] | None = None,
     ) -> None:
         self.mode = AutomationMode(mode)
         self.active_device_ids = normalize_device_ids(active_device_ids)
@@ -82,6 +103,7 @@ class ActionExecutor:
         self.standards_ready_provider = standards_ready_provider
         self.action_enabled_provider = action_enabled_provider
         self.active_epoch_provider = active_epoch_provider
+        self.active_cutover_at_provider = active_cutover_at_provider
 
     def standards_ready(self) -> bool:
         """Return the current production-standard gate, failing closed."""
@@ -264,6 +286,30 @@ class ActionExecutor:
                     context=context,
                     created_at=created_at,
                 )
+            if has_task_context and self.active_cutover_at_provider is not None:
+                try:
+                    cutover_at = _coerce_datetime(self.active_cutover_at_provider())
+                except Exception:  # noqa: BLE001 - a broken cutover gate denies writes
+                    cutover_at = None
+                task_created_at = _coerce_datetime(
+                    context.get("task_created_at") or context.get("created_at") or created_at
+                )
+                if (
+                    cutover_at is None
+                    or task_created_at is None
+                    or not _at_or_after(task_created_at, cutover_at)
+                ):
+                    return ActionExecution(
+                        action=action,
+                        mode=self.mode,
+                        status=ActionExecutionStatus.PLANNED,
+                        error=(
+                            "external effect is before the current Active cutover; "
+                            "action remains PLANNED"
+                        ),
+                        context=context,
+                        created_at=created_at,
+                    )
 
         if self.action_enabled_provider is not None:
             try:

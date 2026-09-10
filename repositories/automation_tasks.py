@@ -287,18 +287,41 @@ class SQLiteAutomationTaskRepository:
             """,
             external_params,
         )
-        if activation.mode == "active" and activation.active_epoch:
-            unisolated_external = count(
+        current_epoch_pending_external = 0
+        if (
+            activation.mode == "active"
+            and activation.active_epoch
+            and activation.active_cutover_at is not None
+        ):
+            # A pending effect created by the current Active epoch is normal
+            # in-flight work.  It must remain observable, but it must not make
+            # the runtime gate reject the task that is supposed to complete
+            # it.  The timestamp check is an explicit second boundary guard
+            # for malformed/legacy rows carrying a reused epoch.
+            current_epoch_pending_external = count(
                 f"""
                 SELECT COUNT(*) FROM automation_tasks
                 WHERE task_type IN ({placeholders})
                   AND status IN ('PENDING', 'RUNNING')
-                  AND NOT (created_mode = 'active' AND active_epoch = ?)
+                  AND created_mode = 'active'
+                  AND active_epoch = ?
+                  AND created_at >= ?
                 """,
-                (*external_params, activation.active_epoch),
+                (
+                    *external_params,
+                    activation.active_epoch,
+                    _datetime_text(activation.active_cutover_at),
+                ),
             )
-        else:
-            unisolated_external = pending_external
+
+        # Anything pending/running outside the current Active epoch is still
+        # historical or unisolated work.  In Shadow there is no current epoch,
+        # so all pending external work belongs to this bucket.
+        historical_pending_external = max(
+            pending_external - current_epoch_pending_external,
+            0,
+        )
+        unisolated_external = historical_pending_external
 
         stale_cutoff = current_time - stale_after
         stale = 0
@@ -338,6 +361,8 @@ class SQLiteAutomationTaskRepository:
             "legacy_pending_tasks": legacy_pending,
             "stale_tasks": stale,
             "pending_external_effects": pending_external,
+            "historical_pending_external_effects": historical_pending_external,
+            "current_epoch_pending_external_effects": current_epoch_pending_external,
             "unisolated_external_effects": unisolated_external,
         }
 
@@ -372,10 +397,10 @@ class SQLiteAutomationTaskRepository:
             )
         if summary["stale_tasks"]:
             blockers.append(f"stale_tasks={summary['stale_tasks']}")
-        if summary["pending_external_effects"]:
+        if summary["historical_pending_external_effects"]:
             blockers.append(
-                "pending_external_effects="
-                f"{summary['pending_external_effects']}"
+                "historical_pending_external_effects="
+                f"{summary['historical_pending_external_effects']}"
             )
         if summary["unisolated_external_effects"]:
             blockers.append(
@@ -425,8 +450,17 @@ class SQLiteAutomationTaskRepository:
         current_time = now or datetime.now().astimezone()
         placeholders = ",".join("?" for _ in _EXTERNAL_EFFECT_TASK_TYPES)
         if activation.mode == "active":
-            eligibility = "created_mode IS NULL OR created_mode <> 'active' OR active_epoch IS NULL OR active_epoch <> ?"
-            eligibility_params: tuple[Any, ...] = (epoch,)
+            cutover_text = (
+                _datetime_text(activation.active_cutover_at)
+                if activation.active_cutover_at is not None
+                else _datetime_text(current_time)
+            )
+            eligibility = (
+                "created_mode IS NULL OR created_mode <> 'active' "
+                "OR active_epoch IS NULL OR active_epoch <> ? "
+                "OR created_at < ?"
+            )
+            eligibility_params: tuple[Any, ...] = (epoch, cutover_text)
             reason = "legacy_external_effect_before_active_cutover"
         else:
             eligibility = "1 = 1"
@@ -465,8 +499,13 @@ class SQLiteAutomationTaskRepository:
         return bool(
             activation.mode == "active"
             and activation.active_epoch
+            and activation.active_cutover_at is not None
             and task.created_mode == "active"
             and task.active_epoch == activation.active_epoch
+            and task.created_at is not None
+            and _at_or_before(activation.active_cutover_at, task.created_at)
+            and task.status is not AutomationTaskStatus.LEGACY_PENDING
+            and task.payload.get("external_effect_policy") != "SHADOW_ONLY"
         )
 
     def event_external_effect_allowed(

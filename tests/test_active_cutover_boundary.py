@@ -145,6 +145,89 @@ def test_current_active_epoch_allows_create_and_notify_tasks() -> None:
         connection.close()
 
 
+def test_current_epoch_pending_effect_does_not_self_block_executor() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        repository = SQLiteAutomationTaskRepository(connection)
+        repository.set_runtime_context(mode="active", now=T0)
+        task = _task(
+            repository,
+            task_type="RECONCILE_ALARM_EVENT",
+            key="RECONCILE_ALARM_EVENT:event-pending",
+            created_at=T0 + timedelta(seconds=1),
+        )
+        notify_task = _task(
+            repository,
+            task_type="NOTIFY_ALARM",
+            key="NOTIFY_ALARM:event-pending",
+            created_at=T0 + timedelta(seconds=1),
+        )
+        calls: list[str] = []
+        executor = ActionExecutor(
+            mode="active",
+            active_device_ids=("TH-01",),
+            standards_ready_provider=lambda: repository.active_readiness(
+                now=T0 + timedelta(seconds=2)
+            )["active_readiness"],
+            active_epoch_provider=lambda: repository.runtime_context().active_epoch,
+            active_cutover_at_provider=lambda: repository.runtime_context().active_cutover_at,
+            handlers={
+                AlarmActionType.CREATE_ALARM_EVENT: lambda action: calls.append("CREATE"),
+                AlarmActionType.NOTIFY_ALARM: lambda action: calls.append("NOTIFY"),
+            },
+        )
+        create_action = AlarmAction(
+            action_type=AlarmActionType.CREATE_ALARM_EVENT,
+            device_id="TH-01",
+            alarm_id="event-pending",
+        )
+        notify_action = AlarmAction(
+            action_type=AlarmActionType.NOTIFY_ALARM,
+            device_id="TH-01",
+            alarm_id="event-pending",
+        )
+
+        executions = executor.execute(
+            (create_action, notify_action),
+            context={
+                "device_id": "TH-01",
+                "created_mode": task.created_mode,
+                "active_epoch": task.active_epoch,
+                "automation_task_id": task.task_id,
+                "task_created_at": task.created_at.isoformat(),
+            },
+            created_at=T0 + timedelta(seconds=2),
+        )
+
+        summary = repository.active_readiness(now=T0 + timedelta(seconds=2))
+        assert summary["current_epoch_pending_external_effects"] == 2
+        assert summary["active_readiness"] is True
+        assert all(item.status is ActionExecutionStatus.SUCCEEDED for item in executions)
+        assert calls == ["CREATE", "NOTIFY"]
+
+        claimed = repository.claim_due(
+            now=T0 + timedelta(seconds=3),
+            limit=2,
+            worker_id="scheduler",
+        )
+        assert {item.task_id for item in claimed} == {task.task_id, notify_task.task_id}
+        repository.mark_succeeded(
+            task.task_id,
+            finished_at=T0 + timedelta(seconds=3),
+            worker_id="scheduler",
+        )
+        repository.mark_succeeded(
+            notify_task.task_id,
+            finished_at=T0 + timedelta(seconds=3),
+            worker_id="scheduler",
+        )
+        settled = repository.active_readiness(now=T0 + timedelta(seconds=3))
+        assert settled["current_epoch_pending_external_effects"] == 0
+        assert settled["pending_external_effects"] == 0
+    finally:
+        connection.close()
+
+
 def test_active_crash_retry_reclaims_same_current_epoch_task() -> None:
     connection = sqlite3.connect(":memory:")
     try:
@@ -199,6 +282,44 @@ def test_action_boundary_refuses_a_stale_epoch_before_handler() -> None:
             created_at=T0 + timedelta(minutes=2),
         )[0]
         assert execution.status is ActionExecutionStatus.PLANNED
+        assert calls == []
+    finally:
+        connection.close()
+
+
+def test_action_boundary_refuses_a_task_created_before_cutover() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        repository = SQLiteAutomationTaskRepository(connection)
+        activation = repository.set_runtime_context(mode="active", now=T0)
+        calls: list[str] = []
+        executor = ActionExecutor(
+            mode="active",
+            active_device_ids=("TH-01",),
+            standards_ready_provider=lambda: True,
+            active_epoch_provider=lambda: activation.active_epoch,
+            active_cutover_at_provider=lambda: activation.active_cutover_at,
+            handlers={AlarmActionType.CREATE_ALARM_EVENT: lambda action: calls.append("POST")},
+        )
+        execution = executor.execute(
+            (
+                AlarmAction(
+                    action_type=AlarmActionType.CREATE_ALARM_EVENT,
+                    device_id="TH-01",
+                    alarm_id="event-before-cutover",
+                ),
+            ),
+            context={
+                "device_id": "TH-01",
+                "created_mode": "active",
+                "active_epoch": activation.active_epoch,
+                "automation_task_id": "task-before-cutover",
+                "task_created_at": (T0 - timedelta(seconds=1)).isoformat(),
+            },
+            created_at=T0 + timedelta(seconds=1),
+        )[0]
+        assert execution.status is ActionExecutionStatus.PLANNED
+        assert "before the current Active cutover" in (execution.error or "")
         assert calls == []
     finally:
         connection.close()

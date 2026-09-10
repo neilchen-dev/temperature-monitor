@@ -333,6 +333,11 @@ class MonitorApplicationService:
                 "created_mode": task.created_mode,
                 "active_epoch": task.active_epoch,
                 "created_at": context.get("created_at") or created_at.isoformat(),
+                "task_created_at": (
+                    task.created_at.isoformat()
+                    if task.created_at is not None
+                    else context.get("created_at") or created_at.isoformat()
+                ),
                 "notification_attempted_at": created_at.isoformat(),
             }
         )
@@ -512,6 +517,11 @@ class MonitorApplicationService:
             "created_mode": task.created_mode,
             "active_epoch": task.active_epoch,
             "created_at": now.isoformat(),
+            "task_created_at": (
+                task.created_at.isoformat()
+                if task.created_at is not None
+                else task.payload.get("created_at") or now.isoformat()
+            ),
             "sample_time": sample_time,
             "sample": {
                 "device_id": device_id,
