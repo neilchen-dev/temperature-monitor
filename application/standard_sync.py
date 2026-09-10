@@ -8,6 +8,7 @@ import math
 from typing import Protocol
 
 from domain.models import ControlType, EnvironmentStandard
+from domain.standard_resolver import logical_selector_key
 from repositories.standard_resolver import SQLiteStandardRepository
 
 
@@ -96,11 +97,41 @@ def validate_standard_snapshot(
         ):
             errors.append(f"humidity_min must be less than humidity_max: {identity[0]}/{identity[1]}")
 
+    # ``standard_id`` is the stable logical-standard key.  Historical and
+    # current revisions may coexist in one complete source snapshot.  They
+    # supersede by effective_from, while equal starts or overlapping selector
+    # changes remain ambiguous and must fail closed.
+    revisions_by_logical_id: dict[str, list[EnvironmentStandard]] = {}
+    for standard in standards:
+        if standard.enabled:
+            revisions_by_logical_id.setdefault(standard.standard_id, []).append(standard)
+
+    for logical_id, revisions in revisions_by_logical_id.items():
+        for index, left in enumerate(revisions):
+            for right in revisions[index + 1 :]:
+                if not _intervals_overlap(left, right):
+                    continue
+                if logical_selector_key(left) != logical_selector_key(right):
+                    errors.append(
+                        "overlapping revisions of the same logical standard have "
+                        "incompatible selectors: "
+                        f"{logical_id}/{left.revision}, {logical_id}/{right.revision}"
+                    )
+                elif left.effective_from == right.effective_from:
+                    errors.append(
+                        "logical standard revisions have the same effective_from: "
+                        f"{logical_id}/{left.revision}, {logical_id}/{right.revision}"
+                    )
+
     for index, left in enumerate(standards):
         if not left.enabled:
             continue
         for right in standards[index + 1 :]:
             if not right.enabled:
+                continue
+            if left.standard_id == right.standard_id:
+                # Revision-chain overlap was validated above.  Do not treat
+                # valid superseding revisions as independent standards.
                 continue
             same_precedence_group = (
                 left.device_id == right.device_id

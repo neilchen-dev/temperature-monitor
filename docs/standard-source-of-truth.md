@@ -38,15 +38,20 @@ SQLiteStandardResolver
 MonitorEngine -> MonitorResult(UNKNOWN, NO_STANDARD) when unavailable
 ```
 
-`standard_versions` 保存 `(standard_id, revision)` 的不可变业务内容；相同版本再次同步
-必须内容一致，不能用新的上下限、控制类型或启用状态覆盖历史行。同步只在完整快照
+`standard_versions` 保存 `(standard_id, revision)` 的不可变业务内容；其中 `standard_id`
+是稳定的逻辑标准 key，revision chain 使用同一个 `standard_id`。相同版本再次同步必须
+内容一致，不能用新的上下限、控制类型或启用状态覆盖历史行。新的 revision 可以在同一
+完整快照中与旧 revision 共存，并按较晚的 `effective_from` supersede 旧 revision；不应
+为同一逻辑标准另造 `ENV-E2E-*` 之类的 `standard_id`。同步只在完整快照
 验证成功后移动 active/last-known-good 指针，并且相同快照重复同步是幂等的。
 旧版 `standard_versions` 历史行不会在启动迁移时自动提升为快照或指针；首次部署必须
 等待一次严格 Feishu sync 成功后才建立可信 active/LKG snapshot。
 
 严格校验包括：设备编号非空、版本非空且可追溯、`control_type` 为支持的 enum、
 `temp_min < temp_max`、`humidity_min < humidity_max`、上下限为有限数值，以及
-`enabled` 为布尔值。任何失败都保留当前有效标准并写入失败同步审计。
+`enabled` 为布尔值。同一 `standard_id` 的 revision 若 selector 不一致且有效期重叠，
+或多个 revision 的 `effective_from` 相同，仍然失败；不同 logical standard 在相同
+selector/priority 下重叠也仍然失败。任何失败都保留当前有效标准并写入失败同步审计。
 
 ## 监控审计
 

@@ -112,8 +112,8 @@
 
 | `EnvironmentStandard` 字段 | 当前飞书来源 | 现状 | 迁移判断 |
 |---|---|---|---|
-| `standard_id` | 新环境标准表 | 目标表必填；不能用事件表 `ENV-...` 代替 | **已确认：与 revision 唯一** |
-| `revision` | 新环境标准表 | 目标表必填 | **已确认：与 standard_id 唯一** |
+| `standard_id` | 新环境标准表 | 目标表必填；同一逻辑标准的 revision 必须复用同一 ID，不能为 E2E/新阈值另造独立 ID | **已确认：稳定 logical key** |
+| `revision` | 新环境标准表 | 目标表必填；同一 `standard_id` 下不可重复且内容不可原地改变 | **已确认：与 standard_id 组成不可变唯一键** |
 | `device_id` | 新环境标准表 `适用设备`；解析输入来自监测点设备编号 | 可空；空表示区域级默认标准，有值表示监测点专用标准 | **已确认：设备精确匹配优先** |
 | `area` | 新环境标准表；解析输入可来自主表 `区域` | 目标表必填 | **已确认** |
 | `operation_type` | 新环境标准表；解析输入可来自当前工艺 | 允许为空，空表示区域默认标准 | **已确认** |
@@ -132,8 +132,8 @@
 
 | 字段 | 建议类型 | 必填 | 约束/语义 |
 |---|---|---:|---|
-| `standard_id` | 文本 | 是 | 与 `revision` 组成唯一键 |
-| `revision` | 文本 | 是 | 与 `standard_id` 组成唯一键 |
+| `standard_id` | 文本 | 是 | 稳定逻辑标准 key；同一标准的后续 revision 复用它 |
+| `revision` | 文本 | 是 | 同一 `standard_id` 下不可重复的 immutable version |
 | `device_id` | 文本 | 否 | 监测点设备编号；空值表示区域级默认标准；精确设备匹配优先于区域默认 |
 | `area` | 文本/单选 | 是 | 适用区域 |
 | `operation_type` | 文本/单选 | 否 | 空值表示该区域默认标准 |
@@ -150,10 +150,12 @@
 
 飞书平台自身的创建/修改时间作为源记录元数据读取，不映射为标准生效字段。
 
-解析顺序冻结为：时间有效 → `enabled=true` → 区域匹配 → 精确 `device_id` 优先于区域级默认 → 精确 `operation_type` 优先于空值默认
-标准 → `priority` 高者优先 → 若仍有多个同优先级候选则报配置冲突。`standard_id + revision`
-飞书录入规范要求该组合唯一；实际可靠约束由 StandardSyncService 的快照校验和 SQLite
-`PRIMARY KEY (standard_id, revision)` 共同保证，不能依赖 Base 展示层。
+解析顺序冻结为：时间有效 → `enabled=true` → 同一 `standard_id` 折叠到该时刻最新的
+`effective_from` revision → 区域匹配 → 精确 `device_id` 优先于区域级默认 → 精确
+`operation_type` 优先于空值默认标准 → `priority` 高者优先 → 若仍有多个同优先级候选则报配置冲突。
+`standard_id + revision` 是不可变唯一键；同一 logical chain 的 overlapping revision 合法，
+但相同 `effective_from` 或重叠 selector 改变仍拒绝。不同 `standard_id` 在同匹配层级、同
+priority 和重叠有效期下仍是歧义配置，不能依赖 Base 展示层绕过。
 
 示例数据：
 
@@ -222,7 +224,7 @@
 
 飞书标准台账 → `StandardSyncService` → 严格字段校验 → immutable SQLite `standard_versions` + 历史 snapshot → 原子激活 → `SQLiteStandardResolver`。
 
-同步校验至少包括：device_id、control_type enum、上下限成对且 `min < max`、enabled 布尔值、时间范围合法、版本唯一、同一匹配键的有效期不冲突、来源文件非空、优先级明确。同步失败时继续使用上一版 validated 标准，并记录同步错误；不能让一次飞书误编辑直接改变生产判定。
+同步校验至少包括：device_id、control_type enum、上下限成对且 `min < max`、enabled 布尔值、时间范围合法、版本唯一、同一 logical chain 的 selector 变更不得重叠、相同起始时间不得歧义、不同标准的同一匹配键有效期不得冲突、来源文件非空、优先级明确。同步失败时继续使用上一版 validated 标准，并记录同步错误；不能让一次飞书误编辑直接改变生产判定。
 
 ## 4. 作业状态字段映射
 

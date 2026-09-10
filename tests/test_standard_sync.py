@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from application.standard_sync import (
@@ -95,6 +96,263 @@ class StandardSyncTests(unittest.TestCase):
             "ENV-TH-05",
         )
 
+    def test_same_logical_standard_revisions_can_overlap_and_latest_wins(self) -> None:
+        old = self._standard("ENV-TH-02", device_id="TH-02")
+        new = replace(
+            old,
+            revision="Rev.B",
+            humidity_max=50.0,
+            effective_from=self.now + timedelta(minutes=1),
+        )
+        source = _Source((old,))
+        service = StandardSyncService(
+            source=source,
+            repository=self.repository,
+            source_name="feishu:test",
+        )
+
+        self.assertEqual(service.sync(now=self.now).status, StandardSyncStatus.SUCCEEDED)
+        source.standards = (old, new)
+        report = service.sync(now=self.now + timedelta(minutes=2))
+
+        self.assertEqual(report.status, StandardSyncStatus.SUCCEEDED)
+        resolver = SQLiteStandardResolver(self.repository)
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.now,
+            ).revision,
+            "Rev.A",
+        )
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.now + timedelta(minutes=1),
+            ).revision,
+            "Rev.B",
+        )
+        self.assertEqual(
+            self.repository.connection.execute(
+                "SELECT COUNT(*) FROM standard_snapshot_members"
+            ).fetchone()[0],
+            3,
+        )
+        snapshots = self.repository.connection.execute(
+            "SELECT snapshot_id FROM standard_snapshots ORDER BY synced_at, snapshot_id"
+        ).fetchall()
+        self.assertEqual(
+            self.repository.connection.execute(
+                "SELECT COUNT(*) FROM standard_snapshot_members WHERE snapshot_id = ?",
+                (snapshots[0][0],),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.repository.connection.execute(
+                "SELECT COUNT(*) FROM standard_snapshot_members WHERE snapshot_id = ?",
+                (snapshots[-1][0],),
+            ).fetchone()[0],
+            2,
+        )
+
+    def test_revision_chain_can_change_priority_without_becoming_independent(self) -> None:
+        old = self._standard("ENV-TH-01", priority=100)
+        new = replace(
+            old,
+            revision="Rev.B",
+            priority=101,
+            effective_from=self.now + timedelta(minutes=1),
+        )
+        report = StandardSyncService(
+            source=_Source((old, new)),
+            repository=self.repository,
+            source_name="feishu:test",
+        ).sync(now=self.now + timedelta(minutes=2))
+
+        self.assertEqual(report.status, StandardSyncStatus.SUCCEEDED)
+        selected = SQLiteStandardResolver(self.repository).resolve(
+            area_id="仓库",
+            operation_type=None,
+            device_id="TH-01",
+            timestamp=self.now + timedelta(minutes=1),
+        )
+        self.assertEqual((selected.standard_id, selected.revision), ("ENV-TH-01", "Rev.B"))
+        self.assertEqual(selected.priority, 101)
+
+    def test_same_logical_standard_revision_with_same_start_is_rejected(self) -> None:
+        old = self._standard("ENV-TH-02", device_id="TH-02")
+        same_start = replace(old, revision="Rev.B", humidity_max=50.0)
+        report = StandardSyncService(
+            source=_Source((old, same_start)),
+            repository=self.repository,
+            source_name="feishu:test",
+        ).sync(now=self.now)
+
+        self.assertEqual(report.status, StandardSyncStatus.FAILED)
+        self.assertTrue(
+            any("same effective_from" in error for error in report.errors)
+        )
+
+    def test_same_logical_standard_selector_change_with_overlap_is_rejected(self) -> None:
+        old = self._standard("ENV-TH-02", device_id="TH-02")
+        changed_selector = replace(
+            old,
+            revision="Rev.B",
+            area="另一仓库",
+            humidity_max=50.0,
+        )
+        report = StandardSyncService(
+            source=_Source((old, changed_selector)),
+            repository=self.repository,
+            source_name="feishu:test",
+        ).sync(now=self.now)
+
+        self.assertEqual(report.status, StandardSyncStatus.FAILED)
+        self.assertTrue(
+            any("incompatible selectors" in error for error in report.errors)
+        )
+
+    def test_multiple_devices_have_independent_revision_chains(self) -> None:
+        th02_old = self._standard("ENV-TH-02", device_id="TH-02")
+        th02_new = replace(
+            th02_old,
+            revision="Rev.B",
+            humidity_max=50.0,
+            effective_from=self.now + timedelta(minutes=1),
+        )
+        th03_old = self._standard("ENV-TH-03", device_id="TH-03")
+        th03_new = replace(
+            th03_old,
+            revision="Rev.B",
+            humidity_max=55.0,
+            effective_from=self.now + timedelta(minutes=1),
+        )
+        report = StandardSyncService(
+            source=_Source((th02_old, th02_new, th03_old, th03_new)),
+            repository=self.repository,
+            source_name="feishu:test",
+        ).sync(now=self.now + timedelta(minutes=2))
+
+        self.assertEqual(report.status, StandardSyncStatus.SUCCEEDED)
+        resolver = SQLiteStandardResolver(self.repository)
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.now + timedelta(minutes=1),
+            ).revision,
+            "Rev.B",
+        )
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-03",
+                timestamp=self.now + timedelta(minutes=1),
+            ).revision,
+            "Rev.B",
+        )
+
+    def test_th02_th03_legacy_abnormal_recovery_chain_is_valid(self) -> None:
+        th02_legacy = self._standard("ENV-LEGACY-TH-02", device_id="TH-02")
+        th03_legacy = self._standard("ENV-LEGACY-TH-03", device_id="TH-03")
+        th02_abnormal = replace(
+            th02_legacy,
+            revision="TH02-E2E-ABNORMAL",
+            humidity_max=50.0,
+            effective_from=self.now + timedelta(minutes=1),
+        )
+        th03_abnormal = replace(
+            th03_legacy,
+            revision="TH03-E2E-ABNORMAL",
+            humidity_max=50.0,
+            effective_from=self.now + timedelta(minutes=1),
+        )
+        th02_recovery = replace(
+            th02_legacy,
+            revision="TH02-E2E-RECOVERY",
+            effective_from=self.now + timedelta(minutes=2),
+        )
+        th03_recovery = replace(
+            th03_legacy,
+            revision="TH03-E2E-RECOVERY",
+            effective_from=self.now + timedelta(minutes=2),
+        )
+        source = _Source((th02_legacy, th03_legacy))
+        service = StandardSyncService(
+            source=source,
+            repository=self.repository,
+            source_name="feishu:test",
+        )
+
+        self.assertEqual(service.sync(now=self.now).status, StandardSyncStatus.SUCCEEDED)
+        source.standards = (
+            th02_legacy,
+            th02_abnormal,
+            th03_legacy,
+            th03_abnormal,
+        )
+        self.assertEqual(
+            service.sync(now=self.now + timedelta(minutes=1)).status,
+            StandardSyncStatus.SUCCEEDED,
+        )
+        resolver = SQLiteStandardResolver(self.repository)
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.now + timedelta(minutes=1),
+            ).revision,
+            "TH02-E2E-ABNORMAL",
+        )
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-03",
+                timestamp=self.now + timedelta(minutes=1),
+            ).revision,
+            "TH03-E2E-ABNORMAL",
+        )
+
+        source.standards = (
+            th02_legacy,
+            th02_abnormal,
+            th02_recovery,
+            th03_legacy,
+            th03_abnormal,
+            th03_recovery,
+        )
+        self.assertEqual(
+            service.sync(now=self.now + timedelta(minutes=2)).status,
+            StandardSyncStatus.SUCCEEDED,
+        )
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.now + timedelta(minutes=2),
+            ).revision,
+            "TH02-E2E-RECOVERY",
+        )
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-03",
+                timestamp=self.now + timedelta(minutes=2),
+            ).revision,
+            "TH03-E2E-RECOVERY",
+        )
+        self.assertEqual(len(self.repository.list_all()), 6)
+
     def test_invalid_snapshot_keeps_previous_active_standard(self) -> None:
         initial = self._standard("ENV-001")
         self.repository.apply_snapshot((initial,), source="feishu:test", synced_at=self.now)
@@ -141,6 +399,27 @@ class StandardSyncTests(unittest.TestCase):
             )
             .standard_id,
             "ENV-001",
+        )
+
+    def test_existing_revision_content_change_is_rejected(self) -> None:
+        initial = self._standard("ENV-001")
+        service = StandardSyncService(
+            source=_Source((initial,)),
+            repository=self.repository,
+            source_name="feishu:test",
+        )
+        self.assertEqual(service.sync(now=self.now).status, StandardSyncStatus.SUCCEEDED)
+
+        changed = replace(initial, temperature_max=30.0)
+        report = StandardSyncService(
+            source=_Source((changed,)),
+            repository=self.repository,
+            source_name="feishu:test",
+        ).sync(now=self.now + timedelta(minutes=1))
+
+        self.assertEqual(report.status, StandardSyncStatus.FAILED)
+        self.assertTrue(
+            any("immutable standard revision changed" in error for error in report.errors)
         )
 
 

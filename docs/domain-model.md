@@ -16,6 +16,8 @@
 
 描述某监测点（可选）、区域、作业类型和时间范围内的环境合格条件。温度和湿度边界均为闭区间；
 某一维度的上下限都为空时，表示该标准不约束该维度。标准必须带版本和来源。
+`standard_id` 是稳定的逻辑标准标识，`revision` 是该逻辑标准下不可变的版本；阈值或其他
+版本内容变化应复用同一个 `standard_id`，不能新建一个伪装成独立标准的编号。
 另外使用 `enabled` 控制是否生效，使用 `priority` 解决同类标准的优先级。
 
 同一区域可以有多个监测点且分别适用不同标准，因此 `device_id` 为空表示区域级默认标准，
@@ -87,12 +89,19 @@ resolve(
 ) -> EnvironmentStandard
 ```
 
-解析顺序固定为：启用且时间有效、区域匹配、设备精确匹配优先、作业类型精确匹配优先、
+解析顺序固定为：启用且时间有效、先按 `standard_id` 折叠到该逻辑标准在该时刻最新的
+`effective_from` revision，再按区域匹配、设备精确匹配优先、作业类型精确匹配优先、
 `priority` 较高优先。
 如果最高优先级仍有多个候选，必须抛出配置冲突；没有候选则抛出未找到异常。
 `StaticStandardResolver` 仅用于测试和本地开发，生产 `SQLiteStandardResolver` 只从
 validated Feishu snapshot 的 active/LKG 链解析；legacy `standard_versions` 历史行没有
 快照指针时不可用，也不能提供 control_type fallback。
+
+同一逻辑标准的多个 enabled revision 可以在完整 snapshot 中同时存在：当有效时间重叠时，
+较晚 `effective_from` 的 revision supersede 较早 revision；相同 `effective_from` 或重叠
+期间改变区域、设备、作业类型、control_type 等 selector 时仍然严格拒绝。不同
+`standard_id` 的标准若在相同匹配层级和 priority 下重叠，仍然报配置冲突。历史 snapshot
+仍保留当时的 revision，因此 rollback/LKG 可以追溯到旧版本。
 
 ## 调用约定
 

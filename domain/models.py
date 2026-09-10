@@ -133,6 +133,9 @@ class MonitorSample:
 class EnvironmentStandard:
     """A versioned definition of what is considered environmentally compliant."""
 
+    # ``standard_id`` is the stable logical-standard key.  ``revision`` is an
+    # immutable version within that chain; it must not be encoded by creating
+    # a second standard_id for a threshold-only revision.
     standard_id: str
     revision: str
     area: str

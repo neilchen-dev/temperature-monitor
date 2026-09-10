@@ -21,6 +21,24 @@ class StandardConfigurationConflictError(StandardResolutionError):
     """More than one standard has the same winning precedence."""
 
 
+def logical_selector_key(standard: EnvironmentStandard) -> tuple[object, ...]:
+    """Return the selector identity shared by a revision chain.
+
+    ``standard_id`` is the stable logical-standard key.  A revision may change
+    thresholds and precedence, so ``priority`` is deliberately not part of
+    this key; it is evaluated after a logical chain has been collapsed to one
+    effective revision.  Selector changes are only safe when their effective
+    intervals do not overlap and are therefore rejected by strict snapshot
+    validation when they do overlap.
+    """
+    return (
+        standard.area,
+        standard.device_id.strip().upper() if standard.device_id else None,
+        standard.operation_type,
+        standard.control_type.value if standard.control_type is not None else None,
+    )
+
+
 class StandardResolver(Protocol):
     """Resolve exactly one applicable standard without evaluating a sample."""
 
@@ -80,6 +98,46 @@ def select_standard(
             f"no enabled standard for area={area_id!r}, "
             f"operation_type={operation_type!r}, timestamp={timestamp.isoformat()}"
         )
+
+    # A source snapshot intentionally contains historical and current
+    # revisions together.  Collapse each logical chain before applying normal
+    # resolver precedence; otherwise two valid overlapping revisions would tie
+    # and look like an ambiguous configuration.  The latest effective
+    # revision is the successor at a given timestamp.  Equal starts remain an
+    # error because there is no deterministic supersession order.
+    by_logical_id: dict[str, list[EnvironmentStandard]] = {}
+    for standard in candidates:
+        by_logical_id.setdefault(standard.standard_id, []).append(standard)
+
+    collapsed: list[EnvironmentStandard] = []
+    for logical_id, revisions in by_logical_id.items():
+        selector_keys = {logical_selector_key(revision) for revision in revisions}
+        if len(selector_keys) != 1:
+            identities = ", ".join(
+                f"{revision.standard_id}/{revision.revision}"
+                for revision in revisions
+            )
+            raise StandardConfigurationConflictError(
+                "logical standard has incompatible active revision selectors: "
+                + identities
+            )
+        latest_start = max(revision.effective_from for revision in revisions)
+        latest = [
+            revision
+            for revision in revisions
+            if revision.effective_from == latest_start
+        ]
+        if len(latest) != 1:
+            identities = ", ".join(
+                f"{revision.standard_id}/{revision.revision}"
+                for revision in latest
+            )
+            raise StandardConfigurationConflictError(
+                "logical standard revisions have the same effective_from: "
+                + identities
+            )
+        collapsed.append(latest[0])
+    candidates = collapsed
 
     def precedence(standard: EnvironmentStandard) -> tuple[int, int, int]:
         device_exact = int(

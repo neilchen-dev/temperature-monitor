@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from domain.standard_resolver import (
@@ -25,15 +26,17 @@ class StandardResolverTests(unittest.TestCase):
         self,
         standard_id: str,
         *,
+        revision: str = "Rev.A",
         device_id: str | None = None,
         operation_type: str | None = None,
         priority: int = 0,
         enabled: bool = True,
+        effective_from: datetime | None = None,
         effective_to: datetime | None = None,
     ) -> EnvironmentStandard:
         return EnvironmentStandard(
             standard_id=standard_id,
-            revision="Rev.A",
+            revision=revision,
             area="仓库",
             device_id=device_id,
             operation_type=operation_type,
@@ -41,7 +44,7 @@ class StandardResolverTests(unittest.TestCase):
             temperature_max=26.0,
             humidity_min=40.0,
             humidity_max=60.0,
-            effective_from=self.start,
+            effective_from=effective_from or self.start,
             effective_to=effective_to,
             source_document="SOP-001",
             clause="5.2.3",
@@ -117,6 +120,80 @@ class StandardResolverTests(unittest.TestCase):
             timestamp=self.timestamp,
         )
         self.assertEqual(selected.standard_id, "HIGH")
+
+    def test_latest_revision_supersedes_older_revision_with_open_intervals(self) -> None:
+        old = self._standard("ENV-TH-02", device_id="TH-02")
+        new = replace(
+            old,
+            revision="Rev.B",
+            humidity_max=50.0,
+            effective_from=self.timestamp - timedelta(days=1),
+        )
+        resolver = StaticStandardResolver((old, new))
+
+        before = resolver.resolve(
+            area_id="仓库",
+            operation_type=None,
+            device_id="TH-02",
+            timestamp=self.timestamp - timedelta(days=2),
+        )
+        after = resolver.resolve(
+            area_id="仓库",
+            operation_type=None,
+            device_id="TH-02",
+            timestamp=self.timestamp,
+        )
+
+        self.assertEqual(before.revision, "Rev.A")
+        self.assertEqual(after.revision, "Rev.B")
+        self.assertEqual(after.humidity_max, 50.0)
+
+    def test_same_logical_revision_start_is_still_ambiguous(self) -> None:
+        old = self._standard("ENV-TH-02", device_id="TH-02")
+        new = replace(old, revision="Rev.B", humidity_max=50.0)
+        with self.assertRaises(StandardConfigurationConflictError):
+            StaticStandardResolver((old, new)).resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.timestamp,
+            )
+
+    def test_revision_chains_are_isolated_per_device(self) -> None:
+        th02_old = self._standard("ENV-TH-02", device_id="TH-02")
+        th02_new = replace(
+            th02_old,
+            revision="Rev.B",
+            effective_from=self.timestamp - timedelta(days=1),
+        )
+        th03_old = self._standard("ENV-TH-03", device_id="TH-03")
+        th03_new = replace(
+            th03_old,
+            revision="Rev.B",
+            effective_from=self.timestamp - timedelta(days=1),
+        )
+        resolver = StaticStandardResolver(
+            (th02_old, th02_new, th03_old, th03_new)
+        )
+
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-02",
+                timestamp=self.timestamp,
+            ).standard_id,
+            "ENV-TH-02",
+        )
+        self.assertEqual(
+            resolver.resolve(
+                area_id="仓库",
+                operation_type=None,
+                device_id="TH-03",
+                timestamp=self.timestamp,
+            ).standard_id,
+            "ENV-TH-03",
+        )
 
     def test_default_standard_is_used_when_exact_operation_is_absent(self) -> None:
         resolver = StaticStandardResolver(
