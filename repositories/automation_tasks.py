@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from domain.models import AutomationTask, AutomationTaskStatus
 from repositories.sqlite import (
@@ -379,7 +379,10 @@ class SQLiteAutomationTaskRepository:
         }
 
     def active_readiness(
-        self, *, now: datetime | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        non_blocking_task_types: Iterable[str] = (),
     ) -> dict[str, Any]:
         """Return whether task state is safe for a new Active Canary.
 
@@ -388,36 +391,179 @@ class SQLiteAutomationTaskRepository:
         lineage, stale unfinished work, and unisolated external-effect work
         remain blockers.
         """
-        summary = self.health_summary(now=now)
-        blockers: list[str] = []
-        if summary["current_failed_tasks"]:
-            blockers.append(
-                f"current_failed_tasks={summary['current_failed_tasks']}"
+        current_time = now or datetime.now().astimezone()
+        summary = self.health_summary(now=current_time)
+        non_blocking = frozenset(
+            str(task_type).strip()
+            for task_type in non_blocking_task_types
+            if str(task_type).strip()
+        )
+        ignored_current_failed = sum(
+            count
+            for task_type, count in summary["current_failed_by_type"].items()
+            if task_type in non_blocking
+        )
+        readiness_current_failed = max(
+            summary["current_failed_tasks"] - ignored_current_failed,
+            0,
+        )
+        readiness_current_epoch_failed = summary["current_epoch_failed_tasks"]
+        ignored_current_epoch_failed = 0
+        if non_blocking and summary["active_epoch"]:
+            placeholders = ",".join("?" for _ in non_blocking)
+            ignored_current_epoch_failed = self.connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM automation_tasks
+                WHERE status = 'FAILED'
+                  AND active_epoch = ?
+                  AND task_type IN ({placeholders})
+                """,
+                (summary["active_epoch"], *sorted(non_blocking)),
+            ).fetchone()[0] or 0
+            readiness_current_epoch_failed = max(
+                readiness_current_epoch_failed - int(ignored_current_epoch_failed),
+                0,
             )
-        if summary["current_epoch_failed_tasks"]:
+
+        readiness_retryable_failed = summary["retryable_failed_tasks"]
+        if non_blocking and summary["current_failed_tasks"]:
+            boundary = summary.get("current_boundary_at")
+            if boundary is not None:
+                retry_rows = self.connection.execute(
+                    """
+                    SELECT task_type, payload_json
+                    FROM automation_tasks
+                    WHERE status = 'FAILED' AND created_at >= ?
+                    """,
+                    (boundary,),
+                ).fetchall()
+                readiness_retryable_failed = sum(
+                    1
+                    for row in retry_rows
+                    if row["task_type"] not in non_blocking
+                    and self._payload_has_retry_marker(row["payload_json"])
+                )
+
+        readiness_stale_tasks = summary["stale_tasks"]
+        readiness_historical_pending_external = summary[
+            "historical_pending_external_effects"
+        ]
+        readiness_unisolated_external = summary["unisolated_external_effects"]
+        if non_blocking:
+            placeholders = ",".join("?" for _ in non_blocking)
+            stale_cutoff = current_time - timedelta(minutes=5)
+            stale_rows = self.connection.execute(
+                """
+                SELECT task_type, status, due_at, lease_until
+                FROM automation_tasks
+                WHERE status IN ('PENDING', 'RUNNING')
+                """
+            ).fetchall()
+            ignored_stale = 0
+            for row in stale_rows:
+                if row["task_type"] not in non_blocking:
+                    continue
+                if row["status"] == "RUNNING":
+                    lease_until = _datetime_value(row["lease_until"])
+                    if lease_until is not None and _at_or_before(
+                        lease_until, current_time
+                    ):
+                        ignored_stale += 1
+                else:
+                    due_at = _datetime_value(row["due_at"])
+                    if due_at is not None and _at_or_before(due_at, stale_cutoff):
+                        ignored_stale += 1
+            readiness_stale_tasks = max(summary["stale_tasks"] - ignored_stale, 0)
+
+            external_params: tuple[Any, ...]
+            historical_query = f"""
+                SELECT COUNT(*)
+                FROM automation_tasks
+                WHERE task_type IN ({placeholders})
+                  AND status IN ('PENDING', 'RUNNING')
+            """
+            activation = self.runtime_context()
+            if (
+                activation.mode == "active"
+                and activation.active_epoch
+                and activation.active_cutover_at is not None
+            ):
+                historical_query += """
+                  AND NOT (
+                      created_mode = 'active'
+                      AND active_epoch = ?
+                      AND created_at >= ?
+                  )
+                """
+                external_params = (
+                    *sorted(non_blocking),
+                    activation.active_epoch,
+                    _datetime_text(activation.active_cutover_at),
+                )
+            else:
+                external_params = tuple(sorted(non_blocking))
+            ignored_historical_pending = int(
+                self.connection.execute(historical_query, external_params).fetchone()[0]
+                or 0
+            )
+            readiness_historical_pending_external = max(
+                summary["historical_pending_external_effects"]
+                - ignored_historical_pending,
+                0,
+            )
+            readiness_unisolated_external = max(
+                summary["unisolated_external_effects"]
+                - ignored_historical_pending,
+                0,
+            )
+
+        summary["readiness_current_failed_tasks"] = readiness_current_failed
+        summary["readiness_current_epoch_failed_tasks"] = (
+            readiness_current_epoch_failed
+        )
+        summary["readiness_retryable_failed_tasks"] = readiness_retryable_failed
+        summary["readiness_stale_tasks"] = readiness_stale_tasks
+        summary["readiness_historical_pending_external_effects"] = (
+            readiness_historical_pending_external
+        )
+        summary["readiness_unisolated_external_effects"] = (
+            readiness_unisolated_external
+        )
+        summary["readiness_ignored_task_types"] = sorted(non_blocking)
+        summary["readiness_ignored_current_failed_tasks"] = ignored_current_failed
+        summary["readiness_ignored_current_epoch_failed_tasks"] = int(
+            ignored_current_epoch_failed or 0
+        )
+        blockers: list[str] = []
+        if readiness_current_failed:
+            blockers.append(
+                f"current_failed_tasks={readiness_current_failed}"
+            )
+        if readiness_current_epoch_failed:
             blockers.append(
                 "current_epoch_failed_tasks="
-                f"{summary['current_epoch_failed_tasks']}"
+                f"{readiness_current_epoch_failed}"
             )
-        if summary["retryable_failed_tasks"]:
+        if readiness_retryable_failed:
             blockers.append(
-                f"retryable_failed_tasks={summary['retryable_failed_tasks']}"
+                f"retryable_failed_tasks={readiness_retryable_failed}"
             )
         if summary["claimable_failed_tasks"]:
             blockers.append(
                 f"claimable_failed_tasks={summary['claimable_failed_tasks']}"
             )
-        if summary["stale_tasks"]:
-            blockers.append(f"stale_tasks={summary['stale_tasks']}")
-        if summary["historical_pending_external_effects"]:
+        if readiness_stale_tasks:
+            blockers.append(f"stale_tasks={readiness_stale_tasks}")
+        if readiness_historical_pending_external:
             blockers.append(
                 "historical_pending_external_effects="
-                f"{summary['historical_pending_external_effects']}"
+                f"{readiness_historical_pending_external}"
             )
-        if summary["unisolated_external_effects"]:
+        if readiness_unisolated_external:
             blockers.append(
                 "unisolated_external_effects="
-                f"{summary['unisolated_external_effects']}"
+                f"{readiness_unisolated_external}"
             )
         summary["active_readiness"] = not blockers
         summary["blocker_reasons"] = blockers

@@ -129,6 +129,20 @@ def _active_write_allowed(mode: str) -> bool:
     )
 
 
+def _active_readiness_non_blocking_task_types() -> tuple[str, ...]:
+    """Exclude independently gated projections from the formal Active gate.
+
+    Device-status projection can remain in read-only/audit mode while the
+    formal monitoring runtime is Active.  Its task failures are still exposed
+    by the raw task-health counters and by the projection status, but they
+    must not make the alarm/operation runtime unavailable before the scheduler
+    gets a chance to reconcile them.
+    """
+    if not config.FEISHU_DEVICE_STATUS_PROJECTION_ENABLED:
+        return ("PROJECT_DEVICE_STATUS",)
+    return ()
+
+
 def _active_action_enabled(action: Any) -> bool:
     """Apply the independent message switch after the common Active gate."""
     action_type = str(getattr(getattr(action, "action_type", None), "value", ""))
@@ -163,7 +177,9 @@ def active_block_reason(
         repository = getattr(_last_components, "task_repository", None)
     if repository is not None:
         try:
-            task_health = repository.active_readiness()
+            task_health = repository.active_readiness(
+                non_blocking_task_types=_active_readiness_non_blocking_task_types()
+            )
         except Exception:  # noqa: BLE001 - a broken health gate fails closed
             task_health = {
                 "active_readiness": False,
@@ -213,7 +229,9 @@ def active_canary_status() -> dict[str, Any]:
         try:
             runtime_context = _last_components.task_repository.runtime_context()
             live_readiness = _last_components.standards_readiness()
-            task_health = _last_components.task_repository.active_readiness()
+            task_health = _last_components.task_repository.active_readiness(
+                non_blocking_task_types=_active_readiness_non_blocking_task_types()
+            )
             readiness.update(
                 {
                     key: live_readiness[key]
@@ -546,7 +564,9 @@ def build_runtime(
         action_enabled_provider=_active_action_enabled,
         standards_ready_provider=lambda: (
             standard_repository.standards_ready(expected_device_ids=devices.keys())
-            and task_repository.active_readiness()["active_readiness"]
+            and task_repository.active_readiness(
+                non_blocking_task_types=_active_readiness_non_blocking_task_types()
+            )["active_readiness"]
         ),
         active_epoch_provider=lambda: task_repository.runtime_context().active_epoch,
         active_cutover_at_provider=lambda: task_repository.runtime_context().active_cutover_at,

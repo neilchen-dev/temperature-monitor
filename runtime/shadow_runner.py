@@ -477,7 +477,12 @@ class ShadowRuntime:
             runtime_context = getattr(self.task_repository, "runtime_context", None)
             activation = runtime_context() if callable(runtime_context) else None
             task_health = self.task_repository.active_readiness(
-                now=self.now_provider()
+                now=self.now_provider(),
+                non_blocking_task_types=(
+                    ("PROJECT_DEVICE_STATUS",)
+                    if not config.FEISHU_DEVICE_STATUS_PROJECTION_ENABLED
+                    else ()
+                ),
             )
             status = RuntimeStatus(
                 mode=self.mode,
