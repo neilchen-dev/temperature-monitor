@@ -464,6 +464,162 @@ class FeishuOperationRecordWriter:
 
 
 @dataclass(frozen=True)
+class FeishuDeviceStatusWriteFieldMap:
+    """Writable fields for the device temperature/humidity status board."""
+
+    device_id: str = "设备编号"
+    temperature_min: str = "当前适用温度下限"
+    temperature_max: str = "当前适用温度上限"
+    humidity_min: str = "当前适用湿度下限"
+    humidity_max: str = "当前适用湿度上限"
+    control_type: str = "控制类型"
+    operation_state: str = "当前作业状态"
+    operation_type: str = "当前工艺"
+    default_owner: str = "默认异常责任人"
+    alarm_status: str = "警报状态"
+    operation_started_at: str = "作业开始时间"
+
+
+class FeishuDeviceStatusWriter:
+    """Read and update exactly one device row in the status board.
+
+    Record lookup is deliberately kept at the Feishu adapter boundary.  The
+    projector can therefore persist desired state and queue a task without
+    doing network I/O in the monitor/operation transaction.
+    """
+
+    def __init__(
+        self,
+        *,
+        writer: FeishuRecordWriter,
+        source: Any,
+        device_table_id: str,
+        device_id_field: str = "设备编号",
+        configured_record_map: Mapping[str, Mapping[str, str]] | None = None,
+        fields: FeishuDeviceStatusWriteFieldMap | None = None,
+    ) -> None:
+        self.writer = writer
+        self.source = source
+        self.device_table_id = _required_id(device_table_id, "device_table_id")
+        self.device_id_field = _required_id(device_id_field, "device_id_field")
+        self.configured_record_map = configured_record_map or {}
+        self.fields = fields or FeishuDeviceStatusWriteFieldMap(
+            device_id=self.device_id_field,
+        )
+        self._schema_status: dict[str, Any] = {
+            "status": "not_checked",
+            "missing_fields": [],
+        }
+
+    def validate_schema(self) -> dict[str, Any]:
+        """Validate the configured device-status fields before any write.
+
+        The source exposes field names as a read-only metadata operation.  A
+        missing field is a configuration error, not a projection retry case.
+        The writer still keeps this check at the adapter boundary so runtime
+        code never needs to know Feishu table schema details.
+        """
+        if self._schema_status.get("status") == "valid":
+            return dict(self._schema_status)
+        read_field_names = getattr(self.source, "read_field_names", None)
+        if not callable(read_field_names):
+            self._schema_status = {
+                "status": "unavailable",
+                "missing_fields": [],
+            }
+            return dict(self._schema_status)
+        try:
+            actual = {
+                str(name).strip()
+                for name in read_field_names(self.device_table_id)
+                if str(name).strip()
+            }
+        except Exception as exc:
+            self._schema_status = {
+                "status": "error",
+                "missing_fields": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            raise FeishuWriteError(
+                f"unable to validate device status table schema: {exc}"
+            ) from exc
+        required = {
+            self.device_id_field,
+            self.fields.temperature_min,
+            self.fields.temperature_max,
+            self.fields.humidity_min,
+            self.fields.humidity_max,
+            self.fields.control_type,
+            self.fields.operation_state,
+            self.fields.operation_type,
+            self.fields.default_owner,
+            self.fields.alarm_status,
+            self.fields.operation_started_at,
+        }
+        missing = sorted(field for field in required if field not in actual)
+        self._schema_status = {
+            "status": "valid" if not missing else "invalid",
+            "missing_fields": missing,
+            "field_count": len(actual),
+        }
+        if missing:
+            raise FeishuWriteError(
+                "device status table is missing configured fields: "
+                + ", ".join(missing)
+            )
+        return dict(self._schema_status)
+
+    def schema_status(self) -> dict[str, Any]:
+        """Return the last schema-check result without triggering network I/O."""
+        return dict(self._schema_status)
+
+    def read_device_record(self, device_id: str) -> FeishuRawRecord:
+        normalized = _device_id(device_id)
+        records = tuple(self.source.read_records(self.device_table_id))
+        configured = self.configured_record_map.get(normalized)
+        configured_id = (
+            str(configured.get("record_id", "")).strip()
+            if isinstance(configured, Mapping)
+            else ""
+        )
+        if configured_id:
+            for record in records:
+                if record.record_id != configured_id:
+                    continue
+                actual = _field_text(record.fields.get(self.device_id_field)).upper()
+                if actual and actual != normalized:
+                    raise FeishuWriteError(
+                        f"DEVICE_RECORD_MAP maps {normalized} to {configured_id}, "
+                        f"but the row belongs to {actual}"
+                    )
+                return record
+            raise FeishuWriteError(
+                f"configured Feishu device record not found: {normalized}/{configured_id}"
+            )
+
+        matches = tuple(
+            record
+            for record in records
+            if _field_text(record.fields.get(self.device_id_field)).upper() == normalized
+        )
+        if len(matches) != 1:
+            raise FeishuWriteError(
+                f"Feishu device status board expected one record for {normalized}, "
+                f"found {len(matches)}"
+            )
+        return matches[0]
+
+    def update(self, *, record_id: str, fields: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not fields:
+            return {"record_id": _required_id(record_id, "record_id"), "fields": {}}
+        return self.writer.update(
+            self.device_table_id,
+            _required_id(record_id, "record_id"),
+            dict(fields),
+        )
+
+
+@dataclass(frozen=True)
 class FeishuEventWriteFieldMap:
     """Writable fields in ``环境异常事件表``.
 

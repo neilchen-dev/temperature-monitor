@@ -32,6 +32,8 @@ from integrations.feishu_writers import (
     FeishuEnvironmentEventWriter,
     FeishuInspectionRecordWriter,
     FeishuOperationRecordWriter,
+    FeishuDeviceStatusWriteFieldMap,
+    FeishuDeviceStatusWriter,
 )
 from integrations.feishu_notifications import FeishuNotificationWriter
 from services.feishu import FeishuIMClient
@@ -45,8 +47,10 @@ from repositories import (
     SQLiteStandardRepository,
     SQLiteStandardResolver,
     SQLitePrewarningEffectRepository,
+    SQLiteDeviceStatusProjectionRepository,
     connect,
 )
+from services.device_status_projection import DeviceStatusProjector
 from repositories.sqlite import verify_runtime_schema
 from scheduler.worker import TaskScheduler
 
@@ -88,6 +92,8 @@ class RuntimeComponents:
     standard_repository: SQLiteStandardRepository
     operation_repository: SQLiteOperationRepository
     latest_sample_repository: SQLiteLatestSampleRepository
+    device_status_projection_repository: SQLiteDeviceStatusProjectionRepository
+    device_status_writer: FeishuDeviceStatusWriter
     operation_writer: FeishuOperationRecordWriter
     event_writer: FeishuEnvironmentEventWriter
     inspection_writer: FeishuInspectionRecordWriter
@@ -366,6 +372,9 @@ def build_runtime(
     run_repository = SQLiteAutomationRunRepository(runtime_connection)
     alarm_state_repository = SQLiteAlarmStateRepository(runtime_connection)
     prewarning_effect_repository = SQLitePrewarningEffectRepository(runtime_connection)
+    device_status_projection_repository = SQLiteDeviceStatusProjectionRepository(
+        runtime_connection
+    )
     # 半旧 schema 拒绝启动：各仓储构造时会做增量迁移/建表，此处校验迁移后
     # 仍缺关键列时显式报错，绝不静默运行在残缺 schema 上（旧采集链路不受
     # 影响——build_runtime 的调用方会捕获并记录，legacy 继续可用）。
@@ -402,6 +411,26 @@ def build_runtime(
         ),
     )
     record_writer = FeishuBitableRecordWriter()
+    device_status_writer = FeishuDeviceStatusWriter(
+        writer=record_writer,
+        source=source,
+        device_table_id=device_table_id,
+        device_id_field=config.DEVICE_ID_FIELD,
+        configured_record_map=config.DEVICES,
+        fields=FeishuDeviceStatusWriteFieldMap(
+            device_id=config.DEVICE_ID_FIELD,
+            temperature_min=config.FEISHU_DEVICE_STATUS_TEMPERATURE_MIN_FIELD,
+            temperature_max=config.FEISHU_DEVICE_STATUS_TEMPERATURE_MAX_FIELD,
+            humidity_min=config.FEISHU_DEVICE_STATUS_HUMIDITY_MIN_FIELD,
+            humidity_max=config.FEISHU_DEVICE_STATUS_HUMIDITY_MAX_FIELD,
+            control_type=config.FEISHU_DEVICE_STATUS_CONTROL_TYPE_FIELD,
+            operation_state=config.FEISHU_DEVICE_STATUS_OPERATION_STATE_FIELD,
+            operation_type=config.FEISHU_DEVICE_STATUS_OPERATION_TYPE_FIELD,
+            default_owner=config.FEISHU_DEVICE_STATUS_OWNER_FIELD,
+            alarm_status=config.FEISHU_DEVICE_STATUS_ALARM_FIELD,
+            operation_started_at=config.FEISHU_DEVICE_STATUS_STARTED_AT_FIELD,
+        ),
+    )
     operation_writer = FeishuOperationRecordWriter(
         writer=record_writer,
         operation_table_id=operation_table_id,
@@ -534,9 +563,10 @@ def build_runtime(
                 ",".join(config.ACTIVE_DEVICE_IDS) or "none",
             )
     operation_state_provider = operation_repository
+    standard_resolver = SQLiteStandardResolver(standard_repository)
     monitor_service = MonitorApplicationService(
         operation_state_provider=operation_state_provider,
-        standard_resolver=SQLiteStandardResolver(standard_repository),
+        standard_resolver=standard_resolver,
         alarm_state_repository=alarm_state_repository,
         alarm_state_machine=AlarmStateMachine(),
         action_mapper=ApplicationActionMapper(emit_notifications=True),
@@ -545,6 +575,21 @@ def build_runtime(
         task_repository=task_repository,
         event_repository=event_repository,
         latest_sample_repository=latest_sample_repository,
+    )
+    device_status_projector = DeviceStatusProjector(
+        devices=devices,
+        standard_resolver=standard_resolver,
+        operation_state_provider=operation_state_provider,
+        alarm_state_repository=alarm_state_repository,
+        latest_sample_repository=latest_sample_repository,
+        task_repository=task_repository,
+        state_repository=device_status_projection_repository,
+        writer=device_status_writer,
+        active_device_ids=config.ACTIVE_DEVICE_IDS,
+        standards_ready_provider=lambda: standard_repository.standards_ready(
+            expected_device_ids=devices.keys()
+        ),
+        now_provider=now_provider,
     )
     shadow_comparison = ShadowComparisonService(
         observation_adapter=observation_adapter,
@@ -589,6 +634,7 @@ def build_runtime(
             # /temperature 可靠性：飞书投影失败后的 durable 重试任务
             # （services.projection 状态机 + shadow_runner 扫描器生成）。
             "FEISHU_PROJECTION": lambda task: runtime_holder["runtime"].handle_feishu_projection(task),
+            "PROJECT_DEVICE_STATUS": lambda task: runtime_holder["runtime"].handle_device_status_projection(task),
         },
         now_provider=now_provider,
     )
@@ -613,6 +659,7 @@ def build_runtime(
         task_repository=task_repository,
         event_repository=event_repository,
         latest_sample_repository=latest_sample_repository,
+        device_status_projector=device_status_projector,
         standard_repository=standard_repository,
         connection=runtime_connection,
         worker_id=worker_id,
@@ -632,6 +679,8 @@ def build_runtime(
         standard_repository=standard_repository,
         operation_repository=operation_repository,
         latest_sample_repository=latest_sample_repository,
+        device_status_projection_repository=device_status_projection_repository,
+        device_status_writer=device_status_writer,
         operation_writer=operation_writer,
         event_writer=event_writer,
         inspection_writer=inspection_writer,

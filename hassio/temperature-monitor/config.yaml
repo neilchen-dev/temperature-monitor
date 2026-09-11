@@ -44,6 +44,19 @@ options:
   feishu_notify_receive_id_type: open_id
   feishu_event_table_url: ""
   feishu_alarm_form_url: ""
+  feishu_device_status_projection_enabled: false
+  feishu_device_status_max_retries: 5
+  feishu_device_status_backoff_seconds: 30
+  feishu_device_status_temperature_min_field: 当前适用温度下限
+  feishu_device_status_temperature_max_field: 当前适用温度上限
+  feishu_device_status_humidity_min_field: 当前适用湿度下限
+  feishu_device_status_humidity_max_field: 当前适用湿度上限
+  feishu_device_status_control_type_field: 控制类型
+  feishu_device_status_operation_state_field: 当前作业状态
+  feishu_device_status_operation_type_field: 当前工艺
+  feishu_device_status_owner_field: 默认异常责任人
+  feishu_device_status_alarm_field: 警报状态
+  feishu_device_status_started_at_field: 作业开始时间
   feishu_notify_max_retries: 5
   feishu_notify_backoff_seconds: 30
   feishu_notify_max_backoff_seconds: 600
@@ -115,6 +128,19 @@ schema:
   feishu_notify_receive_id_type: list(open_id|user_id|union_id|email|chat_id)
   feishu_event_table_url: str
   feishu_alarm_form_url: str
+  feishu_device_status_projection_enabled: bool
+  feishu_device_status_max_retries: int(1,20)
+  feishu_device_status_backoff_seconds: int(1,3600)
+  feishu_device_status_temperature_min_field: str
+  feishu_device_status_temperature_max_field: str
+  feishu_device_status_humidity_min_field: str
+  feishu_device_status_humidity_max_field: str
+  feishu_device_status_control_type_field: str
+  feishu_device_status_operation_state_field: str
+  feishu_device_status_operation_type_field: str
+  feishu_device_status_owner_field: str
+  feishu_device_status_alarm_field: str
+  feishu_device_status_started_at_field: str
   feishu_notify_max_retries: int(1,20)
   feishu_notify_backoff_seconds: int(1,3600)
   feishu_notify_max_backoff_seconds: int(1,86400)

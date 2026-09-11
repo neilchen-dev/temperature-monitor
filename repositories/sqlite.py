@@ -196,6 +196,12 @@ _EXPECTED_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
         "id", "device_id", "source_record_id", "source_created_at",
         "observed_at", "action", "accepted", "reason", "created_at",
     ),
+    "device_status_projection": (
+        "device_id", "record_id", "desired_hash", "desired_fields_json",
+        "observed_fields_json", "changed_fields_json", "status", "pending", "failed",
+        "last_success_at", "last_attempt_at", "last_error", "last_task_id",
+        "updated_at",
+    ),
     "automation_runtime_state": (
         "singleton_id", "current_mode", "active_epoch", "active_cutover_at",
         "updated_at",

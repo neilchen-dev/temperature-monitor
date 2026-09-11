@@ -93,6 +93,19 @@ def _load_hassio_options() -> None:
         "feishu_notify_backoff_seconds": "FEISHU_NOTIFY_BACKOFF_SECONDS",
         "feishu_notify_max_backoff_seconds": "FEISHU_NOTIFY_MAX_BACKOFF_SECONDS",
         "feishu_notify_attempt_timeout_seconds": "FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS",
+        "feishu_device_status_max_retries": "FEISHU_DEVICE_STATUS_MAX_RETRIES",
+        "feishu_device_status_backoff_seconds": "FEISHU_DEVICE_STATUS_BACKOFF_SECONDS",
+        "feishu_device_status_projection_enabled": "FEISHU_DEVICE_STATUS_PROJECTION_ENABLED",
+        "feishu_device_status_temperature_min_field": "FEISHU_DEVICE_STATUS_TEMPERATURE_MIN_FIELD",
+        "feishu_device_status_temperature_max_field": "FEISHU_DEVICE_STATUS_TEMPERATURE_MAX_FIELD",
+        "feishu_device_status_humidity_min_field": "FEISHU_DEVICE_STATUS_HUMIDITY_MIN_FIELD",
+        "feishu_device_status_humidity_max_field": "FEISHU_DEVICE_STATUS_HUMIDITY_MAX_FIELD",
+        "feishu_device_status_control_type_field": "FEISHU_DEVICE_STATUS_CONTROL_TYPE_FIELD",
+        "feishu_device_status_operation_state_field": "FEISHU_DEVICE_STATUS_OPERATION_STATE_FIELD",
+        "feishu_device_status_operation_type_field": "FEISHU_DEVICE_STATUS_OPERATION_TYPE_FIELD",
+        "feishu_device_status_owner_field": "FEISHU_DEVICE_STATUS_OWNER_FIELD",
+        "feishu_device_status_alarm_field": "FEISHU_DEVICE_STATUS_ALARM_FIELD",
+        "feishu_device_status_started_at_field": "FEISHU_DEVICE_STATUS_STARTED_AT_FIELD",
     }
     for option_name, environment_name in option_names.items():
         value = options.get(option_name)
@@ -555,6 +568,49 @@ FEISHU_EVENT_DEVICE_FIELD = os.getenv(
 FEISHU_EVENT_STATUS_FIELD = os.getenv(
     "FEISHU_EVENT_STATUS_FIELD", "处理状态"
 ).strip()
+
+# Device status-board projection fields.  These are explicit configuration
+# points so a Base schema change cannot silently redirect writes to a similar
+# field.  The defaults match the confirmed ``设备温湿度记录`` table.
+FEISHU_DEVICE_STATUS_PROJECTION_ENABLED = _get_bool(
+    "FEISHU_DEVICE_STATUS_PROJECTION_ENABLED", False
+)
+FEISHU_DEVICE_STATUS_TEMPERATURE_MIN_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_TEMPERATURE_MIN_FIELD", "当前适用温度下限"
+).strip()
+FEISHU_DEVICE_STATUS_TEMPERATURE_MAX_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_TEMPERATURE_MAX_FIELD", "当前适用温度上限"
+).strip()
+FEISHU_DEVICE_STATUS_HUMIDITY_MIN_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_HUMIDITY_MIN_FIELD", "当前适用湿度下限"
+).strip()
+FEISHU_DEVICE_STATUS_HUMIDITY_MAX_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_HUMIDITY_MAX_FIELD", "当前适用湿度上限"
+).strip()
+FEISHU_DEVICE_STATUS_CONTROL_TYPE_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_CONTROL_TYPE_FIELD", "控制类型"
+).strip()
+FEISHU_DEVICE_STATUS_OPERATION_STATE_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_OPERATION_STATE_FIELD", "当前作业状态"
+).strip()
+FEISHU_DEVICE_STATUS_OPERATION_TYPE_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_OPERATION_TYPE_FIELD", "当前工艺"
+).strip()
+FEISHU_DEVICE_STATUS_OWNER_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_OWNER_FIELD", "默认异常责任人"
+).strip()
+FEISHU_DEVICE_STATUS_ALARM_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_ALARM_FIELD", "警报状态"
+).strip()
+FEISHU_DEVICE_STATUS_STARTED_AT_FIELD = os.getenv(
+    "FEISHU_DEVICE_STATUS_STARTED_AT_FIELD", "作业开始时间"
+).strip()
+FEISHU_DEVICE_STATUS_MAX_RETRIES = max(
+    1, _get_int("FEISHU_DEVICE_STATUS_MAX_RETRIES", 5)
+)
+FEISHU_DEVICE_STATUS_BACKOFF_SECONDS = max(
+    1.0, _get_float("FEISHU_DEVICE_STATUS_BACKOFF_SECONDS", 30.0)
+)
 
 
 def _get_shadow_contexts() -> dict[str, dict[str, str]]:

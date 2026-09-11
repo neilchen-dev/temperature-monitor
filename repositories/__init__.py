@@ -17,6 +17,7 @@ from .runtime_state import (
     SQLiteLatestSampleRepository,
     SQLiteOperationRepository,
     SQLitePrewarningEffectRepository,
+    SQLiteDeviceStatusProjectionRepository,
 )
 from .sqlite import connect
 
@@ -32,6 +33,7 @@ __all__ = [
     "SQLiteLatestSampleRepository",
     "SQLiteOperationRepository",
     "SQLitePrewarningEffectRepository",
+    "SQLiteDeviceStatusProjectionRepository",
     "TaskStateError",
     "connect",
 ]

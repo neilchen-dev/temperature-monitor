@@ -141,6 +141,7 @@ class ShadowRuntime:
         standard_sync_interval: float,
         now_provider: Callable[[], datetime] | None = None,
         shutdown_timeout: float = 15.0,
+        device_status_projector: Any | None = None,
     ) -> None:
         self.mode = mode
         self.available = available
@@ -164,6 +165,7 @@ class ShadowRuntime:
         self.event_repository = event_repository
         self.latest_sample_repository = latest_sample_repository
         self.standard_repository = standard_repository
+        self.device_status_projector = device_status_projector
         self.connection = connection
         self.worker_id = worker_id
         self.operation_sync_interval = operation_sync_interval
@@ -247,6 +249,7 @@ class ShadowRuntime:
             now = self.now_provider()
             with self._execution_lock:
                 self._ensure_periodic_tasks(now=now, immediate=True)
+                self._reconcile_device_status(now=now)
             self._scheduler_thread = threading.Thread(
                 target=self._run_scheduler,
                 args=(self._stop_event,),
@@ -455,6 +458,11 @@ class ShadowRuntime:
                 control_type_consistency=result.monitor_result.control_type_consistency,
             )
             self._schedule_shadow_compare(expected, sample_time=normalized_sample.sample_time)
+            self._request_device_status_projection(
+                device_id,
+                now=self.now_provider(),
+                trigger="monitor_state_change",
+            )
             self._last_processed_sample_time = normalized_sample.sample_time
             return result
 
@@ -513,6 +521,17 @@ class ShadowRuntime:
             status["automation_tasks"] = task_health
             status["prewarning_devices"] = self.monitor_service.prewarning_status()
             status["prewarning_count"] = len(status["prewarning_devices"])
+            status["device_status_projection"] = (
+                self.device_status_projector.summary()
+                if self.device_status_projector is not None
+                else {
+                    "pending": 0,
+                    "failed": 0,
+                    "last_success_at": None,
+                    "last_error": None,
+                    "mismatched_devices": [],
+                }
+            )
             operation_stats = self.operation_adapter.last_fetch_stats.as_dict()
             operation_stats["accepted"] = self._operation_sync_accepted
             operation_stats["last_sync_at"] = _iso(self._last_operation_sync_time)
@@ -682,6 +701,16 @@ class ShadowRuntime:
             str(task.entity_id), now=self.now_provider()
         )
 
+    def handle_device_status_projection(self, task: Any) -> None:
+        """Run one asynchronous device-status dashboard projection task."""
+        if self.device_status_projector is None:
+            raise RuntimeError("device status projector is not configured")
+        with self._execution_lock:
+            self.device_status_projector.handle_task(
+                task,
+                now=self.now_provider(),
+            )
+
     def handle_shadow_compare(self, task: Any) -> None:
         expected = _expected_from_payload(task.payload["expected"])
         try:
@@ -757,6 +786,7 @@ class ShadowRuntime:
                 )
             else:
                 logger.info("Shadow 标准同步完成 | enabled=%s", self._enabled_standard_count)
+                self._reconcile_device_status(now=sync_time, force=False)
 
     def trigger_standard_sync(self, *, now: datetime | None = None) -> Any:
         """Queue an immediate sync; designed as the future Feishu event hook.
@@ -802,6 +832,10 @@ class ShadowRuntime:
                     stats.outcome,
                 )
                 self._last_operation_sync_time = self.now_provider()
+                self._reconcile_device_status(
+                    now=self._last_operation_sync_time,
+                    force=False,
+                )
             except Exception as exc:
                 self._operation_sync_accepted = 0
                 self._operation_sync_last_error = str(exc)
@@ -1031,6 +1065,46 @@ class ShadowRuntime:
 
         projection.recover_pending_dispatches(now=now)
         projection.ensure_projection_tasks(self.task_repository, now=now)
+
+    def _request_device_status_projection(
+        self,
+        device_id: str,
+        *,
+        now: datetime,
+        force: bool = False,
+        trigger: str,
+    ) -> None:
+        if self.device_status_projector is None:
+            return
+        try:
+            self.device_status_projector.request(
+                device_id,
+                now=now,
+                force=force,
+                trigger=trigger,
+            )
+        except Exception:  # noqa: BLE001 - dashboard projection never blocks the main chain
+            logger.warning(
+                "device status projection task scheduling failed | device=%s | trigger=%s",
+                device_id,
+                trigger,
+                exc_info=True,
+            )
+
+    def _reconcile_device_status(
+        self,
+        *,
+        now: datetime,
+        force: bool = True,
+    ) -> None:
+        """Queue a startup/status reconciliation for every configured device."""
+        for device_id in self.devices:
+            self._request_device_status_projection(
+                device_id,
+                now=now,
+                force=force,
+                trigger="startup_reconcile" if force else "context_change",
+            )
 
 
 def _iso(value: datetime | None) -> str | None:

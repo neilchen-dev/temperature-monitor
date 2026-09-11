@@ -108,6 +108,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("historical_failed_tasks", task_health)
         self.assertIn("current_epoch_failed_tasks", task_health)
         self.assertIn("pending_external_effects", task_health)
+        projection = components.status()["device_status_projection"]
+        self.assertEqual(projection["pending"], 0)
+        self.assertEqual(projection["failed"], 0)
+        self.assertIsNone(projection["last_success_at"])
+        self.assertIsNone(projection["last_error"])
+        self.assertEqual(projection["mismatched_devices"], [])
+        self.assertFalse(projection["enabled"])
+        self.assertEqual(projection["gated_count"], 0)
+        self.assertEqual(projection["planned_count"], 0)
+        self.assertEqual(projection["devices"], [])
+        self.assertEqual(projection["schema"]["status"], "not_checked")
         self.assertFalse(components.runtime.monitor_service.action_executor.mode.value == "active")
         self.assertEqual(
             components.runtime.operation_adapter.fields.source_created_at,

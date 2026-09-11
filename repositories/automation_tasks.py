@@ -60,6 +60,7 @@ _EXTERNAL_EFFECT_TASK_TYPES = frozenset(
         "NOTIFY_RECOVERY",
         "NOTIFY_PREWARNING",
         "NOTIFY_PREWARNING_RECOVERY",
+        "PROJECT_DEVICE_STATUS",
     }
 )
 
@@ -683,6 +684,27 @@ class SQLiteAutomationTaskRepository:
                             f"{dedupe_key}:retry:",
                             (payload or {}).get("local_event_id"),
                             (payload or {}).get("local_event_id"),
+                            AutomationTaskStatus.PENDING.value,
+                            AutomationTaskStatus.RUNNING.value,
+                            AutomationTaskStatus.RUNNING.value,
+                        ),
+                    ).fetchall()
+                elif task_type == "PROJECT_DEVICE_STATUS":
+                    # Projection identity is device + desired-state hash.
+                    # A different desired hash for the same device must not
+                    # be hidden behind an older unfinished projection task;
+                    # the handler will safely no-op superseded tasks.
+                    active_rows = self.connection.execute(
+                        """
+                        SELECT * FROM automation_tasks
+                        WHERE task_type = ? AND dedupe_key = ?
+                          AND status IN (?, ?)
+                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                                 due_at, id
+                        """,
+                        (
+                            task_type,
+                            dedupe_key,
                             AutomationTaskStatus.PENDING.value,
                             AutomationTaskStatus.RUNNING.value,
                             AutomationTaskStatus.RUNNING.value,

@@ -113,6 +113,28 @@ CREATE TABLE IF NOT EXISTS operation_observation_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_operation_audit_device_time
     ON operation_observation_audit(device_id, created_at);
+
+-- Durable state for the device-status dashboard projection.  This is an
+-- additive, Python-owned table; it never replaces or rewrites business
+-- events, samples, standards, or operation history.
+CREATE TABLE IF NOT EXISTS device_status_projection (
+    device_id TEXT PRIMARY KEY,
+    record_id TEXT,
+    desired_hash TEXT,
+    desired_fields_json TEXT NOT NULL DEFAULT '{}',
+    observed_fields_json TEXT NOT NULL DEFAULT '{}',
+    changed_fields_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    pending INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    last_success_at TEXT,
+    last_attempt_at TEXT,
+    last_error TEXT,
+    last_task_id TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_status_projection_status
+    ON device_status_projection(status, pending, failed);
 """
 
 
@@ -661,8 +683,347 @@ class SQLiteOperationRepository:
         )
 
 
+class SQLiteDeviceStatusProjectionRepository:
+    """Persist desired/observed projection state without calling Feishu.
+
+    The desired state is local truth for the asynchronous task.  The
+    observed state is updated only after the remote update has succeeded (or
+    a no-op comparison proved that the remote row already matched).  This
+    makes a worker crash after a successful Feishu PUT safe to replay.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.connection.row_factory = sqlite3.Row
+        self._lock = SQLITE_WRITE_LOCK
+        with self._lock:
+            self.connection.executescript(_SCHEMA)
+            columns = {
+                str(row[1])
+                for row in self.connection.execute(
+                    "PRAGMA table_info(device_status_projection)"
+                )
+            }
+            if "changed_fields_json" not in columns:
+                self.connection.execute(
+                    """
+                    ALTER TABLE device_status_projection
+                    ADD COLUMN changed_fields_json TEXT NOT NULL DEFAULT '[]'
+                    """
+                )
+            self.connection.commit()
+
+    def get(self, device_id: str) -> dict[str, Any] | None:
+        normalized = str(device_id).strip().upper()
+        row = self.connection.execute(
+            "SELECT * FROM device_status_projection WHERE device_id = ?",
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in (
+            "desired_fields_json",
+            "observed_fields_json",
+            "changed_fields_json",
+        ):
+            result[key.removesuffix("_json")] = _json_load(result.pop(key), {})
+        if not isinstance(result["changed_fields"], list):
+            result["changed_fields"] = []
+        result["pending"] = bool(result.get("pending"))
+        result["failed"] = bool(result.get("failed"))
+        return result
+
+    @retry_sqlite_write
+    def save_desired(
+        self,
+        *,
+        device_id: str,
+        record_id: str | None,
+        desired_hash: str,
+        desired_fields: Mapping[str, Any],
+        updated_at: datetime,
+    ) -> bool:
+        """Store desired state and return whether its hash changed."""
+        normalized = str(device_id).strip().upper()
+        existing = self.get(normalized)
+        changed = existing is None or existing.get("desired_hash") != desired_hash
+        payload = json.dumps(
+            dict(desired_fields), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO device_status_projection (
+                    device_id, record_id, desired_hash, desired_fields_json,
+                    observed_fields_json, changed_fields_json, status, pending, failed,
+                    last_success_at, last_attempt_at, last_error, last_task_id,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    record_id = COALESCE(excluded.record_id, device_status_projection.record_id),
+                    desired_hash = excluded.desired_hash,
+                    desired_fields_json = excluded.desired_fields_json,
+                    changed_fields_json = CASE
+                        WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                        THEN '[]' ELSE device_status_projection.changed_fields_json END,
+                    status = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                                  THEN 'PENDING' ELSE device_status_projection.status END,
+                    pending = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                                   THEN 1 ELSE device_status_projection.pending END,
+                    failed = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                                  THEN 0 ELSE device_status_projection.failed END,
+                    last_error = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                                      THEN NULL ELSE device_status_projection.last_error END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized,
+                    record_id,
+                    desired_hash,
+                    payload,
+                    json.dumps({}, ensure_ascii=False),
+                    json.dumps([], ensure_ascii=False),
+                    "PENDING",
+                    1,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    _time(updated_at),
+                ),
+            )
+            self.connection.commit()
+        return changed
+
+    @retry_sqlite_write
+    def mark_pending(
+        self,
+        *,
+        device_id: str,
+        task_id: str,
+        attempted_at: datetime | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE device_status_projection
+                SET status = 'PENDING', pending = 1, failed = 0,
+                    last_task_id = ?, last_attempt_at = COALESCE(?, last_attempt_at),
+                    last_error = ?, updated_at = COALESCE(?, updated_at)
+                WHERE device_id = ?
+                """,
+                (
+                    task_id,
+                    _time(attempted_at) if attempted_at is not None else None,
+                    error,
+                    _time(attempted_at) if attempted_at is not None else None,
+                    str(device_id).strip().upper(),
+                ),
+            )
+            self.connection.commit()
+
+    @retry_sqlite_write
+    def mark_success(
+        self,
+        *,
+        device_id: str,
+        record_id: str,
+        observed_fields: Mapping[str, Any],
+        completed_at: datetime,
+    ) -> None:
+        encoded = json.dumps(
+            dict(observed_fields), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE device_status_projection
+                SET record_id = ?, observed_fields_json = ?, status = 'SUCCEEDED',
+                    changed_fields_json = '[]',
+                    pending = 0, failed = 0, last_success_at = ?,
+                    last_attempt_at = ?, last_error = NULL, updated_at = ?
+                WHERE device_id = ?
+                """,
+                (
+                    record_id,
+                    encoded,
+                    _time(completed_at),
+                    _time(completed_at),
+                    _time(completed_at),
+                    str(device_id).strip().upper(),
+                ),
+            )
+            self.connection.commit()
+
+    @retry_sqlite_write
+    def mark_gated(
+        self,
+        *,
+        device_id: str,
+        record_id: str,
+        observed_fields: Mapping[str, Any],
+        changed_fields: list[str],
+        reconciled_at: datetime,
+        task_id: str,
+    ) -> None:
+        """Persist a read-only reconcile without claiming remote success.
+
+        ``SHADOW_ONLY`` is intentionally distinct from ``SUCCEEDED``: the
+        observed row is recorded for drift visibility, while
+        ``last_success_at`` remains the timestamp of an actual Feishu update
+        (or a confirmed remote no-op when the write gate was enabled).
+        """
+        observed = json.dumps(
+            dict(observed_fields), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        changed = json.dumps(
+            sorted({str(field) for field in changed_fields}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE device_status_projection
+                SET record_id = ?, observed_fields_json = ?, changed_fields_json = ?,
+                    status = 'SHADOW_ONLY', pending = 0, failed = 0,
+                    last_attempt_at = ?, last_task_id = ?, last_error = NULL,
+                    updated_at = ?
+                WHERE device_id = ?
+                """,
+                (
+                    record_id,
+                    observed,
+                    changed,
+                    _time(reconciled_at),
+                    task_id,
+                    _time(reconciled_at),
+                    str(device_id).strip().upper(),
+                ),
+            )
+            self.connection.commit()
+
+    @retry_sqlite_write
+    def mark_failure(
+        self,
+        *,
+        device_id: str,
+        error: str,
+        attempted_at: datetime,
+        terminal: bool,
+    ) -> None:
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE device_status_projection
+                SET status = ?, pending = ?, failed = ?,
+                    last_attempt_at = ?, last_error = ?, updated_at = ?
+                WHERE device_id = ?
+                """,
+                (
+                    "FAILED" if terminal else "PENDING",
+                    int(not terminal),
+                    int(terminal),
+                    _time(attempted_at),
+                    str(error)[:500],
+                    _time(attempted_at),
+                    str(device_id).strip().upper(),
+                ),
+            )
+            self.connection.commit()
+
+    @retry_sqlite_write
+    def mark_shadow_only(self, *, device_id: str, updated_at: datetime) -> None:
+        """Record that the desired row is outside the current Active scope."""
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE device_status_projection
+                SET status = 'SHADOW_ONLY', pending = 0, failed = 0,
+                    changed_fields_json = '[]',
+                    last_error = NULL, updated_at = ?
+                WHERE device_id = ?
+                """,
+                (_time(updated_at), str(device_id).strip().upper()),
+            )
+            self.connection.commit()
+
+    def summary(self) -> dict[str, Any]:
+        rows = self.connection.execute(
+            "SELECT * FROM device_status_projection ORDER BY device_id"
+        ).fetchall()
+        pending = sum(1 for row in rows if row["pending"])
+        failed = sum(1 for row in rows if row["failed"])
+        mismatched: list[str] = []
+        devices: list[dict[str, Any]] = []
+        gated_count = 0
+        planned_count = 0
+        last_success: str | None = None
+        last_error: str | None = None
+        last_error_updated_at: str | None = None
+        last_reconcile_at: str | None = None
+        for row in rows:
+            desired = _json_load(row["desired_fields_json"], {})
+            observed = _json_load(row["observed_fields_json"], {})
+            changed_fields = _json_load(row["changed_fields_json"], [])
+            if not isinstance(changed_fields, list):
+                changed_fields = []
+            if row["pending"] or row["failed"] or changed_fields or desired != observed:
+                mismatched.append(str(row["device_id"]))
+            if row["status"] == "SHADOW_ONLY":
+                gated_count += 1
+            if row["status"] in {"PENDING", "SHADOW_ONLY"} and changed_fields:
+                planned_count += 1
+            if row["updated_at"] and (
+                last_reconcile_at is None or row["updated_at"] > last_reconcile_at
+            ):
+                last_reconcile_at = row["updated_at"]
+            devices.append(
+                {
+                    "device_id": str(row["device_id"]),
+                    "record_id": row["record_id"],
+                    "desired_hash": row["desired_hash"],
+                    "desired_fields": desired,
+                    "observed_fields": observed,
+                    "changed_fields": sorted({str(field) for field in changed_fields}),
+                    "status": str(row["status"]),
+                    "pending": bool(row["pending"]),
+                    "failed": bool(row["failed"]),
+                    "last_success_at": row["last_success_at"],
+                    "last_attempt_at": row["last_attempt_at"],
+                    "last_error": row["last_error"],
+                    "last_task_id": row["last_task_id"],
+                }
+            )
+            if row["last_success_at"] and (
+                last_success is None or row["last_success_at"] > last_success
+            ):
+                last_success = row["last_success_at"]
+            if row["last_error"] and (
+                last_error_updated_at is None
+                or str(row["updated_at"]) >= last_error_updated_at
+            ):
+                last_error = str(row["last_error"])
+                last_error_updated_at = str(row["updated_at"])
+        return {
+            "pending": pending,
+            "failed": failed,
+            "last_success_at": last_success,
+            "last_error": last_error,
+            "mismatched_devices": mismatched,
+            "devices": devices,
+            "gated_count": gated_count,
+            "planned_count": planned_count,
+            "last_reconcile_at": last_reconcile_at,
+        }
+
+
 __all__ = [
     "SQLiteAlarmStateRepository",
     "SQLiteLatestSampleRepository",
     "SQLiteOperationRepository",
+    "SQLiteDeviceStatusProjectionRepository",
 ]
