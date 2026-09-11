@@ -137,6 +137,33 @@ class RecordDiscoveryTests(unittest.TestCase):
         self.assertEqual(result["code"], 0)
         self.assertEqual(request.call_count, 2)
 
+    def test_reads_bitable_field_names_for_schema_validation(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "items": [
+                    {"field_name": "监测点"},
+                    {"field_name": "状态变更"},
+                ],
+                "has_more": False,
+            },
+        }
+
+        with (
+            patch.object(feishu, "get_token", return_value="token"),
+            patch.object(
+                feishu, "request_with_retry", return_value=response
+            ) as request,
+        ):
+            self.assertEqual(
+                feishu.list_bitable_field_names("tbl-operation"),
+                ("监测点", "状态变更"),
+            )
+
+        self.assertEqual(request.call_args.args[0], "GET")
+        self.assertIn("/tables/tbl-operation/fields", request.call_args.args[1])
+
     def test_normalizes_all_business_client_tokens_stably_and_safely(self) -> None:
         business_keys = (
             "ENV:TH-01:2026-09-02T08:30:00+08:00",

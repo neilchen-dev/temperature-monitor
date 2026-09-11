@@ -242,7 +242,8 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `ACTIVE_DEVICE_IDS` | 空 | Active Canary 写回白名单；逗号分隔、自动 uppercase/strip；为空时 fail closed |
 | `ACTIVE_CUTOVER_ACK` | 空 | 确认白名单设备的 legacy owner 已禁用/排除；Canary 阶段不要求关闭其他设备工作流 |
 | `SHADOW_DEVICE_CONTEXTS` | 空 | 设备静态上下文 JSON，可覆盖区域；控制类型、上下限和启用状态只来自已验证的飞书标准表 |
-| `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID |
+| `FEISHU_STANDARD_TABLE_ID` / `FEISHU_OPERATION_TABLE_ID` / `FEISHU_EVENT_TABLE_ID` | — | Shadow 只读链路使用的标准、作业和事件表 ID；`FEISHU_OPERATION_TABLE_ID` 指向作业登记表，不是作业区间表 |
+| `FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD` | `状态记录时间` | 作业登记的业务来源时间字段，不使用 Python 拉取时间 |
 | `FEISHU_OPERATION_INTERVAL_TABLE_ID` / `FEISHU_INSPECTION_TABLE_ID` | 当前台账表 ID | 作业区间和仓库点检写入目标表 |
 | `FEISHU_WRITE_ENABLED` | `false` | 飞书写入总开关；只有与 `AUTOMATION_MODE=active` 同时启用才生效 |
 | `FEISHU_ALARM_NOTIFY_ENABLED` / `FEISHU_RECOVERY_NOTIFY_ENABLED` | `false` | Python 飞书异常/恢复私聊独立 gate；默认关闭，且仍需完整 Active gate |

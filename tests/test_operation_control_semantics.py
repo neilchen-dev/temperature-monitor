@@ -17,6 +17,11 @@ from domain.models import (
 )
 from domain.monitor_engine import evaluate_monitor_state
 from domain.operation import OperationAction, OperationObservation
+from integrations.feishu_operation import (
+    FeishuOperationAdapter,
+    FeishuOperationFieldMap,
+)
+from integrations.feishu_records import FeishuRawRecord
 from repositories.runtime_state import SQLiteOperationRepository
 from runtime.bootstrap import DEFAULT_DEVICE_CONTEXTS
 
@@ -198,4 +203,90 @@ def test_operation_just_ended_returns_operation_period_to_idle() -> None:
     assert state.ended_at == NOW
     assert result.applicability is ApplicabilityStatus.NOT_APPLICABLE
     assert result.overall_status is OverallStatus.UNKNOWN
+    connection.close()
+
+
+def test_feishu_registration_business_time_drives_state_and_audit() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SQLiteOperationRepository(connection)
+    service = OperationObservationService(store=repository)
+    device = _device("TH-05", DEFAULT_DEVICE_CONTEXTS["TH-05"])
+    start_at = NOW - timedelta(minutes=5)
+    end_at = NOW
+    adapter = FeishuOperationAdapter(
+        source=type(
+            "Source",
+            (),
+            {
+                "read_records": lambda self, table_id: (),
+            },
+        )(),
+        table_id="operation-registration",
+        fields=FeishuOperationFieldMap(
+            device_id="监测点",
+            area_id="区域",
+            action="状态变更",
+            operation_type="当前工艺",
+            source_created_at="状态记录时间",
+            validation="登记组合校验",
+        ),
+    )
+    start = adapter.normalize_record(
+        FeishuRawRecord(
+            record_id="rec-start",
+            fields={
+                "监测点": "TH-05",
+                "区域": device.area,
+                "状态变更": "开始作业",
+                "当前工艺": "总装",
+                "登记组合校验": "有效",
+                "状态记录时间": int(start_at.timestamp() * 1000),
+            },
+        ),
+        observed_at=NOW + timedelta(hours=1),
+    )
+    end = adapter.normalize_record(
+        FeishuRawRecord(
+            record_id="rec-end",
+            fields={
+                "监测点": "TH-05",
+                "区域": device.area,
+                "状态变更": "结束作业",
+                "当前工艺": "N/A",
+                "登记组合校验": "有效",
+                "状态记录时间": end_at.isoformat(),
+            },
+        ),
+        observed_at=NOW + timedelta(hours=1),
+    )
+
+    assert service.apply(start).accepted
+    operating = repository.get(device)
+    assert operating.state is OperationStatus.OPERATING
+    assert operating.started_at == start_at
+    assert evaluate_monitor_state(
+        device=device,
+        sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
+        standard=_standard(
+            device, operation_type="总装", control_type=ControlType.OPERATION_PERIOD
+        ),
+        operation_state=operating,
+    ).applicability is ApplicabilityStatus.APPLICABLE
+
+    assert service.apply(end).accepted
+    idle = repository.get(device)
+    assert idle.state is OperationStatus.IDLE
+    assert idle.started_at == start_at
+    assert idle.ended_at == end_at
+    assert evaluate_monitor_state(
+        device=device,
+        sample=MonitorSample(device.device_id, NOW, 24.0, 50.0, online_status="online"),
+        standard=_standard(
+            device, operation_type="总装", control_type=ControlType.OPERATION_PERIOD
+        ),
+        operation_state=idle,
+    ).applicability is ApplicabilityStatus.NOT_APPLICABLE
+    assert connection.execute(
+        "SELECT COUNT(*) FROM operation_observation_audit"
+    ).fetchone()[0] == 2
     connection.close()

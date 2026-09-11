@@ -184,6 +184,155 @@ class FeishuOperationAdapterTests(unittest.TestCase):
         self.assertIsNone(observation.work_order)
         self.assertEqual(observation.source_record_id, "rec-operation-1")
 
+    def test_operation_timestamp_uses_configured_business_field(self) -> None:
+        recorded_at = 1_789_092_875_000
+        pulled_at = datetime(2026, 9, 11, 2, 30, tzinfo=timezone.utc)
+        adapter = FeishuOperationAdapter(
+            source=_Source(
+                (
+                    FeishuRawRecord(
+                        record_id="rec-operation-business-time",
+                        fields={
+                            "device": "TH-03",
+                            "area": "精密装配间",
+                            "action": "开始作业",
+                            "state_recorded_at": recorded_at,
+                        },
+                    ),
+                )
+            ),
+            table_id="operation-registration",
+            fields=FeishuOperationFieldMap(
+                device_id="device",
+                area_id="area",
+                action="action",
+                source_created_at="state_recorded_at",
+            ),
+        )
+
+        observation = adapter.fetch_observations(observed_at=pulled_at)[0]
+
+        self.assertEqual(
+            observation.source_created_at,
+            datetime.fromtimestamp(recorded_at / 1000, tz=timezone.utc),
+        )
+        self.assertEqual(observation.observed_at, pulled_at)
+
+    def test_operation_timestamp_accepts_naive_iso_in_business_timezone(self) -> None:
+        adapter = FeishuOperationAdapter(
+            source=_Source(
+                (
+                    FeishuRawRecord(
+                        record_id="rec-operation-iso",
+                        fields={
+                            "device": "TH-03",
+                            "area": "精密装配间",
+                            "action": "结束作业",
+                            "state_recorded_at": "2026-09-11T10:18:56",
+                        },
+                    ),
+                )
+            ),
+            table_id="operation-registration",
+            fields=FeishuOperationFieldMap(
+                device_id="device",
+                area_id="area",
+                action="action",
+                source_created_at="state_recorded_at",
+            ),
+        )
+
+        observation = adapter.fetch_observations()[0]
+
+        self.assertIsNotNone(observation.source_created_at.tzinfo)
+        self.assertEqual(observation.source_created_at.utcoffset(), timedelta(hours=8))
+
+    def test_empty_operation_table_is_a_valid_empty_sync(self) -> None:
+        class _SchemaSource(_Source):
+            def read_field_names(self, table_id: str):
+                return ("device", "area", "action", "state_recorded_at")
+
+        adapter = FeishuOperationAdapter(
+            source=_SchemaSource(()),
+            table_id="operation-registration",
+            fields=FeishuOperationFieldMap(
+                device_id="device",
+                area_id="area",
+                action="action",
+                source_created_at="state_recorded_at",
+            ),
+        )
+
+        self.assertEqual(adapter.fetch_observations(), ())
+        self.assertEqual(adapter.last_fetch_stats.records_fetched, 0)
+        self.assertEqual(adapter.last_fetch_stats.observations, 0)
+        self.assertEqual(adapter.last_fetch_stats.rejected, 0)
+        self.assertEqual(adapter.last_fetch_stats.schema_status, "valid")
+        self.assertEqual(adapter.last_fetch_stats.outcome, "transport_success_empty")
+
+    def test_wrong_operation_table_schema_fails_explicitly(self) -> None:
+        class _SchemaSource(_Source):
+            def read_field_names(self, table_id: str):
+                return ("监测点", "区间状态", "开始时间", "结束时间")
+
+        adapter = FeishuOperationAdapter(
+            source=_SchemaSource(()),
+            table_id="interval-table",
+            fields=FeishuOperationFieldMap(
+                device_id="监测点",
+                area_id="区域",
+                action="状态变更",
+                source_created_at="状态记录时间",
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Feishu operation table schema mismatch.*状态变更.*状态记录时间",
+        ):
+            adapter.fetch_observations()
+        self.assertEqual(adapter.last_fetch_stats.outcome, "schema_error")
+        self.assertEqual(adapter.last_fetch_stats.schema_status, "invalid")
+
+    def test_records_without_observations_are_counted_and_warned(self) -> None:
+        class _SchemaSource(_Source):
+            def read_field_names(self, table_id: str):
+                return ("device", "area", "action", "state_recorded_at")
+
+        adapter = FeishuOperationAdapter(
+            source=_SchemaSource(
+                (
+                    FeishuRawRecord(
+                        record_id="invalid-operation",
+                        fields={
+                            "device": "TH-03",
+                            "area": "精密装配间",
+                            "state_recorded_at": "2026-09-11T02:30:00Z",
+                        },
+                    ),
+                )
+            ),
+            table_id="operation-registration",
+            fields=FeishuOperationFieldMap(
+                device_id="device",
+                area_id="area",
+                action="action",
+                source_created_at="state_recorded_at",
+            ),
+        )
+
+        with self.assertLogs("temperature_monitor", level="WARNING") as logs:
+            self.assertEqual(adapter.fetch_observations(), ())
+
+        self.assertEqual(adapter.last_fetch_stats.records_fetched, 1)
+        self.assertEqual(adapter.last_fetch_stats.observations, 0)
+        self.assertEqual(adapter.last_fetch_stats.rejected, 1)
+        self.assertEqual(
+            adapter.last_fetch_stats.outcome,
+            "transport_success_records_no_observations",
+        )
+        self.assertTrue(any("records but no observations" in item for item in logs.output))
+
     def test_all_confirmed_operation_actions_are_supported(self) -> None:
         created_at = datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc)
         adapter = FeishuOperationAdapter(

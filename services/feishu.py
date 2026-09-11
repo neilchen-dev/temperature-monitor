@@ -394,6 +394,40 @@ def _require_success(result: dict[str, Any], operation: str) -> dict[str, Any]:
     return result
 
 
+def list_bitable_field_names(table_id: str) -> tuple[str, ...]:
+    """Read the configured Base table schema without reading business rows."""
+    _validate_bitable_config()
+    base_url = _bitable_table_url(table_id, "/fields")
+    page_token: str | None = None
+    field_names: list[str] = []
+
+    while True:
+        query = {"page_size": "100"}
+        if page_token:
+            query["page_token"] = page_token
+        result = _require_success(
+            _request_bitable_json(
+                "GET",
+                f"{base_url}?{urlencode(query)}",
+                operation="读取 Base 字段",
+                lock_key=f"table:{table_id}:fields",
+            ),
+            "读取 Base 字段",
+        )
+        data = result.get("data", {})
+        for field in data.get("items", []):
+            if not isinstance(field, Mapping):
+                continue
+            field_name = field.get("field_name") or field.get("name")
+            if isinstance(field_name, str) and field_name.strip():
+                field_names.append(field_name.strip())
+        if not data.get("has_more"):
+            return tuple(dict.fromkeys(field_names))
+        page_token = str(data.get("page_token", "")).strip()
+        if not page_token:
+            raise RuntimeError("飞书 Base 字段分页响应缺少 page_token")
+
+
 def list_bitable_records(
     table_id: str,
     *,

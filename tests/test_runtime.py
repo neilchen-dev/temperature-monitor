@@ -109,6 +109,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("current_epoch_failed_tasks", task_health)
         self.assertIn("pending_external_effects", task_health)
         self.assertFalse(components.runtime.monitor_service.action_executor.mode.value == "active")
+        self.assertEqual(
+            components.runtime.operation_adapter.fields.source_created_at,
+            config.FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD,
+        )
+        components.runtime.handle_operation_sync(object())
+        operation_sync = components.status()["operation_sync"]
+        self.assertEqual(operation_sync["records_fetched"], 0)
+        self.assertEqual(operation_sync["observations"], 0)
+        self.assertEqual(operation_sync["accepted"], 0)
+        self.assertEqual(operation_sync["rejected"], 0)
+        self.assertEqual(operation_sync["outcome"], "transport_success_empty")
         components.start()
         self.assertTrue(components.status()["scheduler_running"])
         components.stop()

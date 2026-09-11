@@ -395,6 +395,7 @@ def build_runtime(
             action=config.FEISHU_OPERATION_ACTION_FIELD,
             operation_type=config.FEISHU_OPERATION_TYPE_FIELD,
             work_order=config.FEISHU_OPERATION_WORK_ORDER_FIELD,
+            source_created_at=config.FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD or None,
             validation=config.FEISHU_OPERATION_VALIDATION_FIELD or None,
             valid_values=(config.FEISHU_OPERATION_VALIDATION_VALUE,),
             allowed_device_ids=frozenset(config.FEISHU_OPERATION_ALLOWED_DEVICES),

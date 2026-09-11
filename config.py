@@ -62,6 +62,7 @@ def _load_hassio_options() -> None:
         "feishu_event_table_id": "FEISHU_EVENT_TABLE_ID",
         "feishu_operation_validation_field": "FEISHU_OPERATION_VALIDATION_FIELD",
         "feishu_operation_validation_value": "FEISHU_OPERATION_VALIDATION_VALUE",
+        "feishu_operation_source_created_at_field": "FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD",
         "feishu_operation_allowed_devices": "FEISHU_OPERATION_ALLOWED_DEVICES",
         "feishu_operation_interval_table_id": "FEISHU_OPERATION_INTERVAL_TABLE_ID",
         "feishu_inspection_table_id": "FEISHU_INSPECTION_TABLE_ID",
@@ -501,6 +502,9 @@ FEISHU_OPERATION_VALIDATION_FIELD = os.getenv(
 ).strip()
 FEISHU_OPERATION_VALIDATION_VALUE = os.getenv(
     "FEISHU_OPERATION_VALIDATION_VALUE", "有效"
+).strip()
+FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD = os.getenv(
+    "FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD", "状态记录时间"
 ).strip()
 FEISHU_OPERATION_ALLOWED_DEVICES = tuple(
     device.strip().upper()

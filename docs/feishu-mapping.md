@@ -456,7 +456,8 @@ Python `MonitorResult` 已增加 `applicability` 和 `data_quality`，可区分�
 | 业务时间 | 当前飞书取值 | 备注 |
 |---|---|---|
 | 当前主表更新时间 | `设备温湿度记录.更新时间` | 超限流程用作连续超限开始时间；标准化 Python 事件另按 source_created_at 防乱序 |
-| 作业登记时间 | 登记记录 `recordCreatedTime`/`提交时间` | 工作流写入作业区间时使用创建时间 |
+| 作业登记记录创建时间 | 登记记录 `recordCreatedTime`/`提交时间` | 工作流写入作业区间时使用创建时间 |
+| Python 作业状态业务时间 | 登记记录 `状态记录时间`（由 `FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD` 配置） | operation sync 用于 `source_created_at` 和新旧排序，不使用 Python 拉取时间 |
 | 作业开始/结束快照时间 | 登记触发记录的 `recordCreatedTime` | 不是用户填写的 `状态记录时间` |
 | 点检时间 | 点检记录创建时间/`点检时间` | 快照工作流写入主表最近点检时间 |
 | 异常开始时间 | 超限复核时的连续超限开始时间 | 点检异常分支直接使用点检记录时间 |

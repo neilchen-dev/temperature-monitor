@@ -65,3 +65,9 @@ class FeishuBitableRecordSource:
                 )
             )
         return tuple(records)
+
+    def read_field_names(self, table_id: str) -> tuple[str, ...]:
+        """Read table metadata for lightweight integration schema checks."""
+        from services.feishu import list_bitable_field_names
+
+        return list_bitable_field_names(table_id)

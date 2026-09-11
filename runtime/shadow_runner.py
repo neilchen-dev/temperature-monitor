@@ -186,6 +186,8 @@ class ShadowRuntime:
         self._skipped_device_log: set[str] = set()
         self._last_purge_time: datetime | None = None
         self._last_operation_sync_time: datetime | None = None
+        self._operation_sync_accepted = 0
+        self._operation_sync_last_error: str | None = None
         self._last_expected_state: dict[str, ExpectedAutomationState] = {}
 
     def standards_readiness(self) -> dict[str, Any]:
@@ -511,6 +513,24 @@ class ShadowRuntime:
             status["automation_tasks"] = task_health
             status["prewarning_devices"] = self.monitor_service.prewarning_status()
             status["prewarning_count"] = len(status["prewarning_devices"])
+            operation_stats = self.operation_adapter.last_fetch_stats.as_dict()
+            operation_stats["accepted"] = self._operation_sync_accepted
+            operation_stats["last_sync_at"] = _iso(self._last_operation_sync_time)
+            operation_stats["last_error"] = self._operation_sync_last_error
+            status["operation_sync"] = operation_stats
+            status.update(
+                {
+                    "operation_sync_records_fetched": operation_stats[
+                        "records_fetched"
+                    ],
+                    "operation_sync_observations": operation_stats["observations"],
+                    "operation_sync_accepted": operation_stats["accepted"],
+                    "operation_sync_rejected": operation_stats["rejected"],
+                    "last_operation_observation_at": operation_stats[
+                        "last_observation_at"
+                    ],
+                }
+            )
             status["active_canary_enabled"] = bool(
                 status["active_canary_enabled"]
                 and task_health["active_readiness"]
@@ -769,14 +789,24 @@ class ShadowRuntime:
                 for observation in observations:
                     if self.operation_sync.apply(observation).accepted:
                         accepted += 1
+                stats = self.operation_adapter.last_fetch_stats
+                self._operation_sync_accepted = accepted
+                self._operation_sync_last_error = None
                 logger.info(
-                    "Shadow 作业状态同步完成 | observations=%s | accepted=%s",
-                    len(observations),
+                    "Shadow 作业状态同步完成 | records=%s | observations=%s | "
+                    "accepted=%s | rejected=%s | outcome=%s",
+                    stats.records_fetched,
+                    stats.observations,
                     accepted,
+                    stats.rejected,
+                    stats.outcome,
                 )
                 self._last_operation_sync_time = self.now_provider()
-            except Exception:
+            except Exception as exc:
+                self._operation_sync_accepted = 0
+                self._operation_sync_last_error = str(exc)
                 logger.exception("Shadow 作业状态同步失败，保留上一版状态")
+                raise
 
     def _handle_verification_task(self, task: Any) -> None:
         with self._execution_lock:

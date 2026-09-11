@@ -13,6 +13,8 @@ from .feishu_operation import (
     FeishuOperationSource,
     OperationAction,
     OperationObservation,
+    OperationFetchStats,
+    OperationTableSchemaError,
 )
 from domain.operation import is_newer_operation
 from .feishu_records import FeishuBitableRecordSource, FeishuRawRecord
@@ -45,6 +47,8 @@ __all__ = [
     "FeishuOperationSource",
     "OperationAction",
     "OperationObservation",
+    "OperationFetchStats",
+    "OperationTableSchemaError",
     "is_newer_operation",
     "FeishuRawRecord",
     "FeishuBitableRecordSource",
