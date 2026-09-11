@@ -539,6 +539,15 @@ def build_runtime(
             effective_mode,
             activation.active_epoch,
         )
+    recovered_stale = task_repository.recover_stale_tasks(now=activation_now)
+    if recovered_stale:
+        logger.warning(
+            "stale local tasks requeued during runtime startup | "
+            "count=%s | mode=%s | active_epoch=%s",
+            recovered_stale,
+            effective_mode,
+            activation.active_epoch,
+        )
     action_executor = ActionExecutor(
         mode=effective_mode,
         active_device_ids=config.ACTIVE_DEVICE_IDS,

@@ -254,6 +254,41 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
         self.assertFalse(summary["active_readiness"])
         self.assertEqual(self.repository.get(task.task_id).status, AutomationTaskStatus.RUNNING)
 
+    def test_recover_stale_tasks_requeues_without_replacing_task_identity(self) -> None:
+        task = self.repository.create_or_get(
+            task_type="SHADOW_COMPARE",
+            entity_type="DEVICE",
+            entity_id="TH-04",
+            due_at=self.created_at,
+            payload={"expected": {"device_id": "TH-04"}},
+            dedupe_key="SHADOW_COMPARE:stale-restart",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(
+            now=self.created_at,
+            worker_id="worker-a",
+            lease_for=timedelta(seconds=1),
+        )
+        recovered_at = self.created_at + timedelta(minutes=6)
+
+        self.assertEqual(
+            self.repository.recover_stale_tasks(now=recovered_at),
+            1,
+        )
+        recovered = self.repository.get(task.task_id)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered.task_id, task.task_id)
+        self.assertEqual(recovered.dedupe_key, task.dedupe_key)
+        self.assertEqual(recovered.status, AutomationTaskStatus.PENDING)
+        self.assertEqual(recovered.due_at, recovered_at)
+        self.assertIsNone(recovered.lease_until)
+        self.assertIsNone(recovered.worker_id)
+        self.assertEqual(
+            self.repository.health_summary(now=recovered_at)["stale_tasks"],
+            0,
+        )
+
     def test_current_epoch_pending_external_task_does_not_block_readiness(self) -> None:
         activation = self.repository.set_runtime_context(
             mode="active", now=self.created_at

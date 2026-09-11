@@ -650,6 +650,61 @@ class SQLiteAutomationTaskRepository:
             self.connection.commit()
         return max(cursor.rowcount, 0)
 
+    @retry_sqlite_write
+    def recover_stale_tasks(
+        self,
+        *,
+        now: datetime | None = None,
+        stale_after: timedelta = timedelta(minutes=5),
+    ) -> int:
+        """Requeue locally recoverable work left behind by a stopped runtime.
+
+        A process restart can leave a leased task RUNNING or a due task PENDING
+        until its old lease/backoff is observed.  Requeueing preserves the same
+        task id, dedupe key and attempt history; it only clears the transient
+        lease and gives the scheduler a chance to claim the work again.  Legacy
+        external-effect rows must be quarantined before this method is called.
+        """
+        if stale_after <= timedelta(0):
+            raise ValueError("stale_after must be positive")
+        current_time = now or datetime.now().astimezone()
+        now_text = _datetime_text(current_time)
+        stale_cutoff = _datetime_text(current_time - stale_after)
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE automation_tasks
+                    SET status = ?, due_at = ?, updated_at = ?,
+                        lease_until = NULL, worker_id = NULL,
+                        last_error = COALESCE(
+                            last_error,
+                            'requeued after stale runtime restart'
+                        )
+                    WHERE (
+                        status = ? AND lease_until IS NOT NULL
+                        AND lease_until <= ?
+                    ) OR (
+                        status = ? AND due_at <= ?
+                    )
+                    """,
+                    (
+                        AutomationTaskStatus.PENDING.value,
+                        now_text,
+                        now_text,
+                        AutomationTaskStatus.RUNNING.value,
+                        now_text,
+                        AutomationTaskStatus.PENDING.value,
+                        stale_cutoff,
+                    ),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return max(cursor.rowcount, 0)
+
     def external_effect_allowed(self, task: AutomationTask) -> bool:
         """Return whether this task belongs to the currently active epoch."""
         if task.task_type not in _EXTERNAL_EFFECT_TASK_TYPES:
