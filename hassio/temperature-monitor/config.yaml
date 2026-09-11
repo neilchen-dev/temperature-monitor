@@ -47,10 +47,10 @@ options:
   feishu_device_status_projection_enabled: false
   feishu_device_status_max_retries: 5
   feishu_device_status_backoff_seconds: 30
-  feishu_device_status_temperature_min_field: 当前适用温度下限
-  feishu_device_status_temperature_max_field: 当前适用温度上限
-  feishu_device_status_humidity_min_field: 当前适用湿度下限
-  feishu_device_status_humidity_max_field: 当前适用湿度上限
+  feishu_device_status_temperature_min_field: 当前适用温度下限（°C）
+  feishu_device_status_temperature_max_field: 当前适用温度上限（°C）
+  feishu_device_status_humidity_min_field: 当前适用湿度下限（%RH）
+  feishu_device_status_humidity_max_field: 当前适用湿度上限（%RH）
   feishu_device_status_control_type_field: 控制类型
   feishu_device_status_operation_state_field: 当前作业状态
   feishu_device_status_operation_type_field: 当前工艺

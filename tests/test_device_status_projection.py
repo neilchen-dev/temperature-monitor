@@ -189,8 +189,8 @@ class DeviceStatusProjectionTests(unittest.TestCase):
     def test_standard_and_operation_fields_are_projected(self) -> None:
         self._start_operation()
         desired = self.projector.build_desired("TH-03", now=NOW)
-        self.assertEqual(desired.fields["当前适用温度下限"], 20.0)
-        self.assertEqual(desired.fields["当前适用温度上限"], 26.0)
+        self.assertEqual(desired.fields["当前适用温度下限（°C）"], 20.0)
+        self.assertEqual(desired.fields["当前适用温度上限（°C）"], 26.0)
         self.assertEqual(desired.fields["控制类型"], "全天控制")
         self.assertEqual(desired.fields["当前作业状态"], "作业中")
         self.assertEqual(desired.fields["当前工艺"], "工艺A")
@@ -294,13 +294,13 @@ class DeviceStatusProjectionTests(unittest.TestCase):
         self.assertEqual(self.state_repository.summary()["mismatched_devices"], [])
 
         changed = dict(self.writer.records["rec-01"].fields)
-        changed["当前适用湿度上限"] = 55
+        changed["当前适用湿度上限（%RH）"] = 55
         self.writer.records["rec-01"] = FeishuRawRecord("rec-01", changed)
         task = self.projector.request("TH-01", now=NOW, force=True, trigger="drift")
         claimed = self.task_repository.claim_due(now=NOW, worker_id="scheduler-2")
         current = next(item for item in claimed if item.task_id == task.task_id)
         self.projector.handle_task(current, now=NOW)
-        self.assertEqual(self.writer.updates[-1][1], {"当前适用湿度上限": 60.0})
+        self.assertEqual(self.writer.updates[-1][1], {"当前适用湿度上限（%RH）": 60.0})
 
     def test_failure_is_rescheduled_with_same_task_id(self) -> None:
         task = self._make_task()
@@ -350,7 +350,7 @@ class DeviceStatusProjectionTests(unittest.TestCase):
         state = self.state_repository.get("TH-01")
         self.assertEqual(state["status"], "SHADOW_ONLY")
         self.assertEqual(state["record_id"], "rec-01")
-        self.assertIn("当前适用温度下限", state["changed_fields"])
+        self.assertIn("当前适用温度下限（°C）", state["changed_fields"])
         self.assertEqual(self.writer.updates, [])
         projection = self.projector.summary()
         self.assertFalse(projection["enabled"])
@@ -376,10 +376,10 @@ class DeviceStatusProjectionTests(unittest.TestCase):
             worker_id="scheduler-2",
         )
         self.assertEqual(self.writer.updates, [("rec-01", {
-            "当前适用温度下限": 20.0,
-            "当前适用温度上限": 26.0,
-            "当前适用湿度下限": 40.0,
-            "当前适用湿度上限": 60.0,
+            "当前适用温度下限（°C）": 20.0,
+            "当前适用温度上限（°C）": 26.0,
+            "当前适用湿度下限（%RH）": 40.0,
+            "当前适用湿度上限（%RH）": 60.0,
             "控制类型": "全天控制",
             "当前作业状态": "N/A",
             "当前工艺": "N/A",
