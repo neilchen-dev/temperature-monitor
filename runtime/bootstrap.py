@@ -431,6 +431,7 @@ def build_runtime(
         event_repository=event_repository,
         prewarning_effect_repository=prewarning_effect_repository,
         event_table_url=config.FEISHU_EVENT_TABLE_URL,
+        alarm_form_url=config.FEISHU_ALARM_FORM_URL,
         attempt_timeout=config.FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS,
     )
     observation_source = FeishuBitableObservationSource(

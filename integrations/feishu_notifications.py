@@ -70,6 +70,7 @@ class FeishuNotificationWriter:
         event_owner_field: str = "责任人",
         device_owner_field: str = "默认异常责任人",
         event_table_url: str = "",
+        alarm_form_url: str = "",
         attempt_timeout: float | None = None,
     ) -> None:
         self.sender = sender
@@ -81,6 +82,7 @@ class FeishuNotificationWriter:
         self.event_owner_field = event_owner_field
         self.device_owner_field = device_owner_field
         self.event_table_url = event_table_url.strip()
+        self.alarm_form_url = alarm_form_url.strip()
         self.attempt_timeout = attempt_timeout
         if not self.event_table_id:
             raise ValueError("event_table_id cannot be empty")
@@ -657,7 +659,11 @@ class FeishuNotificationWriter:
             f"source={_text(standard.get('standard_source')) or _text(result.get('standard_source')) or '未提供'}",
         )
         link = self._event_link(record_id)
-        return "\n".join((*lines, f"异常事件记录：{link}") if link else lines)
+        if link:
+            lines = (*lines, f"异常事件记录：{link}")
+        if self.alarm_form_url:
+            lines = (*lines, f"异常处置登记表：{self.alarm_form_url}")
+        return "\n".join(lines)
 
     @staticmethod
     def _prewarning_message(*, action_type: str, context: Mapping[str, Any]) -> str:

@@ -249,6 +249,7 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `FEISHU_ALARM_NOTIFY_ENABLED` / `FEISHU_RECOVERY_NOTIFY_ENABLED` | `false` | Python 飞书异常/恢复私聊独立 gate；默认关闭，且仍需完整 Active gate |
 | `FEISHU_ALARM_CHAT_ID` | 空 | 责任人无法解析时的显式 chat_id fallback；不会把显示名称当作 receive_id |
 | `FEISHU_NOTIFY_RECEIVE_ID_TYPE` | `open_id` | 责任人 ID 类型；实际使用类型写入通知审计 |
+| `FEISHU_ALARM_FORM_URL` | 空 | 正式异常私聊中附加的闭环处置表单链接；不改变责任人解析 |
 | `FEISHU_NOTIFY_MAX_RETRIES` / `FEISHU_NOTIFY_BACKOFF_SECONDS` / `FEISHU_NOTIFY_MAX_BACKOFF_SECONDS` | `5` / `30` / `600` | 通知任务的持久化重试次数、基础退避秒数和上限 |
 | `FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS` | `5` | 单次通知外部请求超时；调度器负责跨任务重试 |
 | `ACTIVE_EVENT_RECONCILIATION_*` | `30` / `600` | Active 异常事件 CREATE/UPDATE 失败后的持久化 reconciliation 退避秒数与上限 |

@@ -43,6 +43,7 @@ options:
   feishu_alarm_chat_id: ""
   feishu_notify_receive_id_type: open_id
   feishu_event_table_url: ""
+  feishu_alarm_form_url: ""
   feishu_notify_max_retries: 5
   feishu_notify_backoff_seconds: 30
   feishu_notify_max_backoff_seconds: 600
@@ -113,6 +114,7 @@ schema:
   feishu_alarm_chat_id: str
   feishu_notify_receive_id_type: list(open_id|user_id|union_id|email|chat_id)
   feishu_event_table_url: str
+  feishu_alarm_form_url: str
   feishu_notify_max_retries: int(1,20)
   feishu_notify_backoff_seconds: int(1,3600)
   feishu_notify_max_backoff_seconds: int(1,86400)

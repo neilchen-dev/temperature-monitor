@@ -46,6 +46,8 @@ python -m unittest tests.test_action_executor tests.test_alarm_state_machine \
 
 Python 飞书私聊通知由 `NOTIFY_ALARM`、`NOTIFY_RECOVERY` 两类独立任务驱动。它们分别受 `FEISHU_ALARM_NOTIFY_ENABLED`、`FEISHU_RECOVERY_NOTIFY_ENABLED` gate 保护，并要求完整 Active gate、`standards_ready=true` 和 `ACTIVE_DEVICE_IDS` 命中；单次请求最多发送一次，后续重试复用同一任务/去重键，并以本地 external-effect marker 和返回的 `message_id` 防止成功重放。责任人只接受已解析的 `open_id`/`user_id`/`union_id`/`email` 等 Feishu ID；显示名称不得直接作为 `receive_id`，chat fallback 仅使用显式 `FEISHU_ALARM_CHAT_ID`。
 
+正式异常告警可通过 `FEISHU_ALARM_FORM_URL` 附加人工闭环处置表单链接；该链接不会参与收件人解析，也不改变异常事件、通知或去重语义。表单提交后的回写由飞书侧“闭环表单提交后回写并关闭环境异常事件”自动化负责。
+
 通知链不调用旧 workflow #17，也不以它作为成功条件。切换任一设备为 Python Active 前，必须先确认该设备对应的 #17 legacy owner 已在飞书侧保持 disabled 或排除；未纳入 Active 白名单的设备继续 Shadow。代码和文档不会自动修改线上 workflow。
 
 Active cutover 是持久化边界：启动 Active 时记录 `active_cutover_at` / `active_epoch`，任务额外审计 `created_mode`、`created_at`、`active_epoch`。cutover 之前的事件绑定、`RECONCILE_ALARM_EVENT` 和通知任务保留为 `LEGACY_PENDING` / `SHADOW_ONLY`，可以查询和人工复核，但不会自动 POST、UPDATE 或 NOTIFY。Active 重启复用当前 epoch；回滚到 Shadow 后再次 Active 会开启新 epoch，旧 epoch 不会被自动接管。

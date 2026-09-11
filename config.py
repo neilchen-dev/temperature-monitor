@@ -88,6 +88,7 @@ def _load_hassio_options() -> None:
         "feishu_alarm_chat_id": "FEISHU_ALARM_CHAT_ID",
         "feishu_notify_receive_id_type": "FEISHU_NOTIFY_RECEIVE_ID_TYPE",
         "feishu_event_table_url": "FEISHU_EVENT_TABLE_URL",
+        "feishu_alarm_form_url": "FEISHU_ALARM_FORM_URL",
         "feishu_notify_max_retries": "FEISHU_NOTIFY_MAX_RETRIES",
         "feishu_notify_backoff_seconds": "FEISHU_NOTIFY_BACKOFF_SECONDS",
         "feishu_notify_max_backoff_seconds": "FEISHU_NOTIFY_MAX_BACKOFF_SECONDS",
@@ -426,6 +427,7 @@ FEISHU_NOTIFY_RECEIVE_ID_TYPE = (
     or "open_id"
 )
 FEISHU_EVENT_TABLE_URL = os.getenv("FEISHU_EVENT_TABLE_URL", "").strip()
+FEISHU_ALARM_FORM_URL = os.getenv("FEISHU_ALARM_FORM_URL", "").strip()
 FEISHU_NOTIFY_MAX_RETRIES = max(1, _get_int("FEISHU_NOTIFY_MAX_RETRIES", 5))
 FEISHU_NOTIFY_BACKOFF_SECONDS = max(
     1.0, _get_float("FEISHU_NOTIFY_BACKOFF_SECONDS", 30.0)

@@ -123,6 +123,50 @@ class NotificationTestCase(unittest.TestCase):
             event_table_url="https://feishu.test/base/x?record={record_id}",
         )
 
+    def test_alarm_message_includes_configured_closure_form_url(self) -> None:
+        writer = FeishuNotificationWriter(
+            sender=_Sender(),
+            source=self.source,
+            event_table_id=self.event_table,
+            device_table_id=self.device_table,
+            event_repository=self.events,
+            alarm_form_url="https://feishu.test/share/base/form/test-closure",
+        )
+
+        message = writer._message(
+            action_type=AlarmActionType.NOTIFY_ALARM.value,
+            event_id=self.event.event_id,
+            record_id="rec-event-1",
+            context=self._context(),
+        )
+
+        self.assertIn("异常处置登记表：https://feishu.test/share/base/form/test-closure", message)
+
+    def test_alarm_notification_sends_configured_closure_form_url(self) -> None:
+        sender = _Sender()
+        writer = FeishuNotificationWriter(
+            sender=sender,
+            source=self.source,
+            event_table_id=self.event_table,
+            device_table_id=self.device_table,
+            event_repository=self.events,
+            alarm_form_url="https://feishu.test/share/base/form/test-closure",
+        )
+
+        writer.handle_notification_action(
+            self._action(
+                AlarmActionType.NOTIFY_ALARM,
+                f"NOTIFY_ALARM:{self.event.event_id}",
+            ),
+            self._context(),
+        )
+
+        self.assertEqual(len(sender.calls), 1)
+        self.assertIn(
+            "异常处置登记表：https://feishu.test/share/base/form/test-closure",
+            sender.calls[0]["text"],
+        )
+
     def _action(self, action_type: AlarmActionType, key: str) -> ApplicationAction:
         return ApplicationAction(
             action_type=action_type,
