@@ -186,6 +186,51 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
         self.assertTrue(summary["active_readiness"])
         self.assertEqual(summary["blocker_reasons"], [])
 
+    def test_superseded_projection_failure_is_audit_only_when_write_gate_is_on(self) -> None:
+        self.connection.execute(
+            """
+            CREATE TABLE device_status_projection (
+                device_id TEXT PRIMARY KEY,
+                desired_hash TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.commit()
+        self.repository.set_runtime_context(mode="active", now=self.created_at)
+        task = self.repository.create_or_get(
+            task_type="PROJECT_DEVICE_STATUS",
+            entity_type="DEVICE",
+            entity_id="TH-04",
+            due_at=self.created_at,
+            payload={"desired_hash": "old-hash"},
+            dedupe_key="PROJECT_DEVICE_STATUS:TH-04:old-hash",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(now=self.created_at, worker_id="worker-a")
+        self.repository.mark_failed(
+            task.task_id,
+            finished_at=self.created_at + timedelta(seconds=1),
+            error="old schema mapping",
+            worker_id="worker-a",
+        )
+        self.connection.execute(
+            "INSERT INTO device_status_projection VALUES (?, ?, ?)",
+            ("TH-04", "new-hash", "SUCCEEDED"),
+        )
+        self.connection.commit()
+
+        summary = self.repository.active_readiness(
+            now=self.created_at + timedelta(seconds=2)
+        )
+
+        self.assertEqual(summary["current_failed_tasks"], 1)
+        self.assertEqual(summary["current_epoch_failed_tasks"], 1)
+        self.assertEqual(summary["readiness_current_failed_tasks"], 0)
+        self.assertEqual(summary["readiness_current_epoch_failed_tasks"], 0)
+        self.assertEqual(summary["blocker_reasons"], [])
+        self.assertTrue(summary["active_readiness"])
+
     def test_health_summary_treats_legacy_pending_as_audit_only(self) -> None:
         self.repository.set_runtime_context(mode="shadow", now=self.created_at)
         task = self.repository.create_or_get(
