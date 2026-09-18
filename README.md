@@ -397,6 +397,26 @@ ruff check .
 python -m pytest
 ```
 
+当前测试集按风险而不是按目录层级凑数量，覆盖以下链路：
+
+- **现场采集**：Modbus TCP / RTU 配置、寄存器映射、连续区间读取、短响应、断连与非法数值隔离；
+- **数据与追溯**：10 分钟时间桶幂等、SQLite WAL / 并发 / 备份、设备事件身份与历史查询；
+- **规则事实源**：飞书 validated 标准读取、完整快照替换、标准切换、字段缺失与旧快照回退；
+- **状态与事件**：`NORMAL / PENDING / ALARM / RECOVERY` 持续判定、告警创建 / 更新 / 恢复和预警；
+- **Shadow**：预期结果与观察结果比对、运行审计、任务去重、重启恢复和失败隔离；
+- **Active Canary**：写入总开关、cutover acknowledgement、设备白名单、epoch 边界、旧任务阻断、dispatch ownership 与 fail-closed；
+- **飞书写入**：作业、异常、点检、通知的字段映射、幂等、设备作用域和端到端工具；
+- **接口与投影**：HTTP API、分析看板、设备状态投影，以及写库中断后的恢复一致性。
+
+仓库当前包含 54 个 `tests/test_*.py` 文件。这个数字只用于描述当前代码快照；长期以 `python -m pytest --collect-only -q` 的实际收集结果为准，README 不把文件数等同于测试用例数。
+
+### Evidence and deployment boundaries
+
+- 公开仓库中的 `DEV-xx`、`Area-x`、表单与截图均为脱敏 / Demo；真实凭据、飞书资源 ID、数据库和日志不会提交。
+- 代码与测试能够证明通信、状态机、Shadow / Active 护栏和部署流程的实现；它们不能单独证明某个现场已经启用 Active 或替代既有质量流程。
+- Active 是显式受控的 canary 路径，不是打开 `AUTOMATION_MODE=active` 就全量接管。缺少写入开关、确认令牌、validated standards 或设备白名单时必须 fail closed。
+- 现场阈值和处置规则应由获授权的工艺 / 质量事实源确认；软件负责校验、执行、审计与追溯，不自行创造控制标准。
+
 ## Documentation
 
 - [`.env.example`](.env.example)：完整配置模板和安全说明；
