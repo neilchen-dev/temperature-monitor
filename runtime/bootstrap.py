@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
 import os
+import threading
+import time
 from typing import Any, Callable
 
 import config
@@ -118,6 +120,11 @@ class RuntimeComponents:
 # 最近一次 build_runtime 的结果，供 /api/system/status 只读暴露运行时健康。
 # 测试会反复 build/stop，这里只保存引用，不持有额外资源。
 _last_components: Any = None
+_READINESS_CACHE_TTL_SECONDS = 5.0
+_readiness_cache: dict[str, Any] | None = None
+_readiness_cache_at = 0.0
+_readiness_refreshing = False
+_readiness_refresh_lock = threading.Lock()
 
 
 def _active_write_allowed(mode: str) -> bool:
@@ -326,14 +333,9 @@ def runtime_liveness() -> dict[str, Any]:
     }
 
 
-def runtime_readiness() -> dict[str, Any]:
-    """Return the strict alarm-chain readiness state.
-
-    Liveness only proves that the process and scheduler thread exist.  This
-    probe additionally checks the Active standards/task gates so a running
-    scheduler cannot make blocked event/notification writes look healthy.
-    """
-    if _last_components is None:
+def _compute_runtime_readiness(components: Any) -> dict[str, Any]:
+    """Read the durable readiness gates outside the HTTP request thread."""
+    if components is None:
         return {
             "ready": False,
             "available": False,
@@ -346,7 +348,7 @@ def runtime_readiness() -> dict[str, Any]:
     # execution lock.  A health probe must never wait behind a long Feishu
     # write or database transaction: report a transient not-ready state and
     # let the next probe retry instead of starving Waitress request threads.
-    execution_lock = getattr(_last_components, "_execution_lock", None)
+    execution_lock = getattr(components, "_execution_lock", None)
     if execution_lock is not None and not execution_lock.acquire(blocking=False):
         liveness = runtime_liveness()
         return {
@@ -358,7 +360,7 @@ def runtime_readiness() -> dict[str, Any]:
             "reasons": ["runtime busy; readiness will be retried"],
         }
     try:
-        status = _last_components.status()
+        status = components.status()
         active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
         scheduler_running = bool(
             status.get("scheduler_running")
@@ -400,6 +402,81 @@ def runtime_readiness() -> dict[str, Any]:
     finally:
         if execution_lock is not None:
             execution_lock.release()
+
+
+def _refresh_runtime_readiness(components: Any) -> None:
+    """Refresh readiness asynchronously so probes remain constant-time."""
+    global _readiness_cache, _readiness_cache_at, _readiness_refreshing
+    try:
+        result = _compute_runtime_readiness(components)
+    except Exception:  # noqa: BLE001 - readiness must fail closed
+        logger.exception("异步读取 Runtime readiness 失败")
+        result = {
+            "ready": False,
+            "available": False,
+            "scheduler_running": False,
+            "standards_ready": False,
+            "active_readiness": False,
+            "reasons": ["runtime readiness unavailable"],
+        }
+    with _readiness_refresh_lock:
+        if _last_components is components:
+            _readiness_cache = result
+            _readiness_cache_at = time.monotonic()
+        _readiness_refreshing = False
+
+
+def runtime_readiness() -> dict[str, Any]:
+    """Return strict alarm-chain readiness without blocking HTTP probes.
+
+    The durable standards/task reads run in a single coalesced background
+    refresh.  Callers receive the latest cached result immediately; the
+    first call after startup reports a transient not-ready state until that
+    refresh completes.  Liveness is overlaid synchronously so a dead runtime
+    can never be reported ready from stale cache data.
+    """
+    global _readiness_refreshing
+    components = _last_components
+    if components is None:
+        return _compute_runtime_readiness(None)
+
+    now = time.monotonic()
+    with _readiness_refresh_lock:
+        cached = dict(_readiness_cache) if _readiness_cache is not None else None
+        cache_age = now - _readiness_cache_at
+        refresh_needed = cached is None or cache_age >= _READINESS_CACHE_TTL_SECONDS
+        if refresh_needed and not _readiness_refreshing:
+            _readiness_refreshing = True
+            threading.Thread(
+                target=_refresh_runtime_readiness,
+                args=(components,),
+                name="runtime-readiness-refresh",
+                daemon=True,
+            ).start()
+
+    liveness = runtime_liveness()
+    if cached is None:
+        cached = {
+            "ready": False,
+            "available": bool(liveness.get("available")),
+            "scheduler_running": bool(liveness.get("scheduler_running")),
+            "standards_ready": False,
+            "active_readiness": False,
+            "reasons": ["readiness refresh pending"],
+        }
+    if not liveness.get("available"):
+        cached["ready"] = False
+        cached["available"] = False
+        cached["reasons"] = list(cached.get("reasons", ())) + [
+            str(liveness.get("reason") or "runtime unavailable")
+        ]
+    elif not liveness.get("scheduler_running"):
+        cached["ready"] = False
+        cached["scheduler_running"] = False
+        cached["reasons"] = list(cached.get("reasons", ())) + [
+            "scheduler not running"
+        ]
+    return cached
 
 
 def shadow_summary_snapshot(*, hours: int = 24) -> dict[str, Any]:
@@ -805,8 +882,12 @@ def build_runtime(
         shutdown_timeout=config.RUNTIME_SHUTDOWN_TIMEOUT_SECONDS,
     )
     runtime_holder["runtime"] = runtime
-    global _last_components
-    _last_components = runtime
+    global _last_components, _readiness_cache, _readiness_cache_at, _readiness_refreshing
+    with _readiness_refresh_lock:
+        _last_components = runtime
+        _readiness_cache = None
+        _readiness_cache_at = 0.0
+        _readiness_refreshing = False
     return RuntimeComponents(
         runtime=runtime,
         connection=runtime_connection,
