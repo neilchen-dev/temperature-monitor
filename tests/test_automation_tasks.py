@@ -186,6 +186,92 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
         self.assertTrue(summary["active_readiness"])
         self.assertEqual(summary["blocker_reasons"], [])
 
+    def test_newer_success_supersedes_failed_internal_sync(self) -> None:
+        activation = self.repository.set_runtime_context(
+            mode="active", now=self.created_at
+        )
+        failed = self.repository.create_or_get(
+            task_type="SYNC_OPERATIONS",
+            entity_type="RUNTIME",
+            entity_id="operations",
+            due_at=self.created_at,
+            payload={"retryable": True},
+            dedupe_key="SYNC_OPERATIONS:failed",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(now=self.created_at, worker_id="worker-a")
+        self.repository.mark_failed(
+            failed.task_id,
+            finished_at=self.created_at + timedelta(seconds=1),
+            error="temporary Feishu failure",
+            worker_id="worker-a",
+        )
+        replacement_at = self.created_at + timedelta(seconds=2)
+        replacement = self.repository.create_or_get(
+            task_type="SYNC_OPERATIONS",
+            entity_type="RUNTIME",
+            entity_id="operations",
+            due_at=replacement_at,
+            dedupe_key="SYNC_OPERATIONS:replacement",
+            created_at=replacement_at,
+        )
+        self.repository.claim_due(now=replacement_at, worker_id="worker-a")
+        self.repository.mark_succeeded(
+            replacement.task_id,
+            finished_at=replacement_at + timedelta(seconds=1),
+            worker_id="worker-a",
+        )
+
+        summary = self.repository.active_readiness(
+            now=replacement_at + timedelta(seconds=2)
+        )
+
+        self.assertEqual(summary["active_epoch"], activation.active_epoch)
+        self.assertEqual(summary["current_failed_tasks"], 1)
+        self.assertEqual(summary["readiness_current_failed_tasks"], 0)
+        self.assertEqual(summary["readiness_retryable_failed_tasks"], 0)
+        self.assertTrue(summary["active_readiness"])
+
+    def test_newer_notification_success_does_not_hide_failed_notification(self) -> None:
+        self.repository.set_runtime_context(mode="active", now=self.created_at)
+        failed = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-1",
+            due_at=self.created_at,
+            dedupe_key="NOTIFY_ALARM:failed",
+            created_at=self.created_at,
+        )
+        self.repository.claim_due(now=self.created_at, worker_id="worker-a")
+        self.repository.mark_failed(
+            failed.task_id,
+            finished_at=self.created_at + timedelta(seconds=1),
+            error="recipient unavailable",
+            worker_id="worker-a",
+        )
+        replacement_at = self.created_at + timedelta(seconds=2)
+        replacement = self.repository.create_or_get(
+            task_type="NOTIFY_ALARM",
+            entity_type="EVENT",
+            entity_id="event-1",
+            due_at=replacement_at,
+            dedupe_key="NOTIFY_ALARM:replacement",
+            created_at=replacement_at,
+        )
+        self.repository.claim_due(now=replacement_at, worker_id="worker-a")
+        self.repository.mark_succeeded(
+            replacement.task_id,
+            finished_at=replacement_at + timedelta(seconds=1),
+            worker_id="worker-a",
+        )
+
+        summary = self.repository.active_readiness(
+            now=replacement_at + timedelta(seconds=2)
+        )
+
+        self.assertEqual(summary["readiness_current_failed_tasks"], 1)
+        self.assertFalse(summary["active_readiness"])
+
     def test_superseded_projection_failure_is_audit_only_when_write_gate_is_on(self) -> None:
         self.connection.execute(
             """

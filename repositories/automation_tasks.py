@@ -263,7 +263,7 @@ class SQLiteAutomationTaskRepository:
             }
             current_failed_rows = self.connection.execute(
                 """
-                SELECT payload_json
+                SELECT task_type, entity_id, payload_json, updated_at
                 FROM automation_tasks
                 WHERE status = 'FAILED' AND created_at >= ?
                 """,
@@ -284,6 +284,7 @@ class SQLiteAutomationTaskRepository:
             1
             for row in current_failed_rows
             if self._payload_has_retry_marker(row["payload_json"])
+            and not self._is_superseded_failure(row)
         )
 
         legacy_pending = count(
@@ -402,7 +403,7 @@ class SQLiteAutomationTaskRepository:
         if summary["current_boundary_at"] is not None:
             current_failed_rows = self.connection.execute(
                 """
-                SELECT task_type, entity_id, payload_json
+                SELECT task_type, entity_id, payload_json, updated_at
                 FROM automation_tasks
                 WHERE status = 'FAILED' AND created_at >= ?
                 """,
@@ -412,7 +413,7 @@ class SQLiteAutomationTaskRepository:
             1
             for row in current_failed_rows
             if row["task_type"] in non_blocking
-            or self._is_superseded_projection_failure(row)
+            or self._is_superseded_failure(row)
         )
         readiness_current_failed = max(
             summary["current_failed_tasks"] - ignored_current_failed,
@@ -423,7 +424,7 @@ class SQLiteAutomationTaskRepository:
         if summary["active_epoch"]:
             current_epoch_failed_rows = self.connection.execute(
                 """
-                SELECT task_type, entity_id, payload_json
+                SELECT task_type, entity_id, payload_json, updated_at
                 FROM automation_tasks
                 WHERE status = 'FAILED'
                   AND active_epoch = ?
@@ -434,7 +435,7 @@ class SQLiteAutomationTaskRepository:
                 1
                 for row in current_epoch_failed_rows
                 if row["task_type"] in non_blocking
-                or self._is_superseded_projection_failure(row)
+                or self._is_superseded_failure(row)
             )
             readiness_current_epoch_failed = max(
                 readiness_current_epoch_failed - int(ignored_current_epoch_failed),
@@ -447,7 +448,7 @@ class SQLiteAutomationTaskRepository:
             if boundary is not None:
                 retry_rows = self.connection.execute(
                     """
-                    SELECT task_type, entity_id, payload_json
+                    SELECT task_type, entity_id, payload_json, updated_at
                     FROM automation_tasks
                     WHERE status = 'FAILED' AND created_at >= ?
                     """,
@@ -457,7 +458,7 @@ class SQLiteAutomationTaskRepository:
                     1
                     for row in retry_rows
                     if row["task_type"] not in non_blocking
-                    and not self._is_superseded_projection_failure(row)
+                    and not self._is_superseded_failure(row)
                     and self._payload_has_retry_marker(row["payload_json"])
                 )
 
@@ -640,6 +641,44 @@ class SQLiteAutomationTaskRepository:
             and str(current["desired_hash"]) != failed_hash
             and current["status"] in {"SHADOW_ONLY", "SUCCEEDED"}
         )
+
+    def _is_superseded_failure(self, row: Mapping[str, Any]) -> bool:
+        """Return true when newer successful internal work replaced a failure.
+
+        A terminal failure remains audit evidence, but a later successful task
+        for the same internal operation and entity proves that the failed
+        snapshot is no longer actionable.  External effects and alarm state
+        transitions are deliberately excluded: success of a later notification
+        or event must never hide a missed earlier one.
+        """
+        if self._is_superseded_projection_failure(row):
+            return True
+        task_type = str(row["task_type"] or "").strip()
+        if task_type not in {
+            "FEISHU_PROJECTION",
+            "PROJECT_DEVICE_STATUS",
+            "SHADOW_COMPARE",
+            "SYNC_OPERATIONS",
+            "SYNC_STANDARD",
+        }:
+            return False
+        entity_id = str(row["entity_id"] or "").strip()
+        failed_at = str(row["updated_at"] or "").strip()
+        if not entity_id or not failed_at:
+            return False
+        replacement = self.connection.execute(
+            """
+            SELECT 1
+            FROM automation_tasks
+            WHERE task_type = ?
+              AND entity_id = ?
+              AND status = 'SUCCEEDED'
+              AND updated_at > ?
+            LIMIT 1
+            """,
+            (task_type, entity_id, failed_at),
+        ).fetchone()
+        return replacement is not None
     @retry_sqlite_write
     def quarantine_legacy_external_tasks(
         self,

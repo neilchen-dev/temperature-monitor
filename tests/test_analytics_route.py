@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -306,7 +307,15 @@ class AnalyticsRouteTests(unittest.TestCase):
         )
 
     def test_health_includes_sqlite_stats(self) -> None:
-        response = self.client.get("/health")
+        with mock.patch(
+            "runtime.bootstrap.runtime_status",
+            return_value={
+                "available": True,
+                "scheduler_running": True,
+                "mode": "active",
+            },
+        ):
+            response = self.client.get("/health")
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
@@ -314,6 +323,22 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertTrue(payload["sqlite"]["enabled"])
         self.assertEqual(payload["sqlite"]["write_failures"], 0)
         self.assertEqual(payload["sqlite"]["history_snapshot_count"], 4)
+        self.assertTrue(payload["runtime"]["scheduler_running"])
+
+    def test_health_is_degraded_when_active_runtime_is_unavailable(self) -> None:
+        with mock.patch(
+            "runtime.bootstrap.runtime_status",
+            return_value={
+                "available": False,
+                "scheduler_running": False,
+                "mode": "active",
+                "reason": "automation task health blocked",
+            },
+        ):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["status"], "degraded")
 
 
 if __name__ == "__main__":

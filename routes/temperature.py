@@ -286,7 +286,26 @@ def temperature():
 
 @temperature_bp.get("/health")
 def health():
-    return jsonify({"status": "ok", "sqlite": db.get_stats()}), 200
+    # Docker/Kubernetes must observe the alarm runtime, not merely the Flask
+    # listener.  Otherwise sample ingestion can look healthy while event and
+    # notification processing has silently stopped.
+    from runtime.bootstrap import runtime_status
+
+    runtime = runtime_status()
+    active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
+    scheduler_running = bool(
+        runtime.get("scheduler_running")
+        or runtime.get("scheduler", {}).get("running")
+    )
+    runtime_healthy = bool(runtime.get("available")) and (
+        not active_mode or scheduler_running
+    )
+    status_code = 200 if runtime_healthy else 503
+    return jsonify({
+        "status": "ok" if runtime_healthy else "degraded",
+        "sqlite": db.get_stats(),
+        "runtime": runtime,
+    }), status_code
 
 
 @temperature_bp.post("/temperature/heartbeat")
