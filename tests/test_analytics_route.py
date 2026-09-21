@@ -314,6 +314,16 @@ class AnalyticsRouteTests(unittest.TestCase):
                 "scheduler_running": True,
                 "mode": "active",
             },
+        ), mock.patch(
+            "runtime.bootstrap.runtime_readiness",
+            return_value={
+                "ready": True,
+                "available": True,
+                "scheduler_running": True,
+                "standards_ready": True,
+                "active_readiness": True,
+                "reasons": [],
+            },
         ):
             response = self.client.get("/health")
 
@@ -334,11 +344,38 @@ class AnalyticsRouteTests(unittest.TestCase):
                 "mode": "active",
                 "reason": "automation task health blocked",
             },
+        ), mock.patch(
+            "runtime.bootstrap.runtime_readiness",
+            return_value={
+                "ready": False,
+                "available": False,
+                "scheduler_running": False,
+                "standards_ready": False,
+                "active_readiness": False,
+                "reasons": ["runtime unavailable"],
+            },
         ):
             response = self.client.get("/health")
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.get_json()["status"], "degraded")
+
+    def test_readyz_is_strict_when_alarm_chain_is_not_ready(self) -> None:
+        with mock.patch(
+            "runtime.bootstrap.runtime_readiness",
+            return_value={
+                "ready": False,
+                "available": True,
+                "scheduler_running": True,
+                "standards_ready": False,
+                "active_readiness": False,
+                "reasons": ["standards not ready"],
+            },
+        ):
+            response = self.client.get("/readyz")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["status"], "not_ready")
 
 
 if __name__ == "__main__":

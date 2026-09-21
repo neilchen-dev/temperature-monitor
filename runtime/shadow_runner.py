@@ -178,6 +178,7 @@ class ShadowRuntime:
         self._stop_event = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._started = False
+        self._started_at: datetime | None = None
         self._accepting_samples = False
         self._closed = False
         self._last_standard_sync_time: datetime | None = None
@@ -228,40 +229,56 @@ class ShadowRuntime:
         except ValueError:
             return None
 
-    def start(self) -> None:
+    def start(self) -> bool:
         """Start local scheduling; Feishu sync and observation are background work."""
         with self._lifecycle_lock:
-            if self._started:
-                return
-            self._started = True
+            if self._closed:
+                return False
+            if self._started and self._scheduler_thread is not None:
+                if self._scheduler_thread.is_alive():
+                    return True
+                # A previous scheduler thread exited unexpectedly.  Allow a
+                # caller/supervisor to retry instead of leaving a permanent
+                # ``started`` latch behind.
+                self._started = False
             if not self.available:
                 logger.error(
                     "Shadow Runtime 不可用 | mode=%s | reason=%s",
                     self.mode,
                     self.unavailable_reason,
                 )
-                return
+                return False
 
             from services import devices as device_service
 
-            self._accepting_samples = True
-            device_service.register_sample_listener(self.handle_sample)
-            now = self.now_provider()
-            with self._execution_lock:
-                self._ensure_periodic_tasks(now=now, immediate=True)
-                self._reconcile_device_status(now=now)
-            self._scheduler_thread = threading.Thread(
-                target=self._run_scheduler,
-                args=(self._stop_event,),
-                name="shadow-scheduler",
-                daemon=True,
-            )
-            self._scheduler_thread.start()
+            try:
+                now = self.now_provider()
+                with self._execution_lock:
+                    self._ensure_periodic_tasks(now=now, immediate=True)
+                    self._reconcile_device_status(now=now)
+                device_service.register_sample_listener(self.handle_sample)
+                self._accepting_samples = True
+                self._scheduler_thread = threading.Thread(
+                    target=self._run_scheduler,
+                    args=(self._stop_event,),
+                    name="shadow-scheduler",
+                    daemon=True,
+                )
+                self._started = True
+                self._started_at = now
+                self._scheduler_thread.start()
+            except Exception:
+                self._started = False
+                self._accepting_samples = False
+                device_service.unregister_sample_listener(self.handle_sample)
+                self._scheduler_thread = None
+                raise
             logger.info(
                 "Shadow Runtime ready | worker_id=%s | devices=%s | scheduler=running",
                 self.worker_id,
                 ",".join(self.devices) if self.devices else "none",
             )
+            return True
 
     def stop(self) -> None:
         """Stop sample intake first, then let the durable worker release its lease."""

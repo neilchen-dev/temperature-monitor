@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from datetime import datetime
 from typing import Any
 
 import requests
@@ -289,23 +290,55 @@ def health():
     # Docker/Kubernetes must observe the alarm runtime, not merely the Flask
     # listener.  Otherwise sample ingestion can look healthy while event and
     # notification processing has silently stopped.
-    from runtime.bootstrap import runtime_liveness
+    from runtime.bootstrap import runtime_liveness, runtime_readiness
 
     runtime = runtime_liveness()
+    readiness = runtime_readiness()
     active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
     scheduler_running = bool(
         runtime.get("scheduler_running")
         or runtime.get("scheduler", {}).get("running")
     )
-    runtime_healthy = bool(runtime.get("available")) and (
-        not active_mode or scheduler_running
+    runtime_healthy = bool(runtime.get("available")) and scheduler_running
+    started_at = runtime.get("started_at")
+    startup_grace = False
+    if active_mode and not readiness.get("ready") and started_at:
+        try:
+            started_age = (
+                datetime.now().astimezone()
+                - datetime.fromisoformat(str(started_at))
+            ).total_seconds()
+            startup_grace = started_age < config.RUNTIME_READINESS_GRACE_SECONDS
+        except (TypeError, ValueError):
+            startup_grace = False
+    health_ok = runtime_healthy and (
+        not active_mode or readiness.get("ready") or startup_grace
     )
     status_code = 200 if runtime_healthy else 503
+    if active_mode and not readiness.get("ready") and not startup_grace:
+        status_code = 503
     return jsonify({
-        "status": "ok" if runtime_healthy else "degraded",
+        "status": (
+            "ok" if health_ok and readiness.get("ready")
+            else "starting" if health_ok and startup_grace
+            else "degraded"
+        ),
         "sqlite": db.get_stats(),
         "runtime": runtime,
+        "readiness": readiness,
     }), status_code
+
+
+@temperature_bp.get("/readyz")
+def readyz():
+    """Strict alarm-chain readiness probe for deploy/orchestrator gates."""
+    from runtime.bootstrap import runtime_readiness
+
+    readiness = runtime_readiness()
+    return jsonify({
+        "status": "ok" if readiness.get("ready") else "not_ready",
+        "readiness": readiness,
+    }), 200 if readiness.get("ready") else 503
 
 
 @temperature_bp.post("/temperature/heartbeat")

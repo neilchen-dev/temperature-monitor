@@ -177,6 +177,26 @@ jobs:
               echo "ERROR: could not create the SQLite backup directory"
               exit 1
             fi
+
+            # Keep deployment-generated backups bounded.  Manual/pre-cutover
+            # backups use different names and are preserved.  Retain the last
+            # 14 days and at most 5 timestamped deployment backups, including
+            # any SQLite sidecars for each removed database.
+            BACKUP_DIR="data/backups"
+            BACKUP_RETENTION_DAYS=14
+            BACKUP_RETENTION_COUNT=5
+            find "${BACKUP_DIR}" -maxdepth 1 -type f \
+              -name 'temperature_monitor_????????T??????Z.db' \
+              -mtime +"${BACKUP_RETENTION_DAYS}" -print -delete
+            old_backups=$(find "${BACKUP_DIR}" -maxdepth 1 -type f \
+              -name 'temperature_monitor_????????T??????Z.db' \
+              -printf '%T@ %p\n' | sort -nr | tail -n +$((BACKUP_RETENTION_COUNT + 1)) | cut -d' ' -f2-)
+            while IFS= read -r old_backup; do
+              [ -n "${old_backup}" ] || continue
+              rm -f "${old_backup}" "${old_backup}-wal" \
+                "${old_backup}-shm" "${old_backup}-journal"
+            done <<< "${old_backups}"
+            echo "Deployment backup retention applied: days=${BACKUP_RETENTION_DAYS}, count=${BACKUP_RETENTION_COUNT}"
             if ! docker exec \
               -e "SOURCE_DB=${DB_CONTAINER_PATH}" \
               -e "BACKUP_DB=${BACKUP_CONTAINER_PATH}" \
@@ -239,9 +259,8 @@ jobs:
               rollback
             fi
 
-            # /health 只证明 Flask/基础 SQLite 链路存活；Shadow Runtime
-            # 迁移失败时旧采集链路仍可能返回 200。显式检查 runtime.available，
-            # 但不要求 standards_ready=true：首次严格 Feishu sync 在部署后完成。
+            # /health 只证明 Flask/基础链路存活；Shadow Runtime
+            # 迁移失败时旧采集链路仍可能返回 200。显式检查 runtime.available。
             if ! SYSTEM_STATUS=$(curl --fail --silent --show-error \
               "http://127.0.0.1:${APP_PORT}/api/system/status"); then
               echo "ERROR: system status endpoint unavailable after deployment"
@@ -256,6 +275,24 @@ jobs:
               echo "ERROR: Shadow Runtime is not available after deployment; migration/startup likely failed"
               rollback
             fi
+
+            # Active/Shadow deployments must pass the strict alarm-chain gate.
+            # Active startup may need one initial standards sync, so allow the
+            # configured readiness grace window while still failing the deploy
+            # if the scheduler or task gates never become ready.
+            AUTOMATION_MODE_VALUE=$(grep -E '^AUTOMATION_MODE=' .env | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)
+            case "${AUTOMATION_MODE_VALUE}" in
+              active|shadow)
+                if ! curl --fail --silent --show-error --retry 40 --retry-delay 3 \
+                  "http://127.0.0.1:${APP_PORT}/readyz"; then
+                  echo "ERROR: strict Runtime readiness gate failed after deployment"
+                  rollback
+                fi
+                ;;
+              *)
+                echo "Runtime readiness gate skipped for AUTOMATION_MODE=${AUTOMATION_MODE_VALUE:-disabled}"
+                ;;
+            esac
 
             echo
             echo "Deployment successful: ${IMAGE_TAG}"

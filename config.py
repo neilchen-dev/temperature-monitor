@@ -74,6 +74,7 @@ def _load_hassio_options() -> None:
         "shadow_standard_sync_seconds": "SHADOW_STANDARD_SYNC_SECONDS",
         "shadow_feishu_delay_seconds": "SHADOW_FEISHU_DELAY_SECONDS",
         "runtime_shutdown_timeout_seconds": "RUNTIME_SHUTDOWN_TIMEOUT_SECONDS",
+        "runtime_readiness_grace_seconds": "RUNTIME_READINESS_GRACE_SECONDS",
         "automation_run_retention_days": "AUTOMATION_RUN_RETENTION_DAYS",
         "device_model_stale_seconds": "DEVICE_MODEL_STALE_SECONDS",
         "temperature_dedupe_window_ms": "TEMPERATURE_DEDUPE_WINDOW_MS",
@@ -381,6 +382,12 @@ SHADOW_FEISHU_DELAY_SECONDS = max(
 )
 RUNTIME_SHUTDOWN_TIMEOUT_SECONDS = max(
     1.0, _get_float("RUNTIME_SHUTDOWN_TIMEOUT_SECONDS", 15.0)
+)
+# Active readiness may be temporarily false while the first strict Feishu
+# standard sync completes after a restart.  /health reports ``starting``
+# during this grace period; /readyz remains strict for deployment gates.
+RUNTIME_READINESS_GRACE_SECONDS = max(
+    0.0, _get_float("RUNTIME_READINESS_GRACE_SECONDS", 120.0)
 )
 # automation_runs / automation_tasks 只保留最近 N 天；0 表示禁用清理。
 # SHADOW_COMPARE 每个采样一条 run，长跑会无限增长，必须给上限。

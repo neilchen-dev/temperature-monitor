@@ -70,9 +70,14 @@ def run_server() -> None:
     runtime = None
     try:
         runtime = build_runtime()
-        runtime.start()
+        if not runtime.start():
+            raise RuntimeError(
+                "Shadow Runtime refused to start; refusing to serve a green but silent process"
+            )
     except Exception:  # noqa: BLE001 - legacy service must remain available
         logger.exception("Shadow Runtime 装配失败，旧采集/历史链路继续运行")
+        if str(config.AUTOMATION_MODE).strip().lower() in {"active", "shadow"}:
+            raise
 
     collector.start_collectors()
     logger.info(

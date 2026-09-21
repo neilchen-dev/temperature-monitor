@@ -99,8 +99,8 @@ class RuntimeComponents:
     inspection_writer: FeishuInspectionRecordWriter
     notification_writer: FeishuNotificationWriter
 
-    def start(self) -> None:
-        self.runtime.start()
+    def start(self) -> bool:
+        return self.runtime.start()
 
     def stop(self) -> None:
         self.runtime.stop()
@@ -318,7 +318,70 @@ def runtime_liveness() -> dict[str, Any]:
         "scheduler_running": bool(thread is not None and thread.is_alive()),
         "reason": getattr(runtime, "unavailable_reason", None),
         "mode": getattr(runtime, "mode", None),
+        "started_at": (
+            getattr(runtime, "_started_at").isoformat()
+            if getattr(runtime, "_started_at", None) is not None
+            else None
+        ),
     }
+
+
+def runtime_readiness() -> dict[str, Any]:
+    """Return the strict alarm-chain readiness state.
+
+    Liveness only proves that the process and scheduler thread exist.  This
+    probe additionally checks the Active standards/task gates so a running
+    scheduler cannot make blocked event/notification writes look healthy.
+    """
+    if _last_components is None:
+        return {
+            "ready": False,
+            "available": False,
+            "scheduler_running": False,
+            "standards_ready": False,
+            "active_readiness": False,
+            "reasons": ["runtime not built"],
+        }
+    try:
+        status = _last_components.status()
+        active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
+        scheduler_running = bool(
+            status.get("scheduler_running")
+            or status.get("scheduler", {}).get("running")
+        )
+        task_health = status.get("automation_tasks") or {}
+        standards_ready = bool(status.get("standards_ready"))
+        active_readiness = bool(task_health.get("active_readiness", True))
+        reasons: list[str] = []
+        if not status.get("available"):
+            reasons.append(str(status.get("reason") or "runtime unavailable"))
+        if not scheduler_running:
+            reasons.append("scheduler not running")
+        if active_mode and not standards_ready:
+            reasons.append("standards not ready")
+        if active_mode and not active_readiness:
+            reasons.extend(str(item) for item in task_health.get("blocker_reasons", ()))
+        ready = bool(status.get("available")) and scheduler_running and (
+            not active_mode or (standards_ready and active_readiness)
+        )
+        return {
+            "ready": ready,
+            "available": bool(status.get("available")),
+            "scheduler_running": scheduler_running,
+            "standards_ready": standards_ready,
+            "active_readiness": active_readiness,
+            "reasons": reasons,
+        }
+    except Exception:  # noqa: BLE001 - readiness must fail closed
+        logger.exception("读取 Runtime readiness 失败")
+        return {
+            "ready": False,
+            "available": False,
+            "scheduler_running": False,
+            "standards_ready": False,
+            "active_readiness": False,
+            "reasons": ["runtime readiness unavailable"],
+        }
 
 
 def shadow_summary_snapshot(*, hours: int = 24) -> dict[str, Any]:
