@@ -289,9 +289,9 @@ def health():
     # Docker/Kubernetes must observe the alarm runtime, not merely the Flask
     # listener.  Otherwise sample ingestion can look healthy while event and
     # notification processing has silently stopped.
-    from runtime.bootstrap import runtime_status
+    from runtime.bootstrap import runtime_liveness
 
-    runtime = runtime_status()
+    runtime = runtime_liveness()
     active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
     scheduler_running = bool(
         runtime.get("scheduler_running")

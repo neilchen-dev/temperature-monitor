@@ -295,6 +295,29 @@ def runtime_status() -> dict[str, Any]:
     return status
 
 
+def runtime_liveness() -> dict[str, Any]:
+    """Return a constant-time probe without Feishu or SQLite reads.
+
+    Container health checks run frequently and must not contend with the
+    scheduler's durable-task transaction or remote synchronization work.
+    Detailed diagnostics remain available from ``runtime_status``.
+    """
+    if _last_components is None:
+        return {
+            "available": False,
+            "scheduler_running": False,
+            "reason": "runtime not built",
+        }
+    runtime = _last_components.runtime
+    thread = getattr(runtime, "_scheduler_thread", None)
+    return {
+        "available": bool(getattr(runtime, "available", False)),
+        "scheduler_running": bool(thread is not None and thread.is_alive()),
+        "reason": getattr(runtime, "unavailable_reason", None),
+        "mode": getattr(runtime, "mode", None),
+    }
+
+
 def shadow_summary_snapshot(*, hours: int = 24) -> dict[str, Any]:
     """Read-only Shadow aggregates for /api/shadow/summary."""
     if _last_components is None:

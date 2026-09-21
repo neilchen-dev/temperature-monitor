@@ -308,7 +308,7 @@ class AnalyticsRouteTests(unittest.TestCase):
 
     def test_health_includes_sqlite_stats(self) -> None:
         with mock.patch(
-            "runtime.bootstrap.runtime_status",
+            "runtime.bootstrap.runtime_liveness",
             return_value={
                 "available": True,
                 "scheduler_running": True,
@@ -327,7 +327,7 @@ class AnalyticsRouteTests(unittest.TestCase):
 
     def test_health_is_degraded_when_active_runtime_is_unavailable(self) -> None:
         with mock.patch(
-            "runtime.bootstrap.runtime_status",
+            "runtime.bootstrap.runtime_liveness",
             return_value={
                 "available": False,
                 "scheduler_running": False,
