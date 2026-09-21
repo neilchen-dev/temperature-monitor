@@ -308,7 +308,10 @@ def runtime_liveness() -> dict[str, Any]:
             "scheduler_running": False,
             "reason": "runtime not built",
         }
-    runtime = _last_components.runtime
+    # ``build_runtime`` stores the live ``ShadowRuntime`` here (the public
+    # ``RuntimeComponents`` wrapper is returned to callers but is not retained
+    # globally), so do not assume a nested ``.runtime`` attribute.
+    runtime = _last_components
     thread = getattr(runtime, "_scheduler_thread", None)
     return {
         "available": bool(getattr(runtime, "available", False)),
