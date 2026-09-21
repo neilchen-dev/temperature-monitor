@@ -211,6 +211,18 @@ jobs:
               echo "ERROR: SQLite backup quick_check=${QUICK_CHECK}"
               exit 1
             fi
+            # The newly created backup is included in the count.  Run the
+            # count-bound cleanup again after the online backup so the policy
+            # is true after every deployment, not only before it.
+            old_backups=$(find "${BACKUP_DIR}" -maxdepth 1 -type f \
+              -name 'temperature_monitor_????????T??????Z.db' \
+              -printf '%T@ %p\n' | sort -nr | tail -n +$((BACKUP_RETENTION_COUNT + 1)) | cut -d' ' -f2-)
+            while IFS= read -r old_backup; do
+              [ -n "${old_backup}" ] || continue
+              rm -f "${old_backup}" "${old_backup}-wal" \
+                "${old_backup}-shm" "${old_backup}-journal"
+            done <<< "${old_backups}"
+            echo "Deployment backup post-create count cleanup applied: count=${BACKUP_RETENTION_COUNT}"
             echo "SQLite consistency backup completed: ${BACKUP_HOST_PATH}"
 
             if grep -q '^IMAGE_REPOSITORY=' .env; then
