@@ -345,20 +345,12 @@ def _compute_runtime_readiness(components: Any) -> dict[str, Any]:
             "reasons": ["runtime not built"],
         }
     # The scheduler and sample listener share one SQLite connection and the
-    # execution lock.  A health probe must never wait behind a long Feishu
-    # write or database transaction: report a transient not-ready state and
-    # let the next probe retry instead of starving Waitress request threads.
+    # execution lock.  This function runs only in the coalesced background
+    # refresh thread, so it may wait for that lock; the HTTP probe itself
+    # remains constant-time because it only reads the cache below.
     execution_lock = getattr(components, "_execution_lock", None)
-    if execution_lock is not None and not execution_lock.acquire(blocking=False):
-        liveness = runtime_liveness()
-        return {
-            "ready": False,
-            "available": bool(liveness.get("available")),
-            "scheduler_running": bool(liveness.get("scheduler_running")),
-            "standards_ready": False,
-            "active_readiness": False,
-            "reasons": ["runtime busy; readiness will be retried"],
-        }
+    if execution_lock is not None:
+        execution_lock.acquire()
     try:
         status = components.status()
         active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
