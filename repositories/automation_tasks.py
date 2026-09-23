@@ -45,6 +45,14 @@ CREATE INDEX IF NOT EXISTS idx_automation_tasks_status_finished
     ON automation_tasks(status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_automation_tasks_entity
     ON automation_tasks(entity_type, entity_id, status);
+CREATE INDEX IF NOT EXISTS idx_automation_tasks_status_created
+    ON automation_tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_automation_tasks_status_epoch
+    ON automation_tasks(status, active_epoch);
+CREATE INDEX IF NOT EXISTS idx_automation_tasks_superseded
+    ON automation_tasks(task_type, entity_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_automation_tasks_external_readiness
+    ON automation_tasks(task_type, status, created_mode, active_epoch, created_at);
 
 CREATE TABLE IF NOT EXISTS automation_runtime_state (
     singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),

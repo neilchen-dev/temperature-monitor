@@ -755,12 +755,11 @@ def build_runtime(
         },
         recorder=run_repository,
         action_enabled_provider=_active_action_enabled,
-        standards_ready_provider=lambda: (
-            standard_repository.standards_ready(expected_device_ids=devices.keys())
-            and task_repository.active_readiness(
-                non_blocking_task_types=_active_readiness_non_blocking_task_types()
-            )["active_readiness"]
-        ),
+        # Sensor samples are handled under the Runtime execution lock. Do not
+        # walk the full automation task history on every sample; readiness is
+        # computed once in the coalesced background refresh and served from its
+        # short-lived fail-closed cache.
+        standards_ready_provider=lambda: bool(runtime_readiness().get("ready")),
         active_epoch_provider=lambda: task_repository.runtime_context().active_epoch,
         active_cutover_at_provider=lambda: task_repository.runtime_context().active_cutover_at,
     )
