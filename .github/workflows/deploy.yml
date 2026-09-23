@@ -87,8 +87,6 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
           REGISTRY: ${{ env.REGISTRY }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
@@ -96,7 +94,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          envs: IMAGE_TAG,ACR_USERNAME,ACR_PASSWORD,REGISTRY,IMAGE_NAME,DEPLOY_PATH
+          envs: IMAGE_TAG,REGISTRY,IMAGE_NAME,DEPLOY_PATH
           command_timeout: 12m
 
           script: |
@@ -141,10 +139,6 @@ jobs:
             OLD_IMAGE=$(docker inspect temperature-monitor --format='{{.Config.Image}}' 2>/dev/null || true)
             OLD_TAG=$(grep -E '^IMAGE_TAG=' .env | tail -n 1 | cut -d= -f2 | tr -d '\r' || true)
             echo "Previous image: ${OLD_IMAGE:-none}"
-
-            echo "${ACR_PASSWORD}" | docker login "${REGISTRY}" \
-              --username "${ACR_USERNAME}" \
-              --password-stdin
 
             IMAGE_REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
 
@@ -191,14 +185,16 @@ jobs:
 
             docker compose ps
 
-            if ! curl --fail --silent --show-error --retry 10 --retry-delay 3 \
+            if ! curl --connect-timeout 3 --max-time 5 \
+              --fail --silent --show-error --retry 10 --retry-delay 3 \
               "http://127.0.0.1:${APP_PORT}/health"; then
               rollback
             fi
 
             # /health 只证明 Flask/基础链路存活；Shadow Runtime
             # 迁移失败时旧采集链路仍可能返回 200。显式检查 runtime.available。
-            if ! SYSTEM_STATUS=$(curl --fail --silent --show-error \
+            if ! SYSTEM_STATUS=$(curl --connect-timeout 3 --max-time 5 \
+              --fail --silent --show-error \
               "http://127.0.0.1:${APP_PORT}/api/system/status"); then
               echo "ERROR: system status endpoint unavailable after deployment"
               rollback
@@ -220,7 +216,9 @@ jobs:
             AUTOMATION_MODE_VALUE=$(grep -E '^AUTOMATION_MODE=' .env | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)
             case "${AUTOMATION_MODE_VALUE}" in
               active|shadow)
-                if ! curl --fail --silent --show-error --retry 40 --retry-delay 3 \
+                if ! curl --connect-timeout 3 --max-time 5 \
+                  --fail --silent --show-error --retry 40 --retry-delay 3 \
+                  --retry-max-time 150 \
                   "http://127.0.0.1:${APP_PORT}/readyz"; then
                   echo "ERROR: strict Runtime readiness gate failed after deployment"
                   rollback

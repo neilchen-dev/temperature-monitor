@@ -40,7 +40,7 @@ class TemperatureRouteTests(unittest.TestCase):
     def test_uses_mapped_name_for_record_discovery(self) -> None:
         with (
             patch("routes.temperature.resolve_record_id", return_value="rec_01") as resolve,
-            patch("routes.temperature.update_feishu_fields", return_value={"code": 0}),
+            patch("routes.temperature.update_feishu_fields", return_value={"code": 0}) as update,
             patch("routes.temperature.save_history"),
             patch("routes.temperature.devices.persist_sample") as persist,
         ):
@@ -55,7 +55,15 @@ class TemperatureRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        resolve.assert_called_once_with("DEV-01", None)
+        resolve.assert_called_once_with(
+            "DEV-01",
+            None,
+            attempt_timeout=config.FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            update.call_args.kwargs["attempt_timeout"],
+            config.FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS,
+        )
         # 统一设备模型使用映射后的设备编号（与飞书/历史采样同一身份），
         # 而不是 HA 上报的原始名称
         persist.assert_called_once()

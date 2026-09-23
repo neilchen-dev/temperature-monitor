@@ -161,12 +161,21 @@ def temperature():
     if not suppressed:
         attempted = True
         try:
-            record_id = resolve_record_id(bitable_device, configured_record_id)
+            # Keep sensor ingestion bounded when Feishu is slow. A single
+            # short attempt preserves realtime projection during normal
+            # operation; the durable scheduler retry handles failures.
+            attempt_timeout = config.FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS
+            record_id = resolve_record_id(
+                bitable_device,
+                configured_record_id,
+                attempt_timeout=attempt_timeout,
+            )
             result = update_feishu_fields(
                 record_id,
                 projection.build_projection_fields(
                     temperature_c, humidity, offline=offline
                 ),
+                attempt_timeout=attempt_timeout,
             )
         except (
             requests.exceptions.RequestException,
