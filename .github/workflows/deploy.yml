@@ -185,23 +185,18 @@ jobs:
 
             docker compose ps
 
-            if ! curl --connect-timeout 3 --max-time 5 \
+            if ! HEALTH_STATUS=$(curl --connect-timeout 3 --max-time 5 \
               --fail --silent --show-error --retry 10 --retry-delay 3 \
-              "http://127.0.0.1:${APP_PORT}/health"; then
+              "http://127.0.0.1:${APP_PORT}/health"); then
               rollback
             fi
 
-            # /health 只证明 Flask/基础链路存活；Shadow Runtime
-            # 迁移失败时旧采集链路仍可能返回 200。显式检查 runtime.available。
-            if ! SYSTEM_STATUS=$(curl --connect-timeout 3 --max-time 5 \
-              --fail --silent --show-error \
-              "http://127.0.0.1:${APP_PORT}/api/system/status"); then
-              echo "ERROR: system status endpoint unavailable after deployment"
-              rollback
-            fi
-            if ! RUNTIME_AVAILABLE=$(printf '%s' "${SYSTEM_STATUS}" | docker exec -i temperature-monitor python -c \
-              'import json, sys; print("true" if json.load(sys.stdin).get("runtime", {}).get("available") is True else "false")'); then
-              echo "ERROR: unable to parse runtime availability from system status"
+            # /health is the constant-time liveness probe and includes the
+            # runtime availability snapshot. /api/system/status performs
+            # diagnostic aggregates and can contend with startup SQLite work.
+            if ! RUNTIME_AVAILABLE=$(printf '%s' "${HEALTH_STATUS}" | docker exec -i temperature-monitor python -c \
+              'import json, sys; runtime=json.load(sys.stdin).get("runtime", {}); print("true" if runtime.get("available") is True and runtime.get("scheduler_running") is True else "false")'); then
+              echo "ERROR: unable to parse runtime liveness from health response"
               rollback
             fi
             if [ "${RUNTIME_AVAILABLE}" != "true" ]; then

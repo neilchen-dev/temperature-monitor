@@ -1231,10 +1231,8 @@ def fetch_device_events(
 def fetch_device_summary() -> dict[str, Any]:
     """Aggregates for /api/system/status.
 
-    Two distinct counts with distinct meanings:
-    - ``device_count``: distinct device ids (physical-ish device count)
-    - ``identity_count``: distinct (device, source) pairs — matches the row
-      count of GET /api/devices
+    The compact ``device_presence`` table has one row per (device, source),
+    so diagnostics stay bounded as append-only ``device_samples`` grows.
     """
     connection = _get_connection()
     if connection is None:
@@ -1246,12 +1244,11 @@ def fetch_device_summary() -> dict[str, Any]:
         with _lock:
             row = connection.execute(
                 "SELECT"
-                " (SELECT COUNT(DISTINCT device) FROM device_samples)"
+                " (SELECT COUNT(DISTINCT device) FROM device_presence)"
                 "   AS device_count,"
-                " (SELECT COUNT(*) FROM"
-                "   (SELECT DISTINCT device, source FROM device_samples))"
+                " (SELECT COUNT(*) FROM device_presence)"
                 "   AS identity_count,"
-                " (SELECT MAX(sample_time_ms) FROM device_samples)"
+                " (SELECT MAX(last_measurement_at_ms) FROM device_presence)"
                 "   AS last_sample_time_ms"
             ).fetchone()
         return (
