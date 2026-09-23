@@ -1095,39 +1095,39 @@ def fetch_previous_device_sample(
         return None
 
 
-def fetch_latest_device_states() -> list[dict[str, Any]]:
+def fetch_latest_device_states(*, include_sample_counts: bool = False) -> list[dict[str, Any]]:
     """Latest unified sample per (device, source) — no cross-source fusion.
 
-    ROW_NUMBER keeps the query portable; a device reporting through two
-    sources intentionally shows two rows, each carrying its own source.
+    The default path uses compact presence state. Exact counts remain
+    available on demand through indexed per-source lookups.
     """
     connection = _get_connection()
     if connection is None:
         return []
 
-    query = """
-        WITH ranked AS (
-            SELECT
-                device,
-                source,
-                sample_time_ms,
-                sample_time_iso,
-                temperature,
-                humidity,
-                status,
-                ROW_NUMBER() OVER (
-                    PARTITION BY device, source
-                    ORDER BY sample_time_ms DESC
-                ) AS rn,
-                COUNT(*) OVER (PARTITION BY device, source) AS sample_count
-            FROM device_samples
-        )
+    sample_count = (
+        "(SELECT COUNT(*) FROM device_samples AS counted "
+        "WHERE counted.device = presence.device "
+        "AND counted.source = presence.source)"
+        if include_sample_counts
+        else "NULL"
+    )
+    query = f"""
         SELECT
-            device, source, sample_time_ms, sample_time_iso,
-            temperature, humidity, status, sample_count
-        FROM ranked
-        WHERE rn = 1
-        ORDER BY device, source
+            sample.device, sample.source, sample.sample_time_ms,
+            sample.sample_time_iso, sample.temperature, sample.humidity,
+            sample.status, {sample_count} AS sample_count
+        FROM device_presence AS presence
+        JOIN device_samples AS sample
+          ON sample.device = presence.device
+         AND sample.source = presence.source
+         AND sample.sample_time_ms = (
+             SELECT MAX(latest.sample_time_ms)
+             FROM device_samples AS latest
+             WHERE latest.device = presence.device
+               AND latest.source = presence.source
+         )
+        ORDER BY presence.device, presence.source
     """
     try:
         with _lock:

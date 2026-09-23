@@ -180,13 +180,34 @@ class DeviceModelTestCase(unittest.TestCase):
         devices.record_sample("TH-01", "home_assistant", 24.8, 53.0, "online", 1755000002000)
 
         states = {
-            row["device"]: row for row in db.fetch_latest_device_states()
+            row["device"]: row
+            for row in db.fetch_latest_device_states(include_sample_counts=True)
         }
         self.assertEqual(set(states), {"PLC-01", "TH-01"})
         self.assertEqual(states["TH-01"]["source"], "home_assistant")
         self.assertEqual(states["TH-01"]["temperature"], 24.8)
         self.assertEqual(states["TH-01"]["sample_count"], 2)
         self.assertEqual(states["PLC-01"]["source"], "modbus")
+
+    def test_latest_state_hot_path_does_not_scan_history_for_window_counts(self) -> None:
+        devices.record_sample(
+            "TH-01", "home_assistant", 24.6, 52.0, "online", 1755000000000
+        )
+        connection = db._get_connection()
+        self.assertIsNotNone(connection)
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            rows = db.fetch_latest_device_states()
+        finally:
+            connection.set_trace_callback(None)
+
+        self.assertEqual(len(rows), 1)
+        latest_query = next(
+            sql for sql in statements if "device_presence AS presence" in sql
+        )
+        self.assertNotIn("ROW_NUMBER()", latest_query)
+        self.assertNotIn("COUNT(*) OVER", latest_query)
 
     def test_duplicate_timestamp_replaces_row(self) -> None:
         devices.record_sample("PLC-01", "modbus", 25.0, 50.0, "online", 1755000000000)
