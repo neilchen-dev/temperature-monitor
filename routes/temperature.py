@@ -323,7 +323,9 @@ def health():
             else "starting" if health_ok and startup_grace
             else "degraded"
         ),
-        "sqlite": db.get_stats(),
+        # Exact COUNT(*) scans can exceed Docker's 5-second probe timeout on
+        # production-sized append-only tables. Keep liveness checks constant-time.
+        "sqlite": db.get_stats(include_counts=False),
         "runtime": runtime,
         "readiness": readiness,
     }), status_code

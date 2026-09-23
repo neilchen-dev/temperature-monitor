@@ -97,6 +97,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           envs: IMAGE_TAG,ACR_USERNAME,ACR_PASSWORD,REGISTRY,IMAGE_NAME,DEPLOY_PATH
+          command_timeout: 25m
 
           script: |
             set -euo pipefail

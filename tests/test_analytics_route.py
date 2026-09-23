@@ -306,7 +306,7 @@ class AnalyticsRouteTests(unittest.TestCase):
             ).status_code, 503,
         )
 
-    def test_health_includes_sqlite_stats(self) -> None:
+    def test_health_includes_lightweight_sqlite_stats(self) -> None:
         with mock.patch(
             "runtime.bootstrap.runtime_liveness",
             return_value={
@@ -332,7 +332,8 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertTrue(payload["sqlite"]["enabled"])
         self.assertEqual(payload["sqlite"]["write_failures"], 0)
-        self.assertEqual(payload["sqlite"]["history_snapshot_count"], 4)
+        self.assertIsNone(payload["sqlite"]["history_snapshot_count"])
+        self.assertIsNone(payload["sqlite"]["temperature_report_count"])
         self.assertTrue(payload["runtime"]["scheduler_running"])
 
     def test_health_is_degraded_when_active_runtime_is_unavailable(self) -> None:

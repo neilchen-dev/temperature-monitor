@@ -674,26 +674,30 @@ def fetch_history_snapshots(
         return []
 
 
-def get_stats() -> dict[str, Any]:
+def get_stats(*, include_counts: bool = True) -> dict[str, Any]:
     """Mirror health snapshot for /health: failures and row counts.
 
     Row counts double as a rough lag indicator when compared against the
-    Feishu-side record counts.
+    Feishu-side record counts. Liveness/status endpoints should pass
+    ``include_counts=False`` because exact SQLite COUNT(*) scans become slow
+    as the append-only report table grows.
     """
     global _write_failures
 
-    stats: dict[str, Any] = {
-        "enabled": bool(config.SQLITE_ENABLED) and _get_connection() is not None,
-        "write_failures": _write_failures,
-        "temperature_report_count": 0,
-        "history_snapshot_count": 0,
-    }
     connection = _get_connection()
-    if connection is None:
+    stats: dict[str, Any] = {
+        "enabled": bool(config.SQLITE_ENABLED) and connection is not None,
+        "write_failures": _write_failures,
+        "temperature_report_count": None,
+        "history_snapshot_count": None,
+    }
+    if connection is None or not include_counts:
         return stats
 
     try:
         with _lock:
+            stats["temperature_report_count"] = 0
+            stats["history_snapshot_count"] = 0
             stats["temperature_report_count"] = connection.execute(
                 "SELECT COUNT(*) FROM temperature_reports"
             ).fetchone()[0]

@@ -495,7 +495,9 @@ def system_status():
     return jsonify({
         "status": "ok",
         "service": "temperature-monitor",
-        "sqlite": db.get_stats(),
+        # This endpoint is part of deployment verification; avoid full-table
+        # COUNT(*) scans here as well as in the container liveness probe.
+        "sqlite": db.get_stats(include_counts=False),
         "collectors": get_collector_status(),
         "runtime": runtime_status(),
         **canary,
