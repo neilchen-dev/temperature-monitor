@@ -313,10 +313,14 @@ class ShadowAuditTests(unittest.TestCase):
                 (f"run-{i}", old.isoformat(), created_at),
             )
         cutoff = now - timedelta(days=config.AUTOMATION_RUN_RETENTION_DAYS)
-        purged_tasks = purge_finished_automation_tasks(connection, cutoff)
-        purged_runs = purge_automation_runs(connection, cutoff)
-        self.assertEqual(purged_tasks, 2)
+        purged_tasks = purge_finished_automation_tasks(
+            connection, cutoff, batch_size=1
+        )
+        purged_runs = purge_automation_runs(connection, cutoff, batch_size=1)
+        self.assertEqual(purged_tasks, 1)
         self.assertEqual(purged_runs, 1)
+        self.assertEqual(purge_finished_automation_tasks(connection, cutoff), 1)
+        self.assertEqual(purge_automation_runs(connection, cutoff), 0)
         remaining_status = connection.execute(
             "SELECT status FROM automation_tasks ORDER BY id"
         ).fetchall()
@@ -398,7 +402,7 @@ class ShadowAuditTests(unittest.TestCase):
             """,
             (old, old, old, old),
         )
-        components.runtime._last_purge_time = None
+        components.runtime._last_purge_time = now - timedelta(hours=2)
         components.runtime._maybe_purge()
         remaining_runs = connection.execute(
             "SELECT id FROM automation_runs ORDER BY id"

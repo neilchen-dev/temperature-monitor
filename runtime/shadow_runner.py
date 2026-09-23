@@ -405,6 +405,12 @@ class ShadowRuntime:
         if retention_days <= 0:
             return
         now = self.now_provider()
+        if self._last_purge_time is None:
+            # Do not make the first Active/Shadow scheduler tick scan or
+            # prune large audit tables while sensor ingestion is recovering
+            # from a restart. The bounded, indexed purge runs on a later tick.
+            self._last_purge_time = now
+            return
         if (
             self._last_purge_time is not None
             and now - self._last_purge_time < _PURGE_INTERVAL

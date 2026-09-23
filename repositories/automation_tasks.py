@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS automation_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_automation_tasks_due
     ON automation_tasks(status, due_at);
+CREATE INDEX IF NOT EXISTS idx_automation_tasks_status_finished
+    ON automation_tasks(status, finished_at);
 CREATE INDEX IF NOT EXISTS idx_automation_tasks_entity
     ON automation_tasks(entity_type, entity_id, status);
 
@@ -1384,21 +1386,24 @@ class SQLiteAutomationTaskRepository:
 def purge_finished_automation_tasks(
     connection: sqlite3.Connection,
     cutoff: datetime,
+    *,
+    batch_size: int = 5000,
 ) -> int:
-    """Delete terminal tasks finished before ``cutoff``; return count.
+    """Delete one indexed, bounded batch of terminal tasks before ``cutoff``.
 
     SHADOW_COMPARE 每个采样建一条任务（dedupe=device+sample_time），不加
     清理会无限增长。只删 SUCCEEDED/FAILED/CANCELLED，运行中的不动。
     """
+    limit = max(1, int(batch_size))
+
     def delete() -> int:
         cursor = connection.execute(
-            """
-            DELETE FROM automation_tasks
-            WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
-              AND finished_at IS NOT NULL
-              AND finished_at < ?
-            """,
-            (_datetime_text(cutoff),),
+            "DELETE FROM automation_tasks WHERE id IN ("
+            " SELECT id FROM automation_tasks"
+            " WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')"
+            " AND finished_at < ? LIMIT ?"
+            ")",
+            (_datetime_text(cutoff), limit),
         )
         connection.commit()
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
