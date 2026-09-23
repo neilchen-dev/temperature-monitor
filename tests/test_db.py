@@ -206,6 +206,25 @@ class SqliteMirrorTests(unittest.TestCase):
         self.assertTrue(all(connection is not None for connection in results))
         self.assertFalse(db._init_failed)
 
+    def test_device_presence_backfill_skips_full_history_after_initialization(self) -> None:
+        connection = db._get_connection()
+        connection.execute(
+            "INSERT INTO device_presence ("
+            "device, source, last_measurement_at_ms, last_heartbeat_at_ms,"
+            "availability, updated_at"
+            ") VALUES ('TH-01', 'home_assistant', 1, 1, 'online', 't')"
+        )
+        connection.commit()
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            db._backfill_device_presence(connection)
+        finally:
+            connection.set_trace_callback(None)
+
+        self.assertTrue(any("SELECT 1 FROM device_presence LIMIT 1" in sql for sql in statements))
+        self.assertFalse(any("FROM device_samples AS sample" in sql for sql in statements))
+
     def test_legacy_device_events_gains_source_column(self) -> None:
         # 旧版本建的库缺 device_events.source 列；重开连接必须补列，
         # 且补列后带 source 的写入/读取正常、旧行数据保留。

@@ -201,8 +201,15 @@ def _backfill_device_presence(connection: sqlite3.Connection) -> None:
 
     The migration is additive and idempotent.  Reusing the old timestamp as
     the initial heartbeat is conservative: an old row remains stale rather
-    than becoming fresh merely because the table was created.
+    than becoming fresh merely because the table was created.  Once any
+    presence row exists the migration has completed; samples written after
+    migration maintain this table incrementally.  Skipping the full-history
+    query on warm startup keeps large production databases from being scanned
+    on every process restart.
     """
+    if connection.execute("SELECT 1 FROM device_presence LIMIT 1").fetchone():
+        return
+
     connection.execute(
         """
         INSERT INTO device_presence (

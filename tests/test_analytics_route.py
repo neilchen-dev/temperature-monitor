@@ -306,7 +306,7 @@ class AnalyticsRouteTests(unittest.TestCase):
             ).status_code, 503,
         )
 
-    def test_health_includes_lightweight_sqlite_stats(self) -> None:
+    def test_health_is_independent_of_sqlite_state_reads(self) -> None:
         with mock.patch(
             "runtime.bootstrap.runtime_liveness",
             return_value={
@@ -324,16 +324,16 @@ class AnalyticsRouteTests(unittest.TestCase):
                 "active_readiness": True,
                 "reasons": [],
             },
+        ), mock.patch(
+            "services.db.get_stats",
+            side_effect=AssertionError("health probes must not acquire SQLite lock"),
         ):
             response = self.client.get("/health")
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["status"], "ok")
-        self.assertTrue(payload["sqlite"]["enabled"])
-        self.assertEqual(payload["sqlite"]["write_failures"], 0)
-        self.assertIsNone(payload["sqlite"]["history_snapshot_count"])
-        self.assertIsNone(payload["sqlite"]["temperature_report_count"])
+        self.assertNotIn("sqlite", payload)
         self.assertTrue(payload["runtime"]["scheduler_running"])
 
     def test_health_is_degraded_when_active_runtime_is_unavailable(self) -> None:

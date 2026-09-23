@@ -9,7 +9,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 import config
-from services import db, devices, projection
+from services import devices, projection
 from services.feishu import resolve_record_id, update_feishu_fields
 from services.storage import save_history
 from services.validator import is_offline_status, normalize_humidity, normalize_temperature
@@ -345,9 +345,8 @@ def health():
             else "starting" if health_ok and startup_grace
             else "degraded"
         ),
-        # Exact COUNT(*) scans can exceed Docker's 5-second probe timeout on
-        # production-sized append-only tables. Keep liveness checks constant-time.
-        "sqlite": db.get_stats(include_counts=False),
+        # Keep liveness probes independent from the shared SQLite write lock.
+        # Detailed database health remains available from /api/system/status.
         "runtime": runtime,
         "readiness": readiness,
     }), status_code
