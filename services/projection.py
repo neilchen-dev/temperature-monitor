@@ -193,15 +193,34 @@ def note_sample_persisted(device: str, sample_time_ms: int) -> None:
     db.note_projection_sample(device, int(sample_time_ms))
 
 
-def mark_projection_queued(device: str) -> None:
+def _has_unprojected_sample(state: dict[str, Any]) -> bool:
+    sample_time = state.get("last_sample_time_ms")
+    projected_time = state.get("last_projected_sample_time_ms")
+    return sample_time is not None and (
+        projected_time is None or int(sample_time) > int(projected_time)
+    )
+
+
+def mark_projection_queued(device: str, *, new_sample: bool = False) -> None:
     """Queue a newly persisted sample for immediate scheduler projection.
 
-    Preserve any existing retry/backoff episode. Only an ``ok`` device starts
-    a fresh pending episode, with no last-attempt timestamp so the scheduler
-    can pick it up on its next tick.
+    Preserve any existing retry/backoff episode. An ``ok`` device starts a
+    fresh episode; an exhausted device is re-armed only when a genuinely new
+    sample has arrived and remains unprojected.
     """
     state = _fetch_state(device)
     status = str(state.get("projection_status") or PROJECTION_OK)
+    if status == PROJECTION_FAILED and new_sample and _has_unprojected_sample(state):
+        db.update_projection_status(
+            device,
+            projection_status=PROJECTION_PENDING,
+            retry_count=0,
+            last_error=None,
+            last_attempt_at=None,
+            projected_at=state.get("projected_at"),
+        )
+        logger.info("feishu_projection_rearmed_for_new_sample | device=%s", device)
+        return
     if status != PROJECTION_OK:
         return
     db.update_projection_status(
@@ -256,15 +275,18 @@ def mark_projection_success(
 
 
 def mark_projection_failure(
-    device: str, error: Any, now: datetime | None = None
+    device: str,
+    error: Any,
+    now: datetime | None = None,
+    *,
+    new_sample: bool = False,
 ) -> None:
     """Inline projection failed on /temperature.
 
     Transitions ``ok -> pending`` (new failure episode, retry counter
     reset). An already-``pending`` device keeps its retry counter (the
-    scheduler owns backoff growth); a terminal ``failed`` device stays
-    ``failed`` — inline attempts must never re-arm an exhausted retry
-    loop, or a long outage would produce an infinite retry storm.
+    scheduler owns backoff growth); a terminal ``failed`` device is re-armed
+    only when this call belongs to a new unprojected sample.
     """
     if isinstance(error, BaseException) and _is_deleted_feishu_record(error):
         mark_projection_remote_record_deleted(device, error, now=now)
@@ -273,7 +295,11 @@ def mark_projection_failure(
     status = str(state.get("projection_status") or PROJECTION_OK)
     if status == PROJECTION_REMOTE_RECORD_DELETED:
         return
-    if status == PROJECTION_OK:
+    if status == PROJECTION_OK or (
+        status == PROJECTION_FAILED
+        and new_sample
+        and _has_unprojected_sample(state)
+    ):
         status = PROJECTION_PENDING
         retry_count = 0
     else:
@@ -295,6 +321,37 @@ def mark_projection_failure(
         retry_count,
         error_text,
     )
+
+
+def requeue_failed_projection_states(now: datetime | None = None) -> int:
+    """Recover exhausted projections when their latest local sample is unsent.
+
+    This runs at process startup, so an old terminal failure cannot strand a
+    durable local temperature/humidity sample indefinitely after a restart.
+    Devices with no unsent sample and remotely deleted rows stay untouched.
+    """
+    recovered = 0
+    for state in db.fetch_projection_states(status=PROJECTION_FAILED):
+        device = str(state.get("device") or "")
+        if not device or not _has_unprojected_sample(state):
+            continue
+        db.update_projection_status(
+            device,
+            projection_status=PROJECTION_PENDING,
+            retry_count=0,
+            last_error=None,
+            last_attempt_at=None,
+            projected_at=state.get("projected_at"),
+        )
+        recovered += 1
+    if recovered:
+        logger.warning(
+            "failed Feishu projections requeued at runtime startup"
+            " | count=%s | at=%s",
+            recovered,
+            _now_iso(now),
+        )
+    return recovered
 
 
 def mark_projection_remote_record_deleted(

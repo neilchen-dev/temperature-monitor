@@ -148,40 +148,47 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
         self.assertIn("current_failed_tasks=1", summary["blocker_reasons"])
         self.assertFalse(summary["active_readiness"])
 
-    def test_gated_projection_failure_does_not_block_formal_active_readiness(self) -> None:
+    def test_feishu_projection_failures_do_not_block_formal_active_readiness(self) -> None:
         activation = self.repository.set_runtime_context(
             mode="active", now=self.created_at
         )
-        task = self.repository.create_or_get(
-            task_type="PROJECT_DEVICE_STATUS",
-            entity_type="DEVICE",
-            entity_id="TH-04",
-            due_at=self.created_at,
-            payload={"device_id": "TH-04"},
-            dedupe_key="PROJECT_DEVICE_STATUS:TH-04:old-hash",
-            created_at=self.created_at,
-        )
+        tasks = []
+        for task_type, dedupe_key in (
+            ("PROJECT_DEVICE_STATUS", "PROJECT_DEVICE_STATUS:TH-04:old-hash"),
+            ("FEISHU_PROJECTION", "FEISHU_PROJECTION:TH-04"),
+        ):
+            tasks.append(self.repository.create_or_get(
+                task_type=task_type,
+                entity_type="DEVICE",
+                entity_id="TH-04",
+                due_at=self.created_at,
+                payload={"device_id": "TH-04"},
+                dedupe_key=dedupe_key,
+                created_at=self.created_at,
+            ))
         self.repository.claim_due(now=self.created_at, worker_id="worker-a")
-        self.repository.mark_failed(
-            task.task_id,
-            finished_at=self.created_at + timedelta(seconds=1),
-            error="projection schema mismatch",
-            worker_id="worker-a",
-        )
+        for task in tasks:
+            self.repository.mark_failed(
+                task.task_id,
+                finished_at=self.created_at + timedelta(seconds=1),
+                error="projection unavailable",
+                worker_id="worker-a",
+            )
 
         summary = self.repository.active_readiness(
             now=self.created_at + timedelta(seconds=2),
-            non_blocking_task_types=("PROJECT_DEVICE_STATUS",),
+            non_blocking_task_types=("FEISHU_PROJECTION", "PROJECT_DEVICE_STATUS"),
         )
 
         self.assertEqual(summary["active_epoch"], activation.active_epoch)
-        self.assertEqual(summary["current_failed_tasks"], 1)
-        self.assertEqual(summary["current_epoch_failed_tasks"], 1)
+        self.assertEqual(summary["current_failed_tasks"], 2)
+        self.assertEqual(summary["current_epoch_failed_tasks"], 2)
         self.assertEqual(summary["readiness_current_failed_tasks"], 0)
         self.assertEqual(summary["readiness_current_epoch_failed_tasks"], 0)
         self.assertEqual(summary["readiness_retryable_failed_tasks"], 0)
         self.assertEqual(
-            summary["readiness_ignored_task_types"], ["PROJECT_DEVICE_STATUS"]
+            summary["readiness_ignored_task_types"],
+            ["FEISHU_PROJECTION", "PROJECT_DEVICE_STATUS"],
         )
         self.assertTrue(summary["active_readiness"])
         self.assertEqual(summary["blocker_reasons"], [])

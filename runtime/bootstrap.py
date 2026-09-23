@@ -53,6 +53,7 @@ from repositories import (
     connect,
 )
 from services.device_status_projection import DeviceStatusProjector
+from services import projection as temperature_projection
 from repositories.sqlite import verify_runtime_schema
 from scheduler.worker import TaskScheduler
 
@@ -145,9 +146,13 @@ def _active_readiness_non_blocking_task_types() -> tuple[str, ...]:
     must not make the alarm/operation runtime unavailable before the scheduler
     gets a chance to reconcile them.
     """
+    # Temperature/humidity projection failures are recoverable by their own
+    # bounded retry queue. They must not prevent the alarm Runtime from
+    # starting; health still exposes their separate projection status.
+    task_types = ["FEISHU_PROJECTION"]
     if not config.FEISHU_DEVICE_STATUS_PROJECTION_ENABLED:
-        return ("PROJECT_DEVICE_STATUS",)
-    return ()
+        task_types.append("PROJECT_DEVICE_STATUS")
+    return tuple(task_types)
 
 
 def _active_action_enabled(action: Any) -> bool:
@@ -726,6 +731,7 @@ def build_runtime(
             effective_mode,
             activation.active_epoch,
         )
+    temperature_projection.requeue_failed_projection_states(now=activation_now)
     action_executor = ActionExecutor(
         mode=effective_mode,
         active_device_ids=config.ACTIVE_DEVICE_IDS,

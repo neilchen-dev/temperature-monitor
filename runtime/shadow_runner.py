@@ -510,9 +510,9 @@ class ShadowRuntime:
             task_health = self.task_repository.active_readiness(
                 now=self.now_provider(),
                 non_blocking_task_types=(
-                    ("PROJECT_DEVICE_STATUS",)
+                    ("FEISHU_PROJECTION", "PROJECT_DEVICE_STATUS")
                     if not config.FEISHU_DEVICE_STATUS_PROJECTION_ENABLED
-                    else ()
+                    else ("FEISHU_PROJECTION",)
                 ),
             )
             status = RuntimeStatus(

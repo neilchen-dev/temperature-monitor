@@ -594,6 +594,70 @@ class ProjectionResilienceTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(rows["n"], 1)
 
+    def test_startup_requeues_failed_projection_with_unsent_sample(self) -> None:
+        with (
+            patch.object(config, "FEISHU_PROJECTION_INLINE_ENABLED", False),
+            patch("routes.temperature.save_history"),
+        ):
+            response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        state = self._state()
+        db.update_projection_status(
+            "TH-05",
+            projection_status="failed",
+            retry_count=2,
+            last_error="temporary Feishu outage",
+            last_attempt_at=self._future_now().isoformat(),
+            projected_at=None,
+        )
+
+        recovered = projection.requeue_failed_projection_states()
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(self._state()["projection_status"], "pending")
+        self.assertEqual(self._state()["retry_count"], 0)
+        self.assertIsNone(self._state()["last_attempt_at"])
+        self.assertEqual(
+            [device for device, _due_at in projection.list_due_projection_retries()],
+            ["TH-05"],
+        )
+
+        # A terminal marker with no unprojected local sample is not re-armed.
+        projection.mark_projection_success("TH-05", state["last_sample_time_ms"])
+        current = self._state()
+        db.update_projection_status(
+            "TH-05",
+            projection_status="failed",
+            retry_count=2,
+            last_error="stale terminal marker",
+            last_attempt_at=self._future_now().isoformat(),
+            projected_at=current["projected_at"],
+        )
+        self.assertEqual(projection.requeue_failed_projection_states(), 0)
+        self.assertEqual(self._state()["projection_status"], "failed")
+
+    def test_new_sample_rearms_exhausted_async_projection(self) -> None:
+        with (
+            patch.object(config, "FEISHU_PROJECTION_INLINE_ENABLED", False),
+            patch("routes.temperature.save_history"),
+        ):
+            first = self._post(temperature=24.0)
+            db.update_projection_status(
+                "TH-05",
+                projection_status="failed",
+                retry_count=2,
+                last_error="temporary Feishu outage",
+                last_attempt_at=self._future_now().isoformat(),
+                projected_at=None,
+            )
+            second = self._post(temperature=25.0)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(self._state()["projection_status"], "pending")
+        self.assertEqual(self._state()["retry_count"], 0)
+
     def test_retry_projects_latest_sample_state(self) -> None:
         """重试投影的是最新本地样本（Feishu 是 current-state 投影）。"""
         with (

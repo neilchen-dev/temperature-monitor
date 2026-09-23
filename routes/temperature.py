@@ -244,9 +244,16 @@ def temperature():
             error_summary = "projection queued for durable scheduler"
 
         if attempted or suppressed:
-            projection.mark_projection_failure(bitable_device, error_summary)
+            projection.mark_projection_failure(
+                bitable_device,
+                error_summary,
+                new_sample=not outcome.duplicate,
+            )
         else:
-            projection.mark_projection_queued(bitable_device)
+            projection.mark_projection_queued(
+                bitable_device,
+                new_sample=not outcome.duplicate,
+            )
         save_history(
             bitable_device,
             temperature_c,
