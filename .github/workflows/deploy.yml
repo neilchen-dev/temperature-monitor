@@ -97,7 +97,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           envs: IMAGE_TAG,ACR_USERNAME,ACR_PASSWORD,REGISTRY,IMAGE_NAME,DEPLOY_PATH
-          command_timeout: 25m
+          command_timeout: 12m
 
           script: |
             set -euo pipefail
@@ -148,83 +148,7 @@ jobs:
 
             IMAGE_REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
 
-            # SQLite 一致性备份：必须在切换镜像/执行迁移前完成。通过仍在运行的
-            # Python 容器调用 sqlite 在线 backup API，兼容 WAL；禁止 cp 正在使用
-            # 的 .db 文件，以免漏掉 WAL 中的已提交页。备份与 quick_check 任一步
-            # 失败都直接终止，后续 pull/up 不得执行。
-            DB_CONTAINER_PATH=$(grep -E '^SQLITE_DB_PATH=' .env | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)
-            DB_CONTAINER_PATH="${DB_CONTAINER_PATH:-/app/data/temperature_monitor.db}"
-            case "${DB_CONTAINER_PATH}" in
-              /app/data/*) ;;
-              *)
-                echo "ERROR: SQLITE_DB_PATH must be under /app/data for the deployment backup: ${DB_CONTAINER_PATH}"
-                exit 1
-                ;;
-            esac
-            if [ "$(docker inspect -f '{{.State.Running}}' temperature-monitor 2>/dev/null || true)" != "true" ]; then
-              echo "ERROR: current temperature-monitor container is not running; refusing deployment without an online SQLite backup"
-              exit 1
-            fi
-            if ! docker exec temperature-monitor test -f "${DB_CONTAINER_PATH}"; then
-              echo "ERROR: production SQLite database not found at ${DB_CONTAINER_PATH}"
-              exit 1
-            fi
-            BACKUP_ID=$(date -u +%Y%m%dT%H%M%SZ)
-            BACKUP_HOST_PATH="data/backups/temperature_monitor_${BACKUP_ID}.db"
-            BACKUP_CONTAINER_PATH="/app/${BACKUP_HOST_PATH}"
-            # Create the directory inside the running app container so the
-            # application user owns it on the bind mount.
-            if ! docker exec temperature-monitor mkdir -p /app/data/backups; then
-              echo "ERROR: could not create the SQLite backup directory"
-              exit 1
-            fi
-
-            # Keep deployment-generated backups bounded.  Manual/pre-cutover
-            # backups use different names and are preserved.  Retain the last
-            # 14 days and at most 5 timestamped deployment backups, including
-            # any SQLite sidecars for each removed database.
-            BACKUP_DIR="data/backups"
-            BACKUP_RETENTION_DAYS=14
-            BACKUP_RETENTION_COUNT=5
-            find "${BACKUP_DIR}" -maxdepth 1 -type f \
-              -name 'temperature_monitor_????????T??????Z.db' \
-              -mtime +"${BACKUP_RETENTION_DAYS}" -print -delete
-            old_backups=$(find "${BACKUP_DIR}" -maxdepth 1 -type f \
-              -name 'temperature_monitor_????????T??????Z.db' \
-              -printf '%T@ %p\n' | sort -nr | tail -n +$((BACKUP_RETENTION_COUNT + 1)) | cut -d' ' -f2-)
-            while IFS= read -r old_backup; do
-              [ -n "${old_backup}" ] || continue
-              rm -f "${old_backup}" "${old_backup}-wal" \
-                "${old_backup}-shm" "${old_backup}-journal"
-            done <<< "${old_backups}"
-            echo "Deployment backup retention applied: days=${BACKUP_RETENTION_DAYS}, count=${BACKUP_RETENTION_COUNT}"
-            if ! docker exec \
-              -e "SOURCE_DB=${DB_CONTAINER_PATH}" \
-              -e "BACKUP_DB=${BACKUP_CONTAINER_PATH}" \
-              temperature-monitor python -c 'import os, sqlite3; from pathlib import Path; source=os.environ["SOURCE_DB"]; backup=os.environ["BACKUP_DB"]; Path(backup).parent.mkdir(parents=True, exist_ok=True); src=sqlite3.connect("file:" + source + "?mode=ro", uri=True); dst=sqlite3.connect(backup); src.backup(dst); dst.close(); src.close()'; then
-              echo "ERROR: SQLite online backup failed"
-              exit 1
-            fi
-            QUICK_CHECK=$(docker exec \
-              -e "CHECK_DB=${BACKUP_CONTAINER_PATH}" \
-              temperature-monitor python -c 'import os, sqlite3; db=os.environ["CHECK_DB"]; c=sqlite3.connect("file:" + db + "?mode=ro", uri=True); print(c.execute("PRAGMA quick_check").fetchone()[0]); c.close()')
-            if [ "${QUICK_CHECK}" != "ok" ]; then
-              echo "ERROR: SQLite backup quick_check=${QUICK_CHECK}"
-              exit 1
-            fi
-            # The newly created backup is included in the count.  Run the
-            # count-bound cleanup again after the online backup so the policy
-            # is true after every deployment, not only before it.
-            old_backups=$(find "${BACKUP_DIR}" -maxdepth 1 -type f \
-              -name 'temperature_monitor_????????T??????Z.db' \
-              -printf '%T@ %p\n' | sort -nr | tail -n +$((BACKUP_RETENTION_COUNT + 1)) | cut -d' ' -f2-)
-            while IFS= read -r old_backup; do
-              [ -n "${old_backup}" ] || continue
-              rm -f "${old_backup}" "${old_backup}-wal" \
-                "${old_backup}-shm" "${old_backup}-journal"
-            done <<< "${old_backups}"
-            echo "Deployment backup post-create count cleanup applied: count=${BACKUP_RETENTION_COUNT}"
-            echo "SQLite consistency backup completed: ${BACKUP_HOST_PATH}"
+            echo "Deployment SQLite backup and full-database scan are disabled"
 
             if grep -q '^IMAGE_REPOSITORY=' .env; then
               sed -i "s|^IMAGE_REPOSITORY=.*|IMAGE_REPOSITORY=${IMAGE_REPOSITORY}|" .env
