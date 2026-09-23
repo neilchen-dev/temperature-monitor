@@ -63,6 +63,38 @@ class FeishuCreateNotRetryableError(FeishuWriteError):
     """The request is invalid or otherwise must not be retried."""
 
 
+def _is_deleted_feishu_record(error: Exception) -> bool:
+    """Feishu 1254043 is the authoritative missing-Bitable-record response."""
+    return isinstance(error, FeishuAPIError) and error.code == 1254043
+
+
+def _register_remote_binding(
+    writer: Any,
+    table_id: str,
+    record_id: str,
+    *,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+) -> None:
+    """Attach known local identity to the generic SQLite record registry."""
+    register = getattr(writer, "register_binding", None)
+    if not callable(register):
+        return
+    try:
+        register(
+            table_id,
+            record_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+        )
+    except Exception:  # noqa: BLE001 - registry must not block the Feishu path
+        logger.exception(
+            "记录 Feishu 本地绑定失败 | table_id=%s | record_id=%s",
+            table_id,
+            record_id,
+        )
+
+
 def _create_failure_outcome(exc: Exception) -> str:
     """Classify a failed POST without guessing that an unknown write is safe."""
     if isinstance(exc, FeishuCreateNotPersistedError):
@@ -133,6 +165,23 @@ class FeishuBitableRecordWriter:
         from services.feishu import update_bitable_record
 
         return update_bitable_record(table_id, record_id, dict(fields))
+
+    def register_binding(
+        self,
+        table_id: str,
+        record_id: str,
+        *,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+    ) -> bool:
+        from services.db import register_feishu_record_binding
+
+        return register_feishu_record_binding(
+            table_id,
+            record_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -216,6 +265,13 @@ class FeishuOperationRecordWriter:
             if existing is not None:
                 # 同一逻辑登记已存在（上次调用超时但远端已写入等场景）：
                 # 复用既有 record_id，不再创建第二条记录。
+                _register_remote_binding(
+                    self.writer,
+                    self.operation_table_id,
+                    existing.record_id,
+                    entity_type="OPERATION_REGISTRATION",
+                    entity_id=device_id,
+                )
                 return {
                     "existing": True,
                     "idempotent": True,
@@ -238,11 +294,21 @@ class FeishuOperationRecordWriter:
             if status_recorded_at is not None
             else f"PROC:{uuid.uuid4()}"
         ))
-        return self.writer.create(
+        response = self.writer.create(
             self.operation_table_id,
             fields,
             client_token=token,
         )
+        record_id = _created_record_id(response)
+        if record_id:
+            _register_remote_binding(
+                self.writer,
+                self.operation_table_id,
+                record_id,
+                entity_type="OPERATION_REGISTRATION",
+                entity_id=device_id,
+            )
+        return response
 
     def _find_registration_by_business_key(
         self,
@@ -279,9 +345,16 @@ class FeishuOperationRecordWriter:
         fields = self.snapshot_fields(snapshot)
         if status_recorded_at is not None:
             fields[self.fields.state_recorded_at] = _datetime_cell(status_recorded_at)
+        normalized_record_id = _required_id(registration_record_id, "registration_record_id")
+        _register_remote_binding(
+            self.writer,
+            self.operation_table_id,
+            normalized_record_id,
+            entity_type="OPERATION_REGISTRATION",
+        )
         return self.writer.update(
             self.operation_table_id,
-            _required_id(registration_record_id, "registration_record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -302,11 +375,21 @@ class FeishuOperationRecordWriter:
         token = normalize_client_token(
             idempotency_key or f"RUN:{observation.source_record_id}"
         )
-        return self.writer.create(
+        response = self.writer.create(
             self.interval_table_id,
             fields,
             client_token=token,
         )
+        record_id = _created_record_id(response)
+        if record_id:
+            _register_remote_binding(
+                self.writer,
+                self.interval_table_id,
+                record_id,
+                entity_type="OPERATION_INTERVAL",
+                entity_id=observation.device_id,
+            )
+        return response
 
     def close_interval(
         self,
@@ -322,9 +405,16 @@ class FeishuOperationRecordWriter:
         }
         if snapshot is not None:
             fields.update(self._interval_end_fields(snapshot))
+        normalized_record_id = _required_id(interval_record_id, "interval_record_id")
+        _register_remote_binding(
+            self.writer,
+            self.interval_table_id,
+            normalized_record_id,
+            entity_type="OPERATION_INTERVAL",
+        )
         return self.writer.update(
             self.interval_table_id,
-            _required_id(interval_record_id, "interval_record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -344,9 +434,16 @@ class FeishuOperationRecordWriter:
                 _datetime_cell(started_at) if started_at is not None else None
             ),
         }
+        normalized_record_id = _required_id(device_record_id, "device_record_id")
+        _register_remote_binding(
+            self.writer,
+            self.device_table_id,
+            normalized_record_id,
+            entity_type="DEVICE",
+        )
         return self.writer.update(
             self.device_table_id,
-            _required_id(device_record_id, "device_record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -592,6 +689,13 @@ class FeishuDeviceStatusWriter:
                         f"DEVICE_RECORD_MAP maps {normalized} to {configured_id}, "
                         f"but the row belongs to {actual}"
                     )
+                _register_remote_binding(
+                    self.writer,
+                    self.device_table_id,
+                    record.record_id,
+                    entity_type="DEVICE",
+                    entity_id=normalized,
+                )
                 return record
             raise FeishuWriteError(
                 f"configured Feishu device record not found: {normalized}/{configured_id}"
@@ -607,14 +711,28 @@ class FeishuDeviceStatusWriter:
                 f"Feishu device status board expected one record for {normalized}, "
                 f"found {len(matches)}"
             )
+        _register_remote_binding(
+            self.writer,
+            self.device_table_id,
+            matches[0].record_id,
+            entity_type="DEVICE",
+            entity_id=normalized,
+        )
         return matches[0]
 
     def update(self, *, record_id: str, fields: Mapping[str, Any]) -> Mapping[str, Any]:
         if not fields:
             return {"record_id": _required_id(record_id, "record_id"), "fields": {}}
+        normalized_record_id = _required_id(record_id, "record_id")
+        _register_remote_binding(
+            self.writer,
+            self.device_table_id,
+            normalized_record_id,
+            entity_type="DEVICE",
+        )
         return self.writer.update(
             self.device_table_id,
-            _required_id(record_id, "record_id"),
+            normalized_record_id,
             dict(fields),
         )
 
@@ -804,9 +922,16 @@ class FeishuEnvironmentEventWriter:
             fields[self.fields.anomaly_type] = anomaly_type
         if not fields:
             return {"skipped": True, "reason": "no event fields to update"}
+        normalized_record_id = _required_id(record_id, "record_id")
+        _register_remote_binding(
+            self.writer,
+            self.event_table_id,
+            normalized_record_id,
+            entity_type="ENVIRONMENT_EVENT",
+        )
         return self.writer.update(
             self.event_table_id,
-            _required_id(record_id, "record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -897,9 +1022,16 @@ class FeishuEnvironmentEventWriter:
             _put_number(fields, self.fields.recovery_temperature, temperature)
         if self.fields.recovery_humidity is not None:
             _put_number(fields, self.fields.recovery_humidity, humidity)
+        normalized_record_id = _required_id(record_id, "record_id")
+        _register_remote_binding(
+            self.writer,
+            self.event_table_id,
+            normalized_record_id,
+            entity_type="ENVIRONMENT_EVENT",
+        )
         return self.writer.update(
             self.event_table_id,
-            _required_id(record_id, "record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -939,9 +1071,16 @@ class FeishuEnvironmentEventWriter:
         }
         if recovered_at is not None:
             fields[self.fields.recovery_time] = _datetime_cell(recovered_at)
+        normalized_record_id = _required_id(record_id, "record_id")
+        _register_remote_binding(
+            self.writer,
+            self.event_table_id,
+            normalized_record_id,
+            entity_type="ENVIRONMENT_EVENT",
+        )
         return self.writer.update(
             self.event_table_id,
-            _required_id(record_id, "record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -1044,6 +1183,14 @@ class FeishuEnvironmentEventWriter:
                 action_type=action_type,
                 requested_at=effect_at,
             )
+            if event.payload.get("feishu_record_missing"):
+                self.event_repository.mark_external_effect_succeeded(
+                    local_event_id,
+                    effect_key=effect_key,
+                    completed_at=effect_at,
+                    metadata={"outcome": "linked_record_already_deleted"},
+                )
+                return
         if action_type == "CREATE_ALARM_EVENT":
             started_at = _parse_datetime(
                 transition.get("violation_started_at")
@@ -1129,6 +1276,26 @@ class FeishuEnvironmentEventWriter:
                 if updated.get("skipped") or updated.get("code", 0) != 0:
                     raise FeishuWriteError("UPDATE_ALARM_EVENT did not complete a remote update")
             except Exception as exc:
+                if _is_deleted_feishu_record(exc):
+                    self.event_repository.mark_external_record_missing(
+                        local_event_id,
+                        missing_at=effect_at,
+                        error=str(exc),
+                    )
+                    self.event_repository.mark_external_effect_succeeded(
+                        local_event_id,
+                        effect_key=effect_key or "",
+                        completed_at=effect_at,
+                        metadata={"outcome": "linked_record_deleted"},
+                    )
+                    logger.warning(
+                        "linked Feishu alarm record was deleted; local event tracking closed | "
+                        "device_id=%s local_event_id=%s action=%s",
+                        device_id,
+                        local_event_id,
+                        action_type,
+                    )
+                    return
                 self.event_repository.mark_external_effect_failed(
                     local_event_id,
                     effect_key=effect_key or "",
@@ -1171,6 +1338,26 @@ class FeishuEnvironmentEventWriter:
                 if recovered.get("code", 0) != 0:
                     raise FeishuWriteError("MARK_ALARM_RECOVERED did not complete a remote update")
             except Exception as exc:
+                if _is_deleted_feishu_record(exc):
+                    self.event_repository.mark_external_record_missing(
+                        local_event_id,
+                        missing_at=effect_at,
+                        error=str(exc),
+                    )
+                    self.event_repository.mark_external_effect_succeeded(
+                        local_event_id,
+                        effect_key=effect_key or "",
+                        completed_at=effect_at,
+                        metadata={"outcome": "linked_record_deleted"},
+                    )
+                    logger.warning(
+                        "linked Feishu alarm record was deleted; local event tracking closed | "
+                        "device_id=%s local_event_id=%s action=%s",
+                        device_id,
+                        local_event_id,
+                        action_type,
+                    )
+                    return
                 self.event_repository.mark_external_effect_failed(
                     local_event_id,
                     effect_key=effect_key or "",
@@ -1202,6 +1389,13 @@ class FeishuEnvironmentEventWriter:
     ) -> str | None:
         bound_record_id = self._bound_record_id(local_event_id)
         if bound_record_id is not None:
+            _register_remote_binding(
+                self.writer,
+                self.event_table_id,
+                bound_record_id,
+                entity_type="ENVIRONMENT_EVENT",
+                entity_id=local_event_id,
+            )
             return bound_record_id
         if started_at is None:
             return None
@@ -1229,6 +1423,13 @@ class FeishuEnvironmentEventWriter:
             record_id=record_id,
         )
         event = self.event_repository.get(local_event_id)
+        _register_remote_binding(
+            self.writer,
+            self.event_table_id,
+            record_id,
+            entity_type="ENVIRONMENT_EVENT",
+            entity_id=local_event_id,
+        )
         logger.info(
             "binding_bound | device_id=%s local_event_id=%s event_key=%s record_id=%s",
             event.device_id, local_event_id, event.event_key, record_id,
@@ -1396,6 +1597,13 @@ class FeishuInspectionRecordWriter:
         existing = self._find_snapshot_by_business_key(area, inspected_at)
         if existing is not None:
             # 同一 (仓库区域, 状态记录时间) 的点检已存在：复用，不重复创建。
+            _register_remote_binding(
+                self.writer,
+                self.inspection_table_id,
+                existing.record_id,
+                entity_type="INSPECTION",
+                entity_id=area,
+            )
             return {
                 "existing": True,
                 "idempotent": True,
@@ -1423,11 +1631,21 @@ class FeishuInspectionRecordWriter:
         token = normalize_client_token(
             idempotency_key or f"WH:{area.strip()}:{_datetime_cell(inspected_at)}"
         )
-        return self.writer.create(
+        response = self.writer.create(
             self.inspection_table_id,
             fields,
             client_token=token,
         )
+        record_id = _created_record_id(response)
+        if record_id:
+            _register_remote_binding(
+                self.writer,
+                self.inspection_table_id,
+                record_id,
+                entity_type="INSPECTION",
+                entity_id=area,
+            )
+        return response
 
     def _find_snapshot_by_business_key(
         self,
@@ -1454,9 +1672,16 @@ class FeishuInspectionRecordWriter:
         **snapshot: Any,
     ) -> Mapping[str, Any]:
         fields = self.snapshot_fields(**snapshot)
+        normalized_record_id = _required_id(inspection_record_id, "inspection_record_id")
+        _register_remote_binding(
+            self.writer,
+            self.inspection_table_id,
+            normalized_record_id,
+            entity_type="INSPECTION",
+        )
         return self.writer.update(
             self.inspection_table_id,
-            _required_id(inspection_record_id, "inspection_record_id"),
+            normalized_record_id,
             fields,
         )
 
@@ -1466,9 +1691,16 @@ class FeishuInspectionRecordWriter:
         device_record_id: str,
         inspected_at: datetime,
     ) -> Mapping[str, Any]:
+        normalized_record_id = _required_id(device_record_id, "device_record_id")
+        _register_remote_binding(
+            self.writer,
+            self.device_table_id,
+            normalized_record_id,
+            entity_type="DEVICE",
+        )
         return self.writer.update(
             self.device_table_id,
-            _required_id(device_record_id, "device_record_id"),
+            normalized_record_id,
             {self.device_recent_inspection_field: _datetime_cell(inspected_at)},
         )
 

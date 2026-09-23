@@ -32,6 +32,7 @@ from domain.standard_resolver import StandardResolutionError
 from integrations.feishu_writers import FeishuDeviceStatusWriter, _user_cell
 from repositories.automation_tasks import SQLiteAutomationTaskRepository
 from repositories.runtime_state import SQLiteDeviceStatusProjectionRepository
+from services.feishu import FeishuAPIError
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -326,6 +327,12 @@ class DeviceStatusProjector:
             desired_fields=desired.fields,
             updated_at=current,
         )
+        if (
+            existing is not None
+            and existing.get("status") == "REMOTE_RECORD_DELETED"
+            and not force
+        ):
+            return None
         activation = self.task_repository.runtime_context()
         if (
             activation.mode == "active" and desired.device_id not in self.active_device_ids
@@ -394,6 +401,15 @@ class DeviceStatusProjector:
                 "device status projection task superseded | device=%s | task=%s",
                 device_id,
                 task.task_id,
+            )
+            return
+        if state.get("status") == "REMOTE_RECORD_DELETED":
+            logger.info(
+                "device status projection skipped for deleted remote binding | "
+                "device=%s | task=%s | record_id=%s",
+                device_id,
+                task.task_id,
+                state.get("record_id"),
             )
             return
 
@@ -479,6 +495,22 @@ class DeviceStatusProjector:
         try:
             self.execute_task(task, now=current)
         except Exception as exc:
+            if isinstance(exc, FeishuAPIError) and exc.code == 1254043:
+                state = self.state_repository.get(task.entity_id) or {}
+                self.state_repository.mark_remote_record_deleted(
+                    device_id=task.entity_id,
+                    record_id=state.get("record_id"),
+                    error=str(exc),
+                    marked_at=current,
+                )
+                logger.warning(
+                    "device status remote binding deleted; retry stopped | "
+                    "device=%s | task=%s | error=%s",
+                    task.entity_id,
+                    task.task_id,
+                    str(exc),
+                )
+                return
             attempt = int(task.payload.get("projection_attempt", 0) or 0) + 1
             max_attempts = max(
                 1,

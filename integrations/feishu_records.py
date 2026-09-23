@@ -21,6 +21,7 @@ class FeishuRawRecord:
     fields: Mapping[str, Any]
     created_at: datetime | str | int | float | None = None
     updated_at: datetime | str | int | float | None = None
+    created_by: Mapping[str, Any] | None = None
 
 
 class FeishuBitableRecordSource:
@@ -62,6 +63,11 @@ class FeishuBitableRecordSource:
                     fields=fields,
                     created_at=raw_record.get("created_time"),
                     updated_at=raw_record.get("last_modified_time"),
+                    created_by=(
+                        raw_record.get("created_by")
+                        if isinstance(raw_record.get("created_by"), Mapping)
+                        else None
+                    ),
                 )
             )
         return tuple(records)

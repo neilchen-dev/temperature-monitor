@@ -60,6 +60,7 @@ _EXTERNAL_EFFECT_TASK_TYPES = frozenset(
         "NOTIFY_RECOVERY",
         "NOTIFY_PREWARNING",
         "NOTIFY_PREWARNING_RECOVERY",
+        "NOTIFY_OPERATION_OVERDUE",
         "PROJECT_DEVICE_STATUS",
     }
 )
@@ -1116,6 +1117,24 @@ class SQLiteAutomationTaskRepository:
                 if self.connection.in_transaction:
                     self.connection.rollback()
                 raise
+
+    def get_unfinished_by_dedupe_key(self, dedupe_key: str) -> AutomationTask | None:
+        """Return the pending/running task with this external-effect identity."""
+        row = self.connection.execute(
+            """
+            SELECT * FROM automation_tasks
+            WHERE dedupe_key = ? AND status IN (?, ?)
+            ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, due_at, id
+            LIMIT 1
+            """,
+            (
+                dedupe_key,
+                AutomationTaskStatus.PENDING.value,
+                AutomationTaskStatus.RUNNING.value,
+                AutomationTaskStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
 
     def _release_dedupe_key_from_other_row(
         self,

@@ -90,7 +90,7 @@ import requests
 import config
 from domain.models import MonitorSample
 from services import db, devices
-from services.feishu import resolve_record_id, update_feishu_fields
+from services.feishu import FeishuAPIError, resolve_record_id, update_feishu_fields
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -98,6 +98,11 @@ logger = logging.getLogger("temperature_monitor")
 PROJECTION_OK = "ok"
 PROJECTION_PENDING = "pending"
 PROJECTION_FAILED = "failed"
+PROJECTION_REMOTE_RECORD_DELETED = "remote_record_deleted"
+
+
+def _is_deleted_feishu_record(error: BaseException) -> bool:
+    return isinstance(error, FeishuAPIError) and error.code == 1254043
 
 # Dispatch ownership contract (see module docstring): only the scheduler
 # thread calls dispatch_projected_sample, via recover_pending_dispatches.
@@ -233,8 +238,13 @@ def mark_projection_failure(
     ``failed`` — inline attempts must never re-arm an exhausted retry
     loop, or a long outage would produce an infinite retry storm.
     """
+    if isinstance(error, BaseException) and _is_deleted_feishu_record(error):
+        mark_projection_remote_record_deleted(device, error, now=now)
+        return
     state = _fetch_state(device)
     status = str(state.get("projection_status") or PROJECTION_OK)
+    if status == PROJECTION_REMOTE_RECORD_DELETED:
+        return
     if status == PROJECTION_OK:
         status = PROJECTION_PENDING
         retry_count = 0
@@ -256,6 +266,26 @@ def mark_projection_failure(
         status,
         retry_count,
         error_text,
+    )
+
+
+def mark_projection_remote_record_deleted(
+    device: str, error: Any, now: datetime | None = None
+) -> None:
+    """Stop retries when Feishu confirms the bound device row was deleted."""
+    state = _fetch_state(device)
+    db.update_projection_status(
+        device,
+        projection_status=PROJECTION_REMOTE_RECORD_DELETED,
+        retry_count=int(state.get("retry_count") or 0),
+        last_error=_truncate_error(error),
+        last_attempt_at=_now_iso(now),
+        projected_at=state.get("projected_at"),
+    )
+    logger.warning(
+        "feishu_projection_remote_record_deleted | device=%s | error=%s",
+        device,
+        _truncate_error(error),
     )
 
 
@@ -318,6 +348,8 @@ def should_suppress_inline_attempt(
     if state is None:
         return False
     status = str(state.get("projection_status") or PROJECTION_OK)
+    if status == PROJECTION_REMOTE_RECORD_DELETED:
+        return True
     if status not in (PROJECTION_PENDING, PROJECTION_FAILED):
         return False
     last_attempt = _parse_iso(state.get("last_attempt_at"))
@@ -615,6 +647,12 @@ def retry_device_projection(
                 f"feishu returned code={code} msg={result.get('msg', '')!r}"
             )
     except (requests.exceptions.RequestException, RuntimeError, ValueError) as exc:
+        if _is_deleted_feishu_record(exc):
+            mark_projection_remote_record_deleted(device, exc, now=now)
+            return {
+                "device": device,
+                "result": PROJECTION_REMOTE_RECORD_DELETED,
+            }
         error = f"{type(exc).__name__}: {exc}"
         still_pending = mark_retry_attempt_failed(device, error, now=now)
         raise RuntimeError(
@@ -650,9 +688,15 @@ def retry_device_projection(
 def projection_health_summary() -> dict[str, Any]:
     """Counts + device lists for the feishu_projection status section."""
     states = db.fetch_projection_states()
-    by_status = {"ok": 0, "pending": 0, "failed": 0}
+    by_status = {
+        "ok": 0,
+        "pending": 0,
+        "failed": 0,
+        PROJECTION_REMOTE_RECORD_DELETED: 0,
+    }
     pending_devices: list[str] = []
     failed: list[dict[str, Any]] = []
+    remote_deleted_devices: list[str] = []
     for state in states:
         status = str(state.get("projection_status") or PROJECTION_OK)
         by_status[status] = by_status.get(status, 0) + 1
@@ -667,11 +711,14 @@ def projection_health_summary() -> dict[str, Any]:
                     "last_attempt_at": state.get("last_attempt_at"),
                 }
             )
+        elif status == PROJECTION_REMOTE_RECORD_DELETED:
+            remote_deleted_devices.append(str(state.get("device")))
     return {
         "tracked_devices": len(states),
         "by_status": by_status,
         "pending_devices": pending_devices,
         "failed_devices": failed,
+        "remote_record_deleted_devices": remote_deleted_devices,
         "undispatched_projected": len(db.fetch_undispatched_projection_states()),
         "max_retries": config.FEISHU_PROJECTION_MAX_RETRIES,
         "attempt_timeout_seconds": config.FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS,

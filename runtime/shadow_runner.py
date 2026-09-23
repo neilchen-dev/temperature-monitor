@@ -27,6 +27,7 @@ from application.shadow import (
 )
 from application.standard_sync import StandardSyncService
 from domain.models import DataQualityStatus, DeviceContext, MonitorSample
+from domain.operation import ActiveOperation
 from integrations.feishu_operation import FeishuOperationAdapter
 from repositories.automation_runs import purge_automation_runs
 from repositories.automation_tasks import (
@@ -128,7 +129,9 @@ class ShadowRuntime:
         monitor_service: MonitorApplicationService,
         standard_sync: StandardSyncService,
         operation_adapter: FeishuOperationAdapter,
+        operation_repository: Any,
         operation_sync: OperationObservationService,
+        notification_writer: Any,
         shadow_comparison: ShadowComparisonService,
         scheduler: TaskScheduler,
         task_repository: SQLiteAutomationTaskRepository,
@@ -158,7 +161,9 @@ class ShadowRuntime:
         self.monitor_service = monitor_service
         self.standard_sync = standard_sync
         self.operation_adapter = operation_adapter
+        self.operation_repository = operation_repository
         self.operation_sync = operation_sync
+        self.notification_writer = notification_writer
         self.shadow_comparison = shadow_comparison
         self.scheduler = scheduler
         self.task_repository = task_repository
@@ -351,6 +356,12 @@ class ShadowRuntime:
                         ),
                     )
                     self._run_scheduler_phase(
+                        "operation_overdue",
+                        lambda: self._ensure_operation_overdue_tasks(
+                            now=self.now_provider()
+                        ),
+                    )
+                    self._run_scheduler_phase(
                         "projection_tasks",
                         lambda: self._ensure_projection_tasks(
                             now=self.now_provider()
@@ -459,6 +470,9 @@ class ShadowRuntime:
                 standard_revision=result.monitor_result.standard_revision,
                 standard_source=result.monitor_result.standard_source,
                 active_event_count=len(active_events),
+                event_exists_override=self._event_exists_override(
+                    result.transition.next.active_alarm_id
+                ),
                 active_event_ids=tuple(event.event_id for event in active_events),
                 expected_at=self.now_provider(),
                 applicability=result.monitor_result.applicability.value,
@@ -706,6 +720,148 @@ class ShadowRuntime:
                 now=self.now_provider(),
             )
 
+    def handle_operation_overdue_notification(self, task: Any) -> None:
+        """Notify the creator only if the same operation is still open."""
+        from integrations.feishu_notifications import FeishuNotificationError
+
+        with self._execution_lock:
+            now = self.now_provider()
+            device_id = str(task.entity_id).strip().upper()
+            source_record_id = str(task.payload.get("source_record_id") or "")
+            sequence = int(task.payload.get("reminder_sequence", 0) or 0)
+            operation = next(
+                (
+                    current
+                    for current in self.operation_repository.list_active_operations()
+                    if current.device_id.upper() == device_id
+                    and current.source_record_id == source_record_id
+                ),
+                None,
+            )
+            if operation is None:
+                logger.info(
+                    "operation overdue reminder skipped because operation ended or changed | "
+                    "device=%s source_record_id=%s",
+                    device_id,
+                    source_record_id,
+                )
+                return
+            if not operation.initiator_id or not operation.initiator_id_type:
+                self.operation_repository.update_overdue_notification(
+                    device_id=device_id,
+                    source_record_id=source_record_id,
+                    status="SKIPPED_NO_INITIATOR",
+                    at=now,
+                    sequence=sequence,
+                    error="operation record creator identity is unavailable",
+                )
+                logger.error(
+                    "operation overdue reminder has no creator identity | "
+                    "device=%s source_record_id=%s",
+                    device_id,
+                    source_record_id,
+                )
+                return
+            self.operation_repository.update_overdue_notification(
+                device_id=device_id,
+                source_record_id=source_record_id,
+                status="PENDING",
+                at=now,
+                sequence=sequence,
+            )
+            effect_key = (
+                f"OPERATION_OVERDUE:{device_id}:{source_record_id}:{sequence}"
+            )
+            try:
+                message_id = self.notification_writer.send_operation_overdue(
+                    recipient=operation.initiator_id,
+                    receive_id_type=operation.initiator_id_type,
+                    message=self._operation_overdue_message(
+                        operation,
+                        now=now,
+                        sequence=sequence,
+                    ),
+                    idempotency_key=effect_key,
+                )
+            except FeishuNotificationError as exc:
+                if exc.retryable or exc.outcome_unknown:
+                    retry_attempt = int(task.payload.get("retry_attempt", 0) or 0) + 1
+                    retry_payload = dict(task.payload)
+                    retry_payload["retry_attempt"] = retry_attempt
+                    delay_seconds = min(3600, 30 * (2 ** min(retry_attempt - 1, 7)))
+                    self.task_repository.reschedule_running(
+                        task,
+                        due_at=now + timedelta(seconds=delay_seconds),
+                        updated_at=now,
+                        payload=retry_payload,
+                    )
+                    raise
+                self.operation_repository.update_overdue_notification(
+                    device_id=device_id,
+                    source_record_id=source_record_id,
+                    status="FAILED_FINAL",
+                    at=now,
+                    sequence=sequence,
+                    error=f"{exc.error_code}: {exc}",
+                )
+                logger.error(
+                    "operation overdue reminder failed permanently | device=%s "
+                    "source_record_id=%s error_code=%s",
+                    device_id,
+                    source_record_id,
+                    exc.error_code,
+                )
+                return
+            self.operation_repository.update_overdue_notification(
+                device_id=device_id,
+                source_record_id=source_record_id,
+                status="SENT",
+                at=now,
+                sequence=sequence,
+                message_id=message_id,
+            )
+            logger.info(
+                "operation overdue reminder sent | device=%s source_record_id=%s "
+                "sequence=%s message_id=%s",
+                device_id,
+                source_record_id,
+                sequence,
+                message_id,
+            )
+
+    @staticmethod
+    def _operation_overdue_message(
+        operation: ActiveOperation,
+        *,
+        now: datetime,
+        sequence: int,
+    ) -> str:
+        started_at = _align_datetime(operation.started_at, now)
+        elapsed_hours = max(0.0, (now - started_at).total_seconds() / 3600)
+        record_url = config.FEISHU_OPERATION_TABLE_URL
+        if record_url:
+            record_url = (
+                record_url.replace("{table_id}", config.FEISHU_OPERATION_TABLE_ID)
+                .replace("{record_id}", operation.source_record_id)
+            )
+        lines = [
+            "【作业超时提醒】作业仍未关闭，请及时填写结束作业。",
+            f"设备：{operation.device_id}",
+            f"区域：{operation.area_id}",
+            f"作业/工艺：{operation.operation_type or '未填写'}",
+            f"工单号：{operation.work_order or '未填写'}",
+            f"开始时间：{operation.started_at.isoformat()}",
+            f"对应开始作业记录：{operation.source_record_id}",
+            f"已持续：{elapsed_hours:.1f} 小时；这是第 {sequence + 1} 次提醒。",
+        ]
+        if record_url:
+            lines.append(f"查看开始作业记录：{record_url}")
+        if config.FEISHU_OPERATION_OVERDUE_FORM_URL:
+            lines.append(
+                "结束作业登记：" + config.FEISHU_OPERATION_OVERDUE_FORM_URL
+            )
+        return "\n".join(lines)
+
     def handle_feishu_projection(self, task: Any) -> None:
         """Retry a deferred Feishu projection for one device.
 
@@ -876,6 +1032,11 @@ class ShadowRuntime:
                 now=self.now_provider(),
                 scheduler_task_id=task.task_id,
             )
+            self._request_device_status_projection(
+                task.entity_id,
+                now=self.now_provider(),
+                trigger="verification_state_change",
+            )
             active_events = self.event_repository.list_active(device_id=task.entity_id)
             expected = expected_state_from(
                 device_id=task.entity_id,
@@ -886,6 +1047,9 @@ class ShadowRuntime:
                 standard_revision=result.monitor_result.standard_revision,
                 standard_source=result.monitor_result.standard_source,
                 active_event_count=len(active_events),
+                event_exists_override=self._event_exists_override(
+                    result.transition.next.active_alarm_id
+                ),
                 active_event_ids=tuple(event.event_id for event in active_events),
                 expected_at=self.now_provider(),
                 applicability=result.monitor_result.applicability.value,
@@ -897,6 +1061,15 @@ class ShadowRuntime:
             self._schedule_shadow_compare(
                 expected, sample_time=evaluated_sample.sample_time
             )
+
+    def _event_exists_override(self, active_alarm_id: str | None) -> bool | None:
+        """A deleted remote row is a known local tombstone, not a retryable diff."""
+        if not active_alarm_id:
+            return None
+        event = self.event_repository.get(active_alarm_id)
+        if event is not None and event.payload.get("feishu_record_missing"):
+            return False
+        return None
 
     def _fresh_sample_or_offline(self, sample: MonitorSample) -> MonitorSample:
         """Do not advance a verification timer from an expired observation."""
@@ -979,6 +1152,78 @@ class ShadowRuntime:
             "SYNC_OPERATIONS",
             now if immediate else now + timedelta(seconds=self.operation_sync_interval),
         )
+
+    def _ensure_operation_overdue_tasks(self, *, now: datetime) -> None:
+        """Queue the first reminder at the deadline, then one per interval."""
+        if (
+            not self.active_canary_enabled
+            or not config.FEISHU_OPERATION_OVERDUE_NOTIFY_ENABLED
+            or config.FEISHU_OPERATION_OVERDUE_AFTER_HOURS <= 0
+            or not getattr(self, "_standards_ready", lambda: True)()
+        ):
+            return
+        list_active = getattr(self.operation_repository, "list_active_operations", None)
+        if not callable(list_active):
+            return
+        overdue_after = timedelta(
+            hours=config.FEISHU_OPERATION_OVERDUE_AFTER_HOURS
+        )
+        repeat_every = timedelta(
+            hours=config.FEISHU_OPERATION_OVERDUE_REPEAT_HOURS
+        )
+        for operation in list_active():
+            device_id = operation.device_id.strip().upper()
+            if not active_scope_allows(
+                device_id, active_device_ids=self.active_device_ids
+            ):
+                continue
+            status = operation.overdue_notification_status
+            if status in {"SKIPPED_NO_INITIATOR", "FAILED_FINAL"}:
+                continue
+            if status == "PENDING":
+                # Recreate the same durable task if it was lost or cancelled.
+                sequence = max(0, int(operation.overdue_notification_sequence or 0))
+                due_at = now
+            elif status == "SENT":
+                sequence = max(0, int(operation.overdue_notification_sequence or 0)) + 1
+                due_at = (
+                    _align_datetime(operation.overdue_notification_at, now)
+                    + repeat_every
+                    if operation.overdue_notification_at is not None
+                    else _align_datetime(operation.started_at, now) + overdue_after
+                )
+            else:
+                sequence = 0
+                due_at = _align_datetime(operation.started_at, now) + overdue_after
+            dedupe_key = (
+                f"NOTIFY_OPERATION_OVERDUE:{device_id}:"
+                f"{operation.source_record_id}:{sequence}"
+            )
+            if status == "PENDING":
+                get_unfinished = getattr(
+                    self.task_repository,
+                    "get_unfinished_by_dedupe_key",
+                    None,
+                )
+                if callable(get_unfinished) and get_unfinished(dedupe_key) is not None:
+                    continue
+            if now < _align_datetime(due_at, now):
+                continue
+            payload = {
+                "device_id": device_id,
+                "source_record_id": operation.source_record_id,
+                "reminder_sequence": sequence,
+                "started_at": operation.started_at.isoformat(),
+            }
+            self.task_repository.create_or_get_unfinished(
+                task_type="NOTIFY_OPERATION_OVERDUE",
+                entity_type="DEVICE",
+                entity_id=device_id,
+                due_at=now,
+                payload=payload,
+                dedupe_key=dedupe_key,
+                created_at=now,
+            )
 
     def _ensure_event_reconciliation_tasks(self, *, now: datetime) -> None:
         """Re-arm unbound Feishu CREATEs independently of alarm lifecycle state."""
@@ -1131,6 +1376,15 @@ class ShadowRuntime:
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _align_datetime(value: datetime, reference: datetime) -> datetime:
+    """Align legacy naive values to the reference timezone for comparison."""
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=reference.tzinfo)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.replace(tzinfo=None)
+    return value
 
 
 def _parse_event_start(value: Any) -> datetime | None:

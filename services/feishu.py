@@ -482,14 +482,19 @@ def resolve_record_id(
     path keeps the full retry behaviour.
     """
     if configured_record_id:
+        _register_device_record_binding(configured_record_id, device)
         return configured_record_id
 
     normalized_device = device.strip().upper()
     now = time.time()
     with _record_id_lock:
         cached = _record_id_cache.get(normalized_device)
-        if cached and now < cached[1]:
-            return cached[0]
+        cached_record_id = cached[0] if cached and now < cached[1] else None
+    if cached_record_id:
+        _register_device_record_binding(cached_record_id, normalized_device)
+        return cached_record_id
+
+    with _record_id_lock:
         not_found_until = _record_not_found_until.get(normalized_device)
         if not_found_until and now < not_found_until:
             raise RuntimeError(
@@ -543,6 +548,7 @@ def resolve_record_id(
                     normalized_device,
                     config.DEVICE_ID_FIELD,
                 )
+                _register_device_record_binding(record_id, normalized_device)
                 return record_id
             if len(matching_record_ids) > 1:
                 record_ids = ", ".join(matching_record_ids)
@@ -562,6 +568,25 @@ def resolve_record_id(
         page_token = str(data.get("page_token", "")).strip()
         if not page_token:
             raise RuntimeError("飞书记录分页响应缺少 page_token")
+
+
+def _register_device_record_binding(record_id: str, device: str) -> None:
+    """Keep the client SQLite's generic record registry linked to its device."""
+    try:
+        from services.db import register_feishu_record_binding
+
+        register_feishu_record_binding(
+            config.TABLE_ID,
+            record_id,
+            entity_type="DEVICE",
+            entity_id=device,
+        )
+    except Exception:  # noqa: BLE001 - registry must not block Feishu writes
+        logger.exception(
+            "记录 Feishu 设备 record 绑定失败 | device=%s | record_id=%s",
+            device,
+            record_id,
+        )
 
 
 def update_feishu_fields(
@@ -627,8 +652,28 @@ def update_bitable_record(
         raise ValueError("record_id 不能为空")
     if not isinstance(fields, dict):
         raise TypeError("fields 必须是 JSON object")
-    return _require_success(
-        _request_bitable_json(
+    try:
+        from services.db import is_feishu_record_missing
+
+        if is_feishu_record_missing(normalized_table_id, normalized_record_id):
+            raise FeishuAPIError(
+                {
+                    "code": 1254043,
+                    "msg": "SQLite 已登记该 Feishu record 远端删除，跳过重复更新",
+                    "http_status": 404,
+                },
+                "更新 Base 记录",
+            )
+    except FeishuAPIError:
+        raise
+    except Exception:  # noqa: BLE001 - a SQLite lookup must not block Feishu
+        logger.exception(
+            "查询 Feishu record 删除标记失败 | table_id=%s | record_id=%s",
+            normalized_table_id,
+            normalized_record_id,
+        )
+    try:
+        result = _request_bitable_json(
             "PUT",
             _bitable_table_url(
                 normalized_table_id,
@@ -639,9 +684,28 @@ def update_bitable_record(
             lock_key=f"record:{normalized_record_id}",
             max_attempts=1 if attempt_timeout is not None else None,
             timeout=attempt_timeout,
-        ),
-        "更新 Base 记录",
-    )
+        )
+        return _require_success(result, "更新 Base 记录")
+    except FeishuAPIError as exc:
+        if exc.code == 1254043:
+            # The server is authoritative for this record id. Persist the
+            # tombstone in the shared client SQLite before exposing the error
+            # to domain-specific callers (alarm events, projections, etc.).
+            try:
+                from services.db import mark_feishu_record_missing
+
+                mark_feishu_record_missing(
+                    normalized_table_id,
+                    normalized_record_id,
+                    str(exc),
+                )
+            except Exception:  # noqa: BLE001 - local state must not mask Feishu
+                logger.exception(
+                    "记录 Feishu 远端删除状态失败 | table_id=%s | record_id=%s",
+                    normalized_table_id,
+                    normalized_record_id,
+                )
+        raise
 
 
 def list_realtime_snapshots(field_names: list[str]) -> list[dict[str, Any]]:

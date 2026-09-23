@@ -89,6 +89,43 @@ class FeishuNotificationWriter:
         if not self.device_table_id:
             raise ValueError("device_table_id cannot be empty")
 
+    def send_operation_overdue(
+        self,
+        *,
+        recipient: str,
+        receive_id_type: str,
+        message: str,
+        idempotency_key: str,
+    ) -> str:
+        """Send one durable retryable reminder for an open operation."""
+        try:
+            response = self.sender.send_text(
+                recipient,
+                receive_id_type,
+                message,
+                idempotency_key=idempotency_key,
+                max_attempts=1,
+                timeout=self.attempt_timeout,
+            )
+        except FeishuIMError as exc:
+            raise FeishuNotificationError(
+                str(exc),
+                error_code=exc.error_code,
+                retryable=exc.retryable,
+                outcome_unknown=exc.outcome_unknown,
+                recipient=recipient,
+            ) from exc
+        message_id = _message_id(response)
+        if not message_id:
+            raise FeishuNotificationError(
+                "Feishu success response is missing message_id",
+                error_code="message_id_missing",
+                retryable=False,
+                outcome_unknown=True,
+                recipient=recipient,
+            )
+        return message_id
+
     def handle_notification_action(
         self,
         action: Any,

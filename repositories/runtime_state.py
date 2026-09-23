@@ -20,7 +20,7 @@ from domain.models import (
     OperationState,
     OperationStatus,
 )
-from domain.operation import OperationAction, OperationObservation
+from domain.operation import ActiveOperation, OperationAction, OperationObservation
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
 
 
@@ -86,7 +86,10 @@ CREATE TABLE IF NOT EXISTS operation_observations_current (
     work_order TEXT,
     source_record_id TEXT NOT NULL,
     source_created_at TEXT NOT NULL,
-    observed_at TEXT NOT NULL
+    observed_at TEXT NOT NULL,
+    initiator_id TEXT,
+    initiator_id_type TEXT,
+    initiator_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS operation_states (
@@ -97,6 +100,14 @@ CREATE TABLE IF NOT EXISTS operation_states (
     work_order TEXT,
     started_at TEXT,
     ended_at TEXT,
+    initiator_id TEXT,
+    initiator_id_type TEXT,
+    initiator_name TEXT,
+    overdue_notification_status TEXT,
+    overdue_notification_at TEXT,
+    overdue_notification_sequence INTEGER,
+    overdue_notification_message_id TEXT,
+    overdue_notification_error TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -526,7 +537,37 @@ class SQLiteOperationRepository:
         self._lock = SQLITE_WRITE_LOCK
         with self._lock:
             self.connection.executescript(_SCHEMA)
-            self.connection.commit()
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        for table, columns in {
+            "operation_observations_current": (
+                ("initiator_id", "TEXT"),
+                ("initiator_id_type", "TEXT"),
+                ("initiator_name", "TEXT"),
+            ),
+            "operation_states": (
+                ("initiator_id", "TEXT"),
+                ("initiator_id_type", "TEXT"),
+                ("initiator_name", "TEXT"),
+                ("overdue_notification_status", "TEXT"),
+                ("overdue_notification_at", "TEXT"),
+                ("overdue_notification_sequence", "INTEGER"),
+                ("overdue_notification_message_id", "TEXT"),
+                ("overdue_notification_error", "TEXT"),
+            ),
+        }.items():
+            existing = {
+                row[1]
+                for row in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+            for column, definition in columns:
+                if column not in existing:
+                    self.connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
 
     def get_current(self, device_id: str) -> OperationObservation | None:
         row = self.connection.execute(
@@ -544,7 +585,68 @@ class SQLiteOperationRepository:
             source_record_id=row["source_record_id"],
             source_created_at=datetime.fromisoformat(row["source_created_at"]),
             observed_at=datetime.fromisoformat(row["observed_at"]),
+            initiator_id=row["initiator_id"],
+            initiator_id_type=row["initiator_id_type"],
+            initiator_name=row["initiator_name"],
         )
+
+    @retry_sqlite_write
+    def refresh_initiator(self, observation: OperationObservation) -> None:
+        """Enrich an existing same-record observation after adding creator capture."""
+        if not observation.initiator_id:
+            return
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(
+                    """
+                    UPDATE operation_observations_current
+                    SET initiator_id = COALESCE(initiator_id, ?),
+                        initiator_id_type = COALESCE(initiator_id_type, ?),
+                        initiator_name = COALESCE(initiator_name, ?)
+                    WHERE device_id = ? AND source_record_id = ?
+                    """,
+                    (
+                        observation.initiator_id,
+                        observation.initiator_id_type,
+                        observation.initiator_name,
+                        observation.device_id,
+                        observation.source_record_id,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE operation_states
+                    SET initiator_id = COALESCE(initiator_id, ?),
+                        initiator_id_type = COALESCE(initiator_id_type, ?),
+                        initiator_name = COALESCE(initiator_name, ?),
+                        overdue_notification_status = CASE
+                            WHEN overdue_notification_status = 'SKIPPED_NO_INITIATOR'
+                            THEN NULL ELSE overdue_notification_status END,
+                        overdue_notification_error = CASE
+                            WHEN overdue_notification_status = 'SKIPPED_NO_INITIATOR'
+                            THEN NULL ELSE overdue_notification_error END
+                    WHERE device_id = ? AND state = ?
+                      AND EXISTS (
+                        SELECT 1 FROM operation_observations_current c
+                        WHERE c.device_id = operation_states.device_id
+                          AND c.source_record_id = ?
+                      )
+                    """,
+                    (
+                        observation.initiator_id,
+                        observation.initiator_id_type,
+                        observation.initiator_name,
+                        observation.device_id,
+                        OperationStatus.OPERATING.value,
+                        observation.source_record_id,
+                    ),
+                )
+                self.connection.commit()
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
 
     @retry_sqlite_write
     def save_current(self, observation: OperationObservation) -> None:
@@ -553,8 +655,9 @@ class SQLiteOperationRepository:
                 """
                 INSERT INTO operation_observations_current (
                     device_id, area_id, action, operation_type, work_order,
-                    source_record_id, source_created_at, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    source_record_id, source_created_at, observed_at,
+                    initiator_id, initiator_id_type, initiator_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     area_id = excluded.area_id,
                     action = excluded.action,
@@ -562,7 +665,10 @@ class SQLiteOperationRepository:
                     work_order = excluded.work_order,
                     source_record_id = excluded.source_record_id,
                     source_created_at = excluded.source_created_at,
-                    observed_at = excluded.observed_at
+                    observed_at = excluded.observed_at,
+                    initiator_id = excluded.initiator_id,
+                    initiator_id_type = excluded.initiator_id_type,
+                    initiator_name = excluded.initiator_name
                 """,
                 (
                     observation.device_id,
@@ -573,6 +679,9 @@ class SQLiteOperationRepository:
                     observation.source_record_id,
                     observation.source_created_at.isoformat(),
                     observation.observed_at.isoformat(),
+                    observation.initiator_id,
+                    observation.initiator_id_type,
+                    observation.initiator_name,
                 ),
             )
             previous = self.connection.execute(
@@ -586,18 +695,46 @@ class SQLiteOperationRepository:
                 work_order = observation.work_order
                 started_at = observation.source_created_at
                 ended_at = None
+                initiator_id = observation.initiator_id
+                initiator_id_type = observation.initiator_id_type
+                initiator_name = observation.initiator_name
+                notification_status = None
+                notification_at = None
+                notification_sequence = None
+                notification_message_id = None
+                notification_error = None
             else:
                 state = OperationStatus.IDLE
                 operation_type = None
                 work_order = None
                 started_at = previous_started or observation.source_created_at
                 ended_at = observation.source_created_at
+                initiator_id = previous["initiator_id"] if previous else None
+                initiator_id_type = previous["initiator_id_type"] if previous else None
+                initiator_name = previous["initiator_name"] if previous else None
+                notification_status = (
+                    previous["overdue_notification_status"] if previous else None
+                )
+                notification_at = previous["overdue_notification_at"] if previous else None
+                notification_sequence = (
+                    previous["overdue_notification_sequence"] if previous else None
+                )
+                notification_message_id = (
+                    previous["overdue_notification_message_id"] if previous else None
+                )
+                notification_error = (
+                    previous["overdue_notification_error"] if previous else None
+                )
             self.connection.execute(
                 """
                 INSERT INTO operation_states (
                     device_id, area_id, state, operation_type, work_order,
-                    started_at, ended_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, ended_at, initiator_id, initiator_id_type,
+                    initiator_name, overdue_notification_status,
+                    overdue_notification_at, overdue_notification_sequence,
+                    overdue_notification_message_id,
+                    overdue_notification_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     area_id = excluded.area_id,
                     state = excluded.state,
@@ -605,6 +742,14 @@ class SQLiteOperationRepository:
                     work_order = excluded.work_order,
                     started_at = excluded.started_at,
                     ended_at = excluded.ended_at,
+                    initiator_id = excluded.initiator_id,
+                    initiator_id_type = excluded.initiator_id_type,
+                    initiator_name = excluded.initiator_name,
+                    overdue_notification_status = excluded.overdue_notification_status,
+                    overdue_notification_at = excluded.overdue_notification_at,
+                    overdue_notification_sequence = excluded.overdue_notification_sequence,
+                    overdue_notification_message_id = excluded.overdue_notification_message_id,
+                    overdue_notification_error = excluded.overdue_notification_error,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -615,6 +760,14 @@ class SQLiteOperationRepository:
                     work_order,
                     _time(started_at),
                     _time(ended_at),
+                    initiator_id,
+                    initiator_id_type,
+                    initiator_name,
+                    notification_status,
+                    notification_at,
+                    notification_sequence,
+                    notification_message_id,
+                    notification_error,
                     observation.observed_at.isoformat(),
                 ),
             )
@@ -655,6 +808,92 @@ class SQLiteOperationRepository:
             started_at=_parse(row["started_at"]),
             ended_at=_parse(row["ended_at"]),
         )
+
+    def list_active_operations(self) -> tuple[ActiveOperation, ...]:
+        rows = self.connection.execute(
+            """
+            SELECT s.device_id, s.area_id, s.operation_type, s.work_order,
+                   c.source_record_id, s.started_at, s.initiator_id,
+                   s.initiator_id_type, s.initiator_name,
+                   s.overdue_notification_status, s.overdue_notification_at,
+                   s.overdue_notification_sequence
+            FROM operation_states AS s
+            JOIN operation_observations_current AS c USING (device_id)
+            WHERE s.state = ? AND s.started_at IS NOT NULL
+            ORDER BY s.device_id
+            """,
+            (OperationStatus.OPERATING.value,),
+        ).fetchall()
+        return tuple(
+            ActiveOperation(
+                device_id=row["device_id"],
+                area_id=row["area_id"],
+                operation_type=row["operation_type"],
+                work_order=row["work_order"],
+                source_record_id=row["source_record_id"],
+                started_at=datetime.fromisoformat(row["started_at"]),
+                initiator_id=row["initiator_id"],
+                initiator_id_type=row["initiator_id_type"],
+                initiator_name=row["initiator_name"],
+                overdue_notification_status=row["overdue_notification_status"],
+                overdue_notification_at=_parse(row["overdue_notification_at"]),
+                overdue_notification_sequence=row["overdue_notification_sequence"],
+            )
+            for row in rows
+        )
+
+    @retry_sqlite_write
+    def update_overdue_notification(
+        self,
+        *,
+        device_id: str,
+        source_record_id: str,
+        status: str,
+        at: datetime,
+        message_id: str | None = None,
+        error: str | None = None,
+        sequence: int | None = None,
+    ) -> bool:
+        """Record reminder delivery only while the same operation remains open."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE operation_states
+                    SET overdue_notification_status = ?,
+                        overdue_notification_at = CASE
+                            WHEN ? = 'SENT' OR ? = 'RETRY_EXHAUSTED'
+                            THEN ? ELSE overdue_notification_at END,
+                        overdue_notification_sequence = COALESCE(?, overdue_notification_sequence),
+                        overdue_notification_message_id = COALESCE(?, overdue_notification_message_id),
+                        overdue_notification_error = ?
+                    WHERE device_id = ? AND state = ?
+                      AND EXISTS (
+                        SELECT 1 FROM operation_observations_current c
+                        WHERE c.device_id = operation_states.device_id
+                          AND c.source_record_id = ?
+                      )
+                    """,
+                    (
+                        status,
+                        status,
+                        status,
+                        at.isoformat(),
+                        sequence,
+                        message_id,
+                        error,
+                        device_id,
+                        OperationStatus.OPERATING.value,
+                        source_record_id,
+                    ),
+                )
+                self.connection.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
 
     def _audit_no_commit(
         self,
@@ -767,13 +1006,21 @@ class SQLiteDeviceStatusProjectionRepository:
                     changed_fields_json = CASE
                         WHEN excluded.desired_hash <> device_status_projection.desired_hash
                         THEN '[]' ELSE device_status_projection.changed_fields_json END,
-                    status = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                    status = CASE WHEN device_status_projection.status = 'REMOTE_RECORD_DELETED'
+                                  THEN device_status_projection.status
+                                  WHEN excluded.desired_hash <> device_status_projection.desired_hash
                                   THEN 'PENDING' ELSE device_status_projection.status END,
-                    pending = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                    pending = CASE WHEN device_status_projection.status = 'REMOTE_RECORD_DELETED'
+                                   THEN 0
+                                   WHEN excluded.desired_hash <> device_status_projection.desired_hash
                                    THEN 1 ELSE device_status_projection.pending END,
-                    failed = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                    failed = CASE WHEN device_status_projection.status = 'REMOTE_RECORD_DELETED'
+                                  THEN 0
+                                  WHEN excluded.desired_hash <> device_status_projection.desired_hash
                                   THEN 0 ELSE device_status_projection.failed END,
-                    last_error = CASE WHEN excluded.desired_hash <> device_status_projection.desired_hash
+                    last_error = CASE WHEN device_status_projection.status = 'REMOTE_RECORD_DELETED'
+                                      THEN device_status_projection.last_error
+                                      WHEN excluded.desired_hash <> device_status_projection.desired_hash
                                       THEN NULL ELSE device_status_projection.last_error END,
                     updated_at = excluded.updated_at
                 """,
@@ -936,6 +1183,35 @@ class SQLiteDeviceStatusProjectionRepository:
             self.connection.commit()
 
     @retry_sqlite_write
+    def mark_remote_record_deleted(
+        self,
+        *,
+        device_id: str,
+        record_id: str | None,
+        error: str,
+        marked_at: datetime,
+    ) -> None:
+        """Persist a terminal projection binding tombstone for a device row."""
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE device_status_projection
+                SET record_id = COALESCE(?, record_id),
+                    status = 'REMOTE_RECORD_DELETED', pending = 0, failed = 0,
+                    last_attempt_at = ?, last_error = ?, updated_at = ?
+                WHERE device_id = ?
+                """,
+                (
+                    record_id,
+                    _time(marked_at),
+                    str(error)[:500],
+                    _time(marked_at),
+                    str(device_id).strip().upper(),
+                ),
+            )
+            self.connection.commit()
+
+    @retry_sqlite_write
     def mark_shadow_only(self, *, device_id: str, updated_at: datetime) -> None:
         """Record that the desired row is outside the current Active scope."""
         with self._lock:
@@ -957,6 +1233,9 @@ class SQLiteDeviceStatusProjectionRepository:
         ).fetchall()
         pending = sum(1 for row in rows if row["pending"])
         failed = sum(1 for row in rows if row["failed"])
+        remote_record_deleted = sum(
+            1 for row in rows if row["status"] == "REMOTE_RECORD_DELETED"
+        )
         mismatched: list[str] = []
         devices: list[dict[str, Any]] = []
         gated_count = 0
@@ -1011,6 +1290,7 @@ class SQLiteDeviceStatusProjectionRepository:
         return {
             "pending": pending,
             "failed": failed,
+            "remote_record_deleted": remote_record_deleted,
             "last_success_at": last_success,
             "last_error": last_error,
             "mismatched_devices": mismatched,

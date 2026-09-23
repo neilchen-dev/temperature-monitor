@@ -189,6 +189,57 @@ class SQLiteEnvironmentEventRepository:
                 return record
             return self._require(event_id)
 
+    @retry_sqlite_write
+    def mark_external_record_missing(
+        self,
+        event_id: str,
+        *,
+        missing_at: datetime,
+        error: str,
+    ) -> EnvironmentEventRecord:
+        """Close local tracking when the linked Feishu row was deleted."""
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                record = self._require(event_id)
+                payload = dict(record.payload)
+                payload.update(
+                    {
+                        "feishu_record_missing": True,
+                        "feishu_record_missing_at": _time_text(missing_at),
+                        "feishu_record_missing_error": str(error),
+                        "feishu_binding_status": "DELETED",
+                        "feishu_update_pending": False,
+                        "feishu_recovery_pending": False,
+                        "local_close_reason": "linked_feishu_record_deleted",
+                    }
+                )
+                self.connection.execute(
+                    """
+                    UPDATE environment_events
+                    SET status = ?, closed_at = COALESCE(closed_at, ?),
+                        payload_json = ?
+                    WHERE event_id = ?
+                    """,
+                    (
+                        EnvironmentEventStatus.CLOSED,
+                        _time_text(missing_at),
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        event_id,
+                    ),
+                )
+                self.connection.commit()
+                return self._require(event_id)
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+
     def mark_recovered(
         self,
         event_id: str,
@@ -564,6 +615,7 @@ class SQLiteEnvironmentEventRepository:
             for record in records
             if not record.payload.get("feishu_record_id")
             and record.payload.get("external_effect_policy") != "SHADOW_ONLY"
+            and not record.payload.get("feishu_record_missing")
             and record.payload.get("feishu_binding_status") == "PENDING"
         }
         try:
@@ -603,10 +655,12 @@ class SQLiteEnvironmentEventRepository:
             if (
                 record.event_id in candidates
                 and not record.payload.get("feishu_record_id")
+                and not record.payload.get("feishu_record_missing")
                 and record.payload.get("external_effect_policy") != "SHADOW_ONLY"
             )
             or (
                 record.payload.get("external_effect_policy") != "SHADOW_ONLY"
+                and not record.payload.get("feishu_record_missing")
                 and (
                     record.payload.get("feishu_recovery_pending")
                     or record.payload.get("feishu_update_pending")

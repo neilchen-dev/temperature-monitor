@@ -94,6 +94,7 @@ def expected_state_from(
     standard_revision: str | None = None,
     standard_source: str | None = None,
     active_event_count: int | None = None,
+    event_exists_override: bool | None = None,
     expected_at: datetime | None = None,
     applicability: str | None = None,
     data_quality: str | None = None,
@@ -116,8 +117,12 @@ def expected_state_from(
         device_id=device_id,
         alarm_state=normalized_alarm_state,
         operation_state=normalized_operation_state,
-        event_exists=normalized_alarm_state
-        in {AlarmLifecycleState.ALARM.value, AlarmLifecycleState.RECOVERY.value},
+        event_exists=(
+            event_exists_override
+            if event_exists_override is not None
+            else normalized_alarm_state
+            in {AlarmLifecycleState.ALARM.value, AlarmLifecycleState.RECOVERY.value}
+        ),
         overall_status=overall_status,
         standard_id=standard_id,
         standard_revision=standard_revision,

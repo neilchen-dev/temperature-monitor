@@ -47,6 +47,14 @@ class OperationObservationService:
     def apply(self, observation: OperationObservation) -> OperationApplyResult:
         current = self.store.get_current(observation.device_id)
         if not is_newer_operation(observation, current):
+            refresh_initiator = getattr(self.store, "refresh_initiator", None)
+            if (
+                current is not None
+                and observation.source_record_id == current.source_record_id
+                and observation.initiator_id
+                and callable(refresh_initiator)
+            ):
+                refresh_initiator(observation)
             self.store.record_stale(observation)
             return OperationApplyResult(
                 observation=observation,

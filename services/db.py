@@ -34,6 +34,7 @@ Design notes / semantics:
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -143,6 +144,22 @@ CREATE TABLE IF NOT EXISTS sample_projection_state (
     projected_at TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- One common tombstone registry for every Feishu Bitable table.  A missing
+-- remote record is an external binding state, not a transient write error.
+CREATE TABLE IF NOT EXISTS feishu_remote_record_state (
+    table_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    entity_type TEXT,
+    entity_id TEXT,
+    state TEXT NOT NULL DEFAULT 'BOUND',
+    missing_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (table_id, record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_remote_record_state_entity
+    ON feishu_remote_record_state(entity_type, entity_id, state);
 """
 
 # 加性列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列。
@@ -286,6 +303,244 @@ def _now_text() -> str:
 
 def is_enabled() -> bool:
     return bool(config.SQLITE_ENABLED) and _get_connection() is not None
+
+
+def register_feishu_record_binding(
+    table_id: str,
+    record_id: str,
+    *,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+) -> bool:
+    """Remember the local entity associated with a Feishu record id.
+
+    This registry is deliberately table-agnostic so a later RecordIdNotFound
+    can be reflected in SQLite even when the writer belongs to a different
+    business table.
+    """
+    if not config.SQLITE_ENABLED:
+        return False
+    connection = _get_connection()
+    if connection is None:
+        return False
+    normalized_table = str(table_id).strip()
+    normalized_record = str(record_id).strip()
+    if not normalized_table or not normalized_record:
+        return False
+    now = _now_text()
+    try:
+        with _lock:
+            connection.execute(
+                """
+                INSERT INTO feishu_remote_record_state (
+                    table_id, record_id, entity_type, entity_id, state, updated_at
+                ) VALUES (?, ?, ?, ?, 'BOUND', ?)
+                ON CONFLICT(table_id, record_id) DO UPDATE SET
+                    entity_type = COALESCE(excluded.entity_type, feishu_remote_record_state.entity_type),
+                    entity_id = COALESCE(excluded.entity_id, feishu_remote_record_state.entity_id),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_table,
+                    normalized_record,
+                    str(entity_type).strip() if entity_type else None,
+                    str(entity_id).strip() if entity_id else None,
+                    now,
+                ),
+            )
+            connection.commit()
+        return True
+    except sqlite3.Error:
+        logger.exception(
+            "SQLite 记录飞书 record 绑定失败 | table_id=%s | record_id=%s",
+            normalized_table,
+            normalized_record,
+        )
+        return False
+
+
+def is_feishu_record_missing(table_id: str, record_id: str) -> bool:
+    """Check the shared SQLite tombstone registry without calling Feishu."""
+    if not config.SQLITE_ENABLED:
+        return False
+    connection = _get_connection()
+    if connection is None:
+        return False
+    try:
+        with _lock:
+            row = connection.execute(
+                """
+                SELECT 1 FROM feishu_remote_record_state
+                WHERE table_id = ? AND record_id = ?
+                  AND state = 'REMOTE_RECORD_DELETED'
+                """,
+                (str(table_id).strip(), str(record_id).strip()),
+            ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        logger.exception(
+            "SQLite 查询 Feishu record tombstone 失败 | table_id=%s | record_id=%s",
+            table_id,
+            record_id,
+        )
+        return False
+
+
+def mark_feishu_record_missing(
+    table_id: str,
+    record_id: str,
+    error: str,
+    *,
+    missing_at: str | None = None,
+) -> bool:
+    """Persist a generic remote-deletion tombstone and sync known projections."""
+    if not config.SQLITE_ENABLED:
+        return False
+    connection = _get_connection()
+    if connection is None:
+        return False
+    normalized_table = str(table_id).strip()
+    normalized_record = str(record_id).strip()
+    if not normalized_table or not normalized_record:
+        return False
+    when = missing_at or _now_text()
+    error_text = str(error)[:1000]
+    try:
+        with _lock:
+            connection.execute(
+                """
+                INSERT INTO feishu_remote_record_state (
+                    table_id, record_id, state, missing_at, last_error, updated_at
+                ) VALUES (?, ?, 'REMOTE_RECORD_DELETED', ?, ?, ?)
+                ON CONFLICT(table_id, record_id) DO UPDATE SET
+                    state = 'REMOTE_RECORD_DELETED',
+                    missing_at = excluded.missing_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized_table, normalized_record, when, error_text, when),
+            )
+            binding = connection.execute(
+                """
+                SELECT entity_type, entity_id
+                FROM feishu_remote_record_state
+                WHERE table_id = ? AND record_id = ?
+                """,
+                (normalized_table, normalized_record),
+            ).fetchone()
+
+            entity_type = str(binding["entity_type"] or "").upper() if binding else ""
+            entity_id = str(binding["entity_id"] or "").strip().upper() if binding else ""
+            device_table_ids = {
+                str(getattr(config, "FEISHU_DEVICE_TABLE_ID", "") or "").strip(),
+                str(getattr(config, "TABLE_ID", "") or "").strip(),
+            }
+            is_device_record = entity_type == "DEVICE" or (
+                bool(normalized_table)
+                and normalized_table in device_table_ids - {""}
+            )
+            if is_device_record:
+                projection_exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_status_projection'"
+                ).fetchone()
+                if projection_exists:
+                    connection.execute(
+                        """
+                        UPDATE device_status_projection
+                        SET status = 'REMOTE_RECORD_DELETED', pending = 0, failed = 0,
+                            last_attempt_at = ?, last_error = ?, updated_at = ?
+                        WHERE record_id = ?
+                           OR (? <> '' AND device_id = ?)
+                        """,
+                        (when, error_text, when, normalized_record, entity_id, entity_id),
+                    )
+                if entity_type == "DEVICE" and entity_id:
+                    state_exists = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sample_projection_state'"
+                    ).fetchone()
+                    if state_exists:
+                        connection.execute(
+                            """
+                            UPDATE sample_projection_state
+                            SET projection_status = 'remote_record_deleted',
+                                last_error = ?, last_attempt_at = ?, updated_at = ?
+                            WHERE device = ?
+                            """,
+                            (error_text[:500], when, when, entity_id),
+                        )
+            event_table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='environment_events'"
+            ).fetchone()
+            if event_table_exists:
+                event_table_id = str(
+                    getattr(config, "FEISHU_EVENT_TABLE_ID", "") or ""
+                ).strip()
+                event_rows = connection.execute(
+                    "SELECT event_id, payload_json FROM environment_events"
+                ).fetchall()
+                for event_row in event_rows:
+                    try:
+                        payload = json.loads(event_row["payload_json"] or "{}")
+                    except (TypeError, ValueError):
+                        payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    linked = (
+                        (
+                            normalized_table == event_table_id
+                            and payload.get("feishu_record_id") == normalized_record
+                        )
+                        or (
+                            entity_type == "ENVIRONMENT_EVENT"
+                            and entity_id
+                            and str(event_row["event_id"]) == entity_id
+                        )
+                    )
+                    if not linked:
+                        continue
+                    payload.update(
+                        {
+                            "feishu_record_missing": True,
+                            "feishu_record_missing_at": when,
+                            "feishu_record_missing_error": error_text,
+                            "feishu_binding_status": "DELETED",
+                            "feishu_update_pending": False,
+                            "feishu_recovery_pending": False,
+                            "local_close_reason": "linked_feishu_record_deleted",
+                        }
+                    )
+                    connection.execute(
+                        """
+                        UPDATE environment_events
+                        SET status = 'CLOSED', closed_at = COALESCE(closed_at, ?),
+                            payload_json = ?
+                        WHERE event_id = ?
+                        """,
+                        (
+                            when,
+                            json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            event_row["event_id"],
+                        ),
+                    )
+            connection.commit()
+        logger.warning(
+            "Feishu record 已标记为远端删除 | table_id=%s | record_id=%s",
+            normalized_table,
+            normalized_record,
+        )
+        return True
+    except sqlite3.Error:
+        logger.exception(
+            "SQLite 同步远端删除状态失败 | table_id=%s | record_id=%s",
+            normalized_table,
+            normalized_record,
+        )
+        return False
 
 
 def save_temperature_report(

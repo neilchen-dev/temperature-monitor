@@ -78,6 +78,8 @@ class FeishuOperationFieldMap:
     validation: str | None = None
     valid_values: tuple[str, ...] = ("有效",)
     allowed_device_ids: frozenset[str] = frozenset()
+    initiator: str | None = None
+    initiator_id_type: str = "open_id"
 
 
 class FeishuOperationAdapter:
@@ -110,6 +112,8 @@ class FeishuOperationAdapter:
             required.append(fields.source_created_at)
         if fields.validation:
             required.append(fields.validation)
+        if fields.initiator:
+            required.append(fields.initiator)
         return tuple(dict.fromkeys(field for field in required if field))
 
     def validate_schema(self) -> None:
@@ -246,6 +250,20 @@ class FeishuOperationAdapter:
         action = _action(_required_text(record.fields, fields.action))
         operation_type = _optional_text(record.fields, fields.operation_type)
         work_order = _optional_text(record.fields, fields.work_order)
+        initiator = (
+            record.fields.get(fields.initiator)
+            if fields.initiator is not None
+            else None
+        )
+        initiator_id, initiator_id_type, initiator_name = _person_identity(
+            initiator,
+            default_id_type=fields.initiator_id_type,
+        )
+        if initiator_id is None and record.created_by is not None:
+            initiator_id, initiator_id_type, initiator_name = _person_identity(
+                record.created_by,
+                default_id_type="open_id",
+            )
         source_created_at = _parse_datetime(record.created_at)
         if source_created_at is None and fields.source_created_at is not None:
             source_created_at = _parse_datetime(record.fields.get(fields.source_created_at))
@@ -261,6 +279,9 @@ class FeishuOperationAdapter:
             source_record_id=record.record_id,
             source_created_at=source_created_at,
             observed_at=current_time,
+            initiator_id=initiator_id,
+            initiator_id_type=initiator_id_type,
+            initiator_name=initiator_name,
         )
 
 
@@ -292,6 +313,38 @@ def _optional_text(fields: Any, field_name: str | None) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _person_identity(
+    value: Any,
+    *,
+    default_id_type: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Extract a routable Feishu identity from a person cell or record creator."""
+    while isinstance(value, list):
+        if not value:
+            return None, None, None
+        value = value[0]
+    if isinstance(value, dict):
+        name = _optional_text(value, "name") or _optional_text(value, "en_name")
+        for key, id_type in (
+            ("open_id", "open_id"),
+            ("user_id", "user_id"),
+            ("union_id", "union_id"),
+            ("email", "email"),
+            ("id", default_id_type),
+        ):
+            identity = _optional_text(value, key)
+            if identity:
+                return identity, id_type, name
+        nested = value.get("value")
+        if nested is not None and nested is not value:
+            return _person_identity(nested, default_id_type=default_id_type)
+        return None, None, name
+    if value is None:
+        return None, None, None
+    identity = str(value).strip()
+    return (identity, default_id_type, None) if identity else (None, None, None)
 
 
 def _action(value: str) -> OperationAction:
