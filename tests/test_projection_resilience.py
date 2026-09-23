@@ -460,6 +460,16 @@ class ProjectionResilienceTests(unittest.TestCase):
         """抑制窗口内的客户端重试：不重复飞书调用、不重复 sample/派发。"""
         config.FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = 30.0
         with (
+            patch.object(
+                projection,
+                "should_suppress_inline_attempt",
+                side_effect=[False, True, True],
+            ),
+            patch.object(
+                projection,
+                "mark_projection_failure",
+                wraps=projection.mark_projection_failure,
+            ) as mark_failure,
             patch("routes.temperature.resolve_record_id", return_value="rec_01"),
             patch(
                 "routes.temperature.update_feishu_fields", side_effect=_connection_error
@@ -477,6 +487,9 @@ class ProjectionResilienceTests(unittest.TestCase):
         self.assertEqual(retry_new.get_json()["feishu_projection"], "deferred")
         # 只发生了一次内联飞书尝试
         update.assert_called_once()
+        # 被 backoff 抑制的请求不是新失败，不能刷新 last_attempt_at，
+        # 否则持续的现场样本会把 durable retry 一直往后推。
+        mark_failure.assert_called_once()
         self.assertEqual(len(self._samples()), 2)
         self.assertEqual(self.dispatched, [])
 
