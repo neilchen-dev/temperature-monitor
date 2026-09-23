@@ -205,6 +205,10 @@ class FeishuObservationAdapter:
 def _alarm_state(value: Any) -> str:
     aliases = {
         "未触发": "NORMAL",
+        # These labels describe independent prewarning/applicability fields;
+        # they do not mean the alarm lifecycle is active.
+        "预警": "NORMAL",
+        "N/A": "NORMAL",
         "计时中": "PENDING",
         "已发警报": "ALARM",
     }

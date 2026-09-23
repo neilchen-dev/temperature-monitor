@@ -438,6 +438,37 @@ class FeishuObservationAdapterTests(unittest.TestCase):
             ),
         ).observe("TH-10")
 
+    def test_alarm_state_keeps_prewarning_and_not_applicable_separate(self) -> None:
+        class _ObservationSource:
+            def __init__(self, alarm: str) -> None:
+                self.alarm = alarm
+
+            def read(self, device_id: str):
+                return {
+                    "alarm": self.alarm,
+                    "operation": "N/A",
+                    "event": False,
+                }
+
+        fields = FeishuObservationFieldMap(
+            alarm_state="alarm",
+            operation_state="operation",
+            event_exists="event",
+        )
+        for raw, expected in (
+            ("预警", "NORMAL"),
+            ("N/A", "NORMAL"),
+            ("未触发", "NORMAL"),
+            ("计时中", "PENDING"),
+            ("已发警报", "ALARM"),
+        ):
+            with self.subTest(raw=raw):
+                observed = FeishuObservationAdapter(
+                    source=_ObservationSource(raw),
+                    fields=fields,
+                ).observe("TH-10")
+                self.assertEqual(observed.alarm_state, expected)
+
     def test_integer_field_accepts_supported_feishu_shapes(self) -> None:
         supported = (
             (0, 0),
