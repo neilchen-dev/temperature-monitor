@@ -855,13 +855,20 @@ class ShadowRuntime:
             f"设备：{operation.device_id}",
             f"区域：{operation.area_id}",
             f"作业/工艺：{operation.operation_type or '未填写'}",
-            f"工单号：{operation.work_order or '未填写'}",
-            f"开始时间：{operation.started_at.isoformat()}",
-            f"对应开始作业记录：{operation.source_record_id}",
+            f"开始时间：{started_at.strftime('%Y-%m-%d %H:%M:%S %z')}",
+            f"登记编号：{operation.registration_number or '未提供'}",
+            f"开始登记记录ID：{operation.source_record_id}",
             f"已持续：{elapsed_hours:.1f} 小时；这是第 {sequence + 1} 次提醒。",
         ]
+        if operation.initiator_name:
+            lines.insert(3, f"发起人：{operation.initiator_name}")
+        if operation.work_order:
+            lines.insert(4, f"工单/批次号：{operation.work_order}")
+        if operation.note:
+            note = " ".join(operation.note.split())
+            lines.append(f"开始登记备注：{note[:300]}")
         if record_url:
-            lines.append(f"查看开始作业记录：{record_url}")
+            lines.append(f"作业登记台账（按登记编号查找）：{record_url}")
         if config.FEISHU_OPERATION_OVERDUE_FORM_URL:
             lines.append(
                 "结束作业登记：" + config.FEISHU_OPERATION_OVERDUE_FORM_URL

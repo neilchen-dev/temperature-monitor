@@ -51,7 +51,13 @@ class OperationObservationService:
             if (
                 current is not None
                 and observation.source_record_id == current.source_record_id
-                and observation.initiator_id
+                and any(
+                    (
+                        observation.initiator_id,
+                        observation.registration_number,
+                        observation.note,
+                    )
+                )
                 and callable(refresh_initiator)
             ):
                 refresh_initiator(observation)

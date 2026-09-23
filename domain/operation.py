@@ -26,6 +26,8 @@ class OperationObservation:
     initiator_id: str | None = None
     initiator_id_type: str | None = None
     initiator_name: str | None = None
+    registration_number: str | None = None
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,8 @@ class ActiveOperation:
     initiator_id: str | None
     initiator_id_type: str | None
     initiator_name: str | None
+    registration_number: str | None = None
+    note: str | None = None
     overdue_notification_status: str | None = None
     overdue_notification_at: datetime | None = None
     overdue_notification_sequence: int | None = None

@@ -523,7 +523,13 @@ FEISHU_OPERATION_TYPE_FIELD = os.getenv(
     "FEISHU_OPERATION_TYPE_FIELD", "当前工艺"
 ).strip()
 FEISHU_OPERATION_WORK_ORDER_FIELD = os.getenv(
-    "FEISHU_OPERATION_WORK_ORDER_FIELD", "工单号"
+    "FEISHU_OPERATION_WORK_ORDER_FIELD", ""
+).strip()
+FEISHU_OPERATION_REGISTRATION_NUMBER_FIELD = os.getenv(
+    "FEISHU_OPERATION_REGISTRATION_NUMBER_FIELD", "登记编号"
+).strip()
+FEISHU_OPERATION_NOTE_FIELD = os.getenv(
+    "FEISHU_OPERATION_NOTE_FIELD", "备注"
 ).strip()
 FEISHU_OPERATION_INITIATOR_FIELD = os.getenv(
     "FEISHU_OPERATION_INITIATOR_FIELD", ""
@@ -545,7 +551,11 @@ FEISHU_OPERATION_OVERDUE_FORM_URL = os.getenv(
     "https://qjvasb3rm2.feishu.cn/share/base/form/shrcn3uI6kNyIHatmjKc7DXnpih",
 ).strip()
 FEISHU_OPERATION_TABLE_URL = os.getenv(
-    "FEISHU_OPERATION_TABLE_URL", ""
+    "FEISHU_OPERATION_TABLE_URL",
+    (
+        "https://qjvasb3rm2.feishu.cn/wiki/PKKJwvD8ei7zL3k3Dbkcj2S8nhc"
+        "?table=tbl3xFxhxnNlv4pm&view=vew9ianU9W"
+    ),
 ).strip()
 FEISHU_OPERATION_VALIDATION_FIELD = os.getenv(
     "FEISHU_OPERATION_VALIDATION_FIELD", "登记组合校验"

@@ -605,6 +605,8 @@ def build_runtime(
             work_order=config.FEISHU_OPERATION_WORK_ORDER_FIELD,
             initiator=config.FEISHU_OPERATION_INITIATOR_FIELD or None,
             initiator_id_type=config.FEISHU_OPERATION_INITIATOR_ID_TYPE,
+            registration_number=config.FEISHU_OPERATION_REGISTRATION_NUMBER_FIELD,
+            note=config.FEISHU_OPERATION_NOTE_FIELD,
             source_created_at=config.FEISHU_OPERATION_SOURCE_CREATED_AT_FIELD or None,
             validation=config.FEISHU_OPERATION_VALIDATION_FIELD or None,
             valid_values=(config.FEISHU_OPERATION_VALIDATION_VALUE,),

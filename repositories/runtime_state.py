@@ -89,7 +89,9 @@ CREATE TABLE IF NOT EXISTS operation_observations_current (
     observed_at TEXT NOT NULL,
     initiator_id TEXT,
     initiator_id_type TEXT,
-    initiator_name TEXT
+    initiator_name TEXT,
+    registration_number TEXT,
+    note TEXT
 );
 
 CREATE TABLE IF NOT EXISTS operation_states (
@@ -103,6 +105,8 @@ CREATE TABLE IF NOT EXISTS operation_states (
     initiator_id TEXT,
     initiator_id_type TEXT,
     initiator_name TEXT,
+    registration_number TEXT,
+    note TEXT,
     overdue_notification_status TEXT,
     overdue_notification_at TEXT,
     overdue_notification_sequence INTEGER,
@@ -547,11 +551,15 @@ class SQLiteOperationRepository:
                 ("initiator_id", "TEXT"),
                 ("initiator_id_type", "TEXT"),
                 ("initiator_name", "TEXT"),
+                ("registration_number", "TEXT"),
+                ("note", "TEXT"),
             ),
             "operation_states": (
                 ("initiator_id", "TEXT"),
                 ("initiator_id_type", "TEXT"),
                 ("initiator_name", "TEXT"),
+                ("registration_number", "TEXT"),
+                ("note", "TEXT"),
                 ("overdue_notification_status", "TEXT"),
                 ("overdue_notification_at", "TEXT"),
                 ("overdue_notification_sequence", "INTEGER"),
@@ -588,12 +596,20 @@ class SQLiteOperationRepository:
             initiator_id=row["initiator_id"],
             initiator_id_type=row["initiator_id_type"],
             initiator_name=row["initiator_name"],
+            registration_number=row["registration_number"],
+            note=row["note"],
         )
 
     @retry_sqlite_write
     def refresh_initiator(self, observation: OperationObservation) -> None:
-        """Enrich an existing same-record observation after adding creator capture."""
-        if not observation.initiator_id:
+        """Enrich an existing same-record observation with newly mapped metadata."""
+        if not any(
+            (
+                observation.initiator_id,
+                observation.registration_number,
+                observation.note,
+            )
+        ):
             return
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -603,13 +619,17 @@ class SQLiteOperationRepository:
                     UPDATE operation_observations_current
                     SET initiator_id = COALESCE(initiator_id, ?),
                         initiator_id_type = COALESCE(initiator_id_type, ?),
-                        initiator_name = COALESCE(initiator_name, ?)
+                        initiator_name = COALESCE(initiator_name, ?),
+                        registration_number = COALESCE(registration_number, ?),
+                        note = COALESCE(note, ?)
                     WHERE device_id = ? AND source_record_id = ?
                     """,
                     (
                         observation.initiator_id,
                         observation.initiator_id_type,
                         observation.initiator_name,
+                        observation.registration_number,
+                        observation.note,
                         observation.device_id,
                         observation.source_record_id,
                     ),
@@ -620,6 +640,8 @@ class SQLiteOperationRepository:
                     SET initiator_id = COALESCE(initiator_id, ?),
                         initiator_id_type = COALESCE(initiator_id_type, ?),
                         initiator_name = COALESCE(initiator_name, ?),
+                        registration_number = COALESCE(registration_number, ?),
+                        note = COALESCE(note, ?),
                         overdue_notification_status = CASE
                             WHEN overdue_notification_status = 'SKIPPED_NO_INITIATOR'
                             THEN NULL ELSE overdue_notification_status END,
@@ -637,6 +659,8 @@ class SQLiteOperationRepository:
                         observation.initiator_id,
                         observation.initiator_id_type,
                         observation.initiator_name,
+                        observation.registration_number,
+                        observation.note,
                         observation.device_id,
                         OperationStatus.OPERATING.value,
                         observation.source_record_id,
@@ -656,8 +680,9 @@ class SQLiteOperationRepository:
                 INSERT INTO operation_observations_current (
                     device_id, area_id, action, operation_type, work_order,
                     source_record_id, source_created_at, observed_at,
-                    initiator_id, initiator_id_type, initiator_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    initiator_id, initiator_id_type, initiator_name,
+                    registration_number, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     area_id = excluded.area_id,
                     action = excluded.action,
@@ -668,7 +693,9 @@ class SQLiteOperationRepository:
                     observed_at = excluded.observed_at,
                     initiator_id = excluded.initiator_id,
                     initiator_id_type = excluded.initiator_id_type,
-                    initiator_name = excluded.initiator_name
+                    initiator_name = excluded.initiator_name,
+                    registration_number = excluded.registration_number,
+                    note = excluded.note
                 """,
                 (
                     observation.device_id,
@@ -682,6 +709,8 @@ class SQLiteOperationRepository:
                     observation.initiator_id,
                     observation.initiator_id_type,
                     observation.initiator_name,
+                    observation.registration_number,
+                    observation.note,
                 ),
             )
             previous = self.connection.execute(
@@ -698,6 +727,8 @@ class SQLiteOperationRepository:
                 initiator_id = observation.initiator_id
                 initiator_id_type = observation.initiator_id_type
                 initiator_name = observation.initiator_name
+                registration_number = observation.registration_number
+                note = observation.note
                 notification_status = None
                 notification_at = None
                 notification_sequence = None
@@ -712,6 +743,8 @@ class SQLiteOperationRepository:
                 initiator_id = previous["initiator_id"] if previous else None
                 initiator_id_type = previous["initiator_id_type"] if previous else None
                 initiator_name = previous["initiator_name"] if previous else None
+                registration_number = None
+                note = None
                 notification_status = (
                     previous["overdue_notification_status"] if previous else None
                 )
@@ -730,11 +763,12 @@ class SQLiteOperationRepository:
                 INSERT INTO operation_states (
                     device_id, area_id, state, operation_type, work_order,
                     started_at, ended_at, initiator_id, initiator_id_type,
-                    initiator_name, overdue_notification_status,
+                    initiator_name, registration_number, note,
+                    overdue_notification_status,
                     overdue_notification_at, overdue_notification_sequence,
                     overdue_notification_message_id,
                     overdue_notification_error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     area_id = excluded.area_id,
                     state = excluded.state,
@@ -745,6 +779,8 @@ class SQLiteOperationRepository:
                     initiator_id = excluded.initiator_id,
                     initiator_id_type = excluded.initiator_id_type,
                     initiator_name = excluded.initiator_name,
+                    registration_number = excluded.registration_number,
+                    note = excluded.note,
                     overdue_notification_status = excluded.overdue_notification_status,
                     overdue_notification_at = excluded.overdue_notification_at,
                     overdue_notification_sequence = excluded.overdue_notification_sequence,
@@ -763,6 +799,8 @@ class SQLiteOperationRepository:
                     initiator_id,
                     initiator_id_type,
                     initiator_name,
+                    registration_number,
+                    note,
                     notification_status,
                     notification_at,
                     notification_sequence,
@@ -815,6 +853,7 @@ class SQLiteOperationRepository:
             SELECT s.device_id, s.area_id, s.operation_type, s.work_order,
                    c.source_record_id, s.started_at, s.initiator_id,
                    s.initiator_id_type, s.initiator_name,
+                   s.registration_number, s.note,
                    s.overdue_notification_status, s.overdue_notification_at,
                    s.overdue_notification_sequence
             FROM operation_states AS s
@@ -835,6 +874,8 @@ class SQLiteOperationRepository:
                 initiator_id=row["initiator_id"],
                 initiator_id_type=row["initiator_id_type"],
                 initiator_name=row["initiator_name"],
+                registration_number=row["registration_number"],
+                note=row["note"],
                 overdue_notification_status=row["overdue_notification_status"],
                 overdue_notification_at=_parse(row["overdue_notification_at"]),
                 overdue_notification_sequence=row["overdue_notification_sequence"],

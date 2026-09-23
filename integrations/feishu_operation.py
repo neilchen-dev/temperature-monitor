@@ -80,6 +80,8 @@ class FeishuOperationFieldMap:
     allowed_device_ids: frozenset[str] = frozenset()
     initiator: str | None = None
     initiator_id_type: str = "open_id"
+    registration_number: str | None = None
+    note: str | None = None
 
 
 class FeishuOperationAdapter:
@@ -282,6 +284,10 @@ class FeishuOperationAdapter:
             initiator_id=initiator_id,
             initiator_id_type=initiator_id_type,
             initiator_name=initiator_name,
+            registration_number=_optional_text(
+                record.fields, fields.registration_number
+            ),
+            note=_optional_text(record.fields, fields.note),
         )
 
 
