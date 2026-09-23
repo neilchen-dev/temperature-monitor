@@ -361,6 +361,33 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.get_json()["status"], "degraded")
 
+    def test_health_liveness_stays_healthy_when_active_readiness_is_blocked(self) -> None:
+        with mock.patch(
+            "runtime.bootstrap.runtime_liveness",
+            return_value={
+                "available": True,
+                "scheduler_running": True,
+                "mode": "active",
+            },
+        ), mock.patch(
+            "runtime.bootstrap.runtime_readiness",
+            return_value={
+                "ready": False,
+                "available": True,
+                "scheduler_running": True,
+                "standards_ready": False,
+                "active_readiness": False,
+                "reasons": ["standards not ready"],
+            },
+        ):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "degraded")
+        self.assertEqual(
+            response.get_json()["readiness"]["reasons"], ["standards not ready"]
+        )
+
     def test_readyz_is_strict_when_alarm_chain_is_not_ready(self) -> None:
         with mock.patch(
             "runtime.bootstrap.runtime_readiness",

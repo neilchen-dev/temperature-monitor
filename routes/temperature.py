@@ -333,12 +333,14 @@ def health():
             startup_grace = started_age < config.RUNTIME_READINESS_GRACE_SECONDS
         except (TypeError, ValueError):
             startup_grace = False
+    # /health is the process/runtime liveness probe used by Docker. Business
+    # readiness is reported in the body and enforced separately by /readyz;
+    # mixing the two makes a recoverable readiness blocker restart the whole
+    # service and interrupts sensor ingestion.
     health_ok = runtime_healthy and (
         not active_mode or readiness.get("ready") or startup_grace
     )
     status_code = 200 if runtime_healthy else 503
-    if active_mode and not readiness.get("ready") and not startup_grace:
-        status_code = 503
     return jsonify({
         "status": (
             "ok" if health_ok and readiness.get("ready")

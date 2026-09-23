@@ -86,7 +86,7 @@ options:
   device_name_map: ""
   source_temperature_unit: C
   sqlite_enabled: true
-  waitress_threads: 4
+  waitress_threads: 16
   modbus_enabled: false
   modbus_transport: tcp
   modbus_host: 127.0.0.1

@@ -171,7 +171,7 @@ FEISHU_DEVICE_TABLE_ID = TABLE_ID
 # 运行配置。容器中的默认路径自然对应 /app/data 与 /app/logs。
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = _get_int("PORT", 5000)
-WAITRESS_THREADS = _get_int("WAITRESS_THREADS", 4)
+WAITRESS_THREADS = _get_int("WAITRESS_THREADS", 16)
 # Home Assistant Add-on 中 /app/data 位于容器内、升级即丢；Supervisor 的
 # /data 才是持久目录。检测到 Add-on 环境时默认切换，仍可用 DATA_DIR 覆盖。
 IS_HOME_ASSISTANT_ADDON = HASSIO_OPTIONS_PATH.is_file()
@@ -385,7 +385,7 @@ RUNTIME_SHUTDOWN_TIMEOUT_SECONDS = max(
 )
 # Active readiness may be temporarily false while the first strict Feishu
 # standard sync completes after a restart.  /health reports ``starting``
-# during this grace period; /readyz remains strict for deployment gates.
+# during this grace period; /readyz remains the strict business-readiness view.
 RUNTIME_READINESS_GRACE_SECONDS = max(
     0.0, _get_float("RUNTIME_READINESS_GRACE_SECONDS", 120.0)
 )

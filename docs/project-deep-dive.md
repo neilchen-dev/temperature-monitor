@@ -43,7 +43,7 @@
 
 **数据到哪去**：飞书多维表格（实时表 + 每设备一张历史表）、SQLite 镜像（4 张表）、CSV 月度文件、本地看板（Chart.js）。
 
-**技术栈**：Python 3.12 / Flask 3（工厂模式 + 5 个 Blueprint）/ waitress（生产 WSGI，4 线程）/ SQLite（WAL）/ requests / pymodbus 3.15（TCP+串口）/ pyserial / Docker + GitHub Actions（测试 → 构建 → 阿里云 ACR → SSH 部署 → 健康检查 → 自动回滚）。
+**技术栈**：Python 3.12 / Flask 3（工厂模式 + 5 个 Blueprint）/ waitress（生产 WSGI，16 线程）/ SQLite（WAL）/ requests / pymodbus 3.15（TCP+串口）/ pyserial / Docker + GitHub Actions（测试 → 构建 → 阿里云 ACR → SSH 部署 → 健康检查 → 自动回滚）。
 
 **规模感**：单进程多线程架构；11 个 HA 设备 + 1 个 Modbus 设备；采样间隔 10 分钟（历史）/ 5 秒（Modbus）；数据量级为"每天每设备 144 条历史快照"——这是所有技术选型（SQLite、单进程、无消息队列）的前提。
 
@@ -473,7 +473,7 @@ connection.execute("PRAGMA busy_timeout=5000")
 connection.execute("PRAGMA synchronous=NORMAL")
 ```
 
-- **单连接 + RLock**：waitress 4 线程共享一个连接，所有读写持锁串行。RLock（可重入）是必须的：`devices.record_sample` 在 `with db._lock:` 里调用 `db.fetch_previous_device_sample`，后者内部再取同一把锁——普通 Lock 会当场死锁（devices.py:123-127 注释明说）。
+- **单连接 + RLock**：waitress 工作线程共享一个连接，所有读写持锁串行。RLock（可重入）是必须的：`devices.record_sample` 在 `with db._lock:` 里调用 `db.fetch_previous_device_sample`，后者内部再取同一把锁——普通 Lock 会当场死锁（devices.py:123-127 注释明说）。
 - **WAL（Write-Ahead Logging）**：写不再阻塞读。SQLite 默认 journal 模式下写事务独占文件，waitress 的读请求会被采集线程的写卡住；WAL 把写前置到 -wal 文件，读写并发。代价：多一个 wal 文件、跨进程场景需要共享内存协调（本设计明确限定单进程，`:24-26`）。
 - **`synchronous=NORMAL`**：WAL 模式下事务不 fsync 到磁盘即返回，性能大幅提升；掉电最多丢最后一个 checkpoint 之后的事务，但**已提交事务在进程被 SIGKILL 时依然完好**（这正是 §4 那个 PID 1 边界"损失有限"的根据）。
 - **busy_timeout=5000**：锁被占时等 5 秒而不是立刻抛 `database is locked`。
@@ -572,7 +572,7 @@ push/PR ──► tests.yml：ruff check + unittest（Python 3.12）
                    ├─ 备份旧 IMAGE_TAG（.env 里的）→ rollback() 函数就绪
                    ├─ sed 只改 .env 的 IMAGE_TAG 行（其余业务配置不动）
                    ├─ docker compose pull
-                   ├─ docker compose up -d --wait --wait-timeout 120
+                   ├─ docker compose up -d --wait --wait-timeout 600
                    └─ curl --retry 10 --retry-delay 3 http://127.0.0.1:$PORT/health
                         失败 → rollback()：把 .env 改回旧 tag → up -d → exit 1
 ```
@@ -612,7 +612,7 @@ push/PR ──► tests.yml：ruff check + unittest（Python 3.12）
 数据量级：11 设备 × 144 条/天 ≈ 每天 1600 行，年 60 万行——单机嵌入式数据库绰绰有余。部署形态：Add-on 单容器，外置数据库需要第二个服务、网络、凭据，违背"Add-on 自包含"。WAL 解决了读阻塞写。明确边界写进 db.py docstring：单进程设计，多进程部署需要重新设计协调。
 
 **③ 单进程多线程，而不是多进程/微服务。**
-采集线程与 Web 服务共进程：线程间共享一个 SQLite 连接即可同步，进程间就要引入 IPC。waitress 4 线程足够这个负载。代价：GIL 下 CPU 并行受限（本应用是 IO 密集，无影响）、多 worker 部署需要部署层约定（§4 三层防线）。
+采集线程与 Web 服务共进程：线程间共享一个 SQLite 连接即可同步，进程间就要引入 IPC。waitress 16 线程用于吸收 I/O 等待和现场上报突发；SQLite 写入仍由连接锁串行。代价：GIL 下 CPU 并行受限（本应用是 IO 密集，无影响）、多 worker 部署需要部署层约定（§4 三层防线）。
 
 **④ per-resource lock 取代全局锁。**
 演进：最初一把全局锁串行化所有飞书请求 → 11 台设备的历史写入被最慢一台拖住。现在锁粒度 = record/table key（feishu.py:16-34）。替代方案：无锁（read-modify-write 竞态产生重复记录）、分布式锁（单进程用不上 Redis，过度工程）。

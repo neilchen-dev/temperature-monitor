@@ -196,7 +196,7 @@ HISTORY_API_KEY=generate-a-random-key-at-least-32-bytes
 
 ```bash
 docker compose pull
-docker compose up -d --remove-orphans --wait --wait-timeout 120
+docker compose up -d --remove-orphans --wait --wait-timeout 600
 curl http://127.0.0.1:5000/health
 ```
 
