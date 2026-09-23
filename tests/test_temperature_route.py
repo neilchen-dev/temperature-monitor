@@ -19,6 +19,7 @@ class TemperatureRouteTests(unittest.TestCase):
             "DEVICE_NAME_MAP": config.DEVICE_NAME_MAP,
             "DEVICES": config.DEVICES,
             "TEMPERATURE_DEDUPE_WINDOW_MS": config.TEMPERATURE_DEDUPE_WINDOW_MS,
+            "FEISHU_PROJECTION_INLINE_ENABLED": config.FEISHU_PROJECTION_INLINE_ENABLED,
         }
         # 镜像指向临时目录：patch 之外的投影状态读写不得触碰真实生产库。
         config.SQLITE_DB_PATH = Path(self._tmp_dir.name) / "route-tests.db"
@@ -28,6 +29,7 @@ class TemperatureRouteTests(unittest.TestCase):
         config.DEVICE_NAME_MAP = {"WAREHOUSE-TEMP": "DEV-01"}
         config.DEVICES = {}
         config.TEMPERATURE_DEDUPE_WINDOW_MS = 5000
+        config.FEISHU_PROJECTION_INLINE_ENABLED = True
         self.addCleanup(self._restore)
 
     def _restore(self) -> None:

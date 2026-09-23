@@ -193,6 +193,28 @@ def note_sample_persisted(device: str, sample_time_ms: int) -> None:
     db.note_projection_sample(device, int(sample_time_ms))
 
 
+def mark_projection_queued(device: str) -> None:
+    """Queue a newly persisted sample for immediate scheduler projection.
+
+    Preserve any existing retry/backoff episode. Only an ``ok`` device starts
+    a fresh pending episode, with no last-attempt timestamp so the scheduler
+    can pick it up on its next tick.
+    """
+    state = _fetch_state(device)
+    status = str(state.get("projection_status") or PROJECTION_OK)
+    if status != PROJECTION_OK:
+        return
+    db.update_projection_status(
+        device,
+        projection_status=PROJECTION_PENDING,
+        retry_count=0,
+        last_error=None,
+        last_attempt_at=None,
+        projected_at=state.get("projected_at"),
+    )
+    logger.info("feishu_projection_queued | device=%s", device)
+
+
 def mark_projection_success(
     device: str,
     sample_time_ms: int | None = None,
@@ -211,19 +233,25 @@ def mark_projection_success(
     if sample_time_ms is not None:
         db.mark_projection_projected(device, int(sample_time_ms))
     previous = _fetch_state(device)
+    has_newer_sample = (
+        sample_time_ms is not None
+        and previous.get("last_sample_time_ms") is not None
+        and int(previous["last_sample_time_ms"]) > int(sample_time_ms)
+    )
     db.update_projection_status(
         device,
-        projection_status=PROJECTION_OK,
+        projection_status=PROJECTION_PENDING if has_newer_sample else PROJECTION_OK,
         retry_count=0,
         last_error=None,
-        last_attempt_at=previous.get("last_attempt_at"),
+        last_attempt_at=None if has_newer_sample else previous.get("last_attempt_at"),
         projected_at=_now_iso(now),
     )
     logger.info(
         "feishu_projection_ok | device=%s | sample_time_ms=%s"
-        " | retry_count_reset=1",
+        " | retry_count_reset=1 | newer_sample_pending=%s",
         device,
         sample_time_ms,
+        has_newer_sample,
     )
 
 

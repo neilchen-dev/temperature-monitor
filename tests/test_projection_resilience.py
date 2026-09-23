@@ -56,6 +56,7 @@ class ProjectionResilienceTests(unittest.TestCase):
             "FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS": (
                 config.FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS
             ),
+            "FEISHU_PROJECTION_INLINE_ENABLED": config.FEISHU_PROJECTION_INLINE_ENABLED,
         }
         db.close()
         db._init_failed = False
@@ -70,6 +71,7 @@ class ProjectionResilienceTests(unittest.TestCase):
         # 默认关闭内联抑制，保证各用例可显式尝试内联投影；
         # 抑制语义由专门用例验证。
         config.FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = 0.0
+        config.FEISHU_PROJECTION_INLINE_ENABLED = True
         devices._reset_device_model_stats()
 
         self.dispatched: list[MonitorSample] = []
@@ -128,6 +130,29 @@ class ProjectionResilienceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self._samples()), 1)
         self.assertEqual(self._state()["projection_status"], "ok")
+
+    def test_inline_disabled_queues_projection_for_scheduler(self) -> None:
+        with (
+            patch.object(config, "FEISHU_PROJECTION_INLINE_ENABLED", False),
+            patch("routes.temperature.resolve_record_id") as resolve,
+            patch("routes.temperature.update_feishu_fields") as update,
+            patch("routes.temperature.save_history"),
+        ):
+            response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "accepted")
+        self.assertEqual(response.get_json()["feishu_projection"], "deferred")
+        self.assertEqual(len(self._samples()), 1)
+        self.assertEqual(self._state()["projection_status"], "pending")
+        self.assertIsNone(self._state()["last_attempt_at"])
+        self.assertEqual(
+            [device for device, _due_at in projection.list_due_projection_retries()],
+            ["TH-05"],
+        )
+        resolve.assert_not_called()
+        update.assert_not_called()
+        self.assertEqual(self.dispatched, [])
 
     def test_resolve_failure_still_persists(self) -> None:
         """resolve_record_id 网络失败：sample 必须已本地持久化。"""

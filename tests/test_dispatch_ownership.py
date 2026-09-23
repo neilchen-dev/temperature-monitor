@@ -140,6 +140,7 @@ class _OwnershipTestBase(unittest.TestCase):
                 "FEISHU_PROJECTION_MAX_RETRIES",
                 "FEISHU_PROJECTION_BACKOFF_SECONDS",
                 "FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS",
+                "FEISHU_PROJECTION_INLINE_ENABLED",
             )
         }
         config.AUTOMATION_MODE = "shadow"
@@ -159,6 +160,7 @@ class _OwnershipTestBase(unittest.TestCase):
         config.FEISHU_PROJECTION_MAX_RETRIES = 5
         config.FEISHU_PROJECTION_BACKOFF_SECONDS = 30.0
         config.FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = 0.0
+        config.FEISHU_PROJECTION_INLINE_ENABLED = True
         db.close()
         db._init_failed = False
         devices._reset_device_model_stats()

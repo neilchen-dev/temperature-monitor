@@ -423,13 +423,19 @@ FEISHU_PROJECTION_BACKOFF_SECONDS = max(
 FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = max(
     0.0, _get_float("FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS", 30.0)
 )
+# Keep Bitable projection work off Waitress request threads in production.
+# The durable scheduler writes the latest locally persisted sample shortly
+# after ingestion and retries failures with its normal backoff.
+FEISHU_PROJECTION_INLINE_ENABLED = _get_bool(
+    "FEISHU_PROJECTION_INLINE_ENABLED", False
+)
 # 单个 FEISHU_PROJECTION 任务内每次网络尝试的硬上限（秒）。
 # Scheduler 是单线程串行执行：一个 projection handler 禁止内部再做
 # 多轮长 retry loop（否则 11 台设备故障时 SHADOW_COMPARE / SYNC 会被
 # 饿死）。有界模式下每次飞书调用恰好 1 次请求、该超时封顶；handler
 # 最坏 = token + resolve + update 共 3 次有界调用（token 缓存命中时
 # ≤ 2 次），失败立即返回，由 automation_tasks + exponential backoff
-# 调度下一次尝试。普通 /temperature 内联路径不受影响（仍用完整重试）。
+# 调度下一次尝试。开发环境如显式启用 /temperature 内联投影，也使用同一硬上限。
 FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS = max(
     1.0, _get_float("FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS", 5.0)
 )

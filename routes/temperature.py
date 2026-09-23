@@ -150,15 +150,15 @@ def temperature():
             "humidity": humidity,
         }), 200
 
-    # ---- 阶段 B：飞书 realtime projection ----
-    # 投影刚失败过（pending/failed 且在抑制窗口内）时不再同步阻塞
-    # Waitress 线程重试飞书；由 scheduler 的 FEISHU_PROJECTION 任务收敛。
+    # ---- 阶段 B：飞书 projection ----
+    # 生产默认由 durable scheduler 异步投影，避免飞书网络耗时占满
+    # Waitress 线程；显式启用 inline mode 时仍严格限制单次请求耗时。
     attempted = False
     result: dict[str, Any] = {}
     projection_error: str | None = None
     suppressed = durable and projection.should_suppress_inline_attempt(bitable_device)
 
-    if not suppressed:
+    if not suppressed and config.FEISHU_PROJECTION_INLINE_ENABLED:
         attempted = True
         try:
             # Keep sensor ingestion bounded when Feishu is slow. A single
@@ -238,9 +238,15 @@ def temperature():
                 )
             else:
                 error_summary = projection_error
-        else:
+        elif suppressed:
             error_summary = "projection suppressed: recent failure backoff window"
-        projection.mark_projection_failure(bitable_device, error_summary)
+        else:
+            error_summary = "projection queued for durable scheduler"
+
+        if attempted or suppressed:
+            projection.mark_projection_failure(bitable_device, error_summary)
+        else:
+            projection.mark_projection_queued(bitable_device)
         save_history(
             bitable_device,
             temperature_c,
