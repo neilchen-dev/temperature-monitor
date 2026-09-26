@@ -325,9 +325,11 @@ class MonitorApplicationService:
         """Add the near-limit episode while leaving formal alarm state intact."""
         previous = transition.previous
         next_state = transition.next
-        # A real breach always wins.  The formal state machine has already
-        # moved to PENDING/ALARM (or is recovering); clear the advisory signal
-        # without emitting a misleading prewarning recovery.
+        # A real breach always wins.  Hide the advisory signal while the
+        # formal state machine is PENDING/ALARM (or recovering), but retain
+        # its episode identity through PENDING so a brief return to the
+        # prewarning band cannot create another notification for the same
+        # unresolved incident.
         if monitor_result.overall_status.value == "VIOLATION" or next_state.state.value != "NORMAL":
             if previous.prewarning_active:
                 next_state = replace(
@@ -363,13 +365,18 @@ class MonitorApplicationService:
         reasons = tuple(monitor_result.prewarning_reasons)
         actions = list(transition.actions)
         if reasons:
-            episode_id = previous.prewarning_episode_id if previous.prewarning_active else uuid.uuid4().hex
+            # A prewarning episode stays the same across a transient breach
+            # while the formal alarm is still being verified.  The durable
+            # notification effect key then dedupes any re-entry into that
+            # episode; a genuinely cleared prewarning loses its id below.
+            episode_id = previous.prewarning_episode_id or uuid.uuid4().hex
             next_state = replace(
                 next_state,
                 prewarning_active=True,
                 prewarning_started_at=(
                     previous.prewarning_started_at
-                    if previous.prewarning_active and previous.prewarning_started_at is not None
+                    if previous.prewarning_episode_id is not None
+                    and previous.prewarning_started_at is not None
                     else now
                 ),
                 prewarning_episode_id=episode_id,
@@ -392,6 +399,8 @@ class MonitorApplicationService:
             next_state = replace(
                 next_state,
                 prewarning_active=False,
+                prewarning_started_at=None,
+                prewarning_episode_id=None,
                 prewarning_reasons=(),
                 prewarning_details={},
                 prewarning_recovered_at=now,

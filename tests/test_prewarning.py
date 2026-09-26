@@ -269,6 +269,69 @@ class PrewarningPipelineTests(unittest.TestCase):
             0,
         )
 
+    def test_transient_violation_reuses_prewarning_episode_and_active_event_suppresses_it(self) -> None:
+        with patch.object(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", True):
+            service = self._service()
+            first_warning = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=self._sample(25.9),
+                now=NOW,
+            )
+            episode_id = first_warning.transition.next.prewarning_episode_id
+            self.assertIsNotNone(episode_id)
+
+            pending = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=MonitorSample("TH-01", NOW + timedelta(minutes=1), 26.1, 50.0),
+                now=NOW + timedelta(minutes=1),
+            )
+            self.assertEqual(pending.transition.next.state, AlarmLifecycleState.PENDING)
+            self.assertFalse(pending.transition.next.prewarning_active)
+            self.assertEqual(pending.transition.next.prewarning_episode_id, episode_id)
+
+            resumed_warning = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=MonitorSample("TH-01", NOW + timedelta(minutes=2), 25.9, 50.0),
+                now=NOW + timedelta(minutes=2),
+            )
+            self.assertEqual(resumed_warning.transition.next.prewarning_episode_id, episode_id)
+            self.assertIn(
+                AlarmActionType.NOTIFY_PREWARNING,
+                [action.action_type for action in resumed_warning.actions],
+            )
+            self.assertEqual(len(self.sender.calls), 1)
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM prewarning_external_effects"
+                ).fetchone()[0],
+                1,
+            )
+
+            service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=MonitorSample("TH-01", NOW + timedelta(minutes=3), 26.1, 50.0),
+                now=NOW + timedelta(minutes=3),
+            )
+            verified = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=MonitorSample("TH-01", NOW + timedelta(minutes=8), 26.1, 50.0),
+                now=NOW + timedelta(minutes=8),
+            )
+            self.assertEqual(verified.transition.next.state, AlarmLifecycleState.ALARM)
+            self.assertEqual(len(self.events.list_active(device_id="TH-01")), 1)
+
+            during_alarm = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=MonitorSample("TH-01", NOW + timedelta(minutes=9), 25.9, 50.0),
+                now=NOW + timedelta(minutes=9),
+            )
+            self.assertEqual(during_alarm.transition.next.state, AlarmLifecycleState.RECOVERY)
+            self.assertNotIn(
+                AlarmActionType.NOTIFY_PREWARNING,
+                [action.action_type for action in during_alarm.actions],
+            )
+            self.assertEqual(len(self.sender.calls), 1)
+
     def test_two_devices_have_independent_episode_keys_and_recipients(self) -> None:
         with patch.object(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", True):
             first = self._service()
