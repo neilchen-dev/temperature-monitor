@@ -789,6 +789,7 @@ def build_runtime(
         task_repository=task_repository,
         event_repository=event_repository,
         latest_sample_repository=latest_sample_repository,
+        unclosed_event_provider=notification_writer.has_unclosed_event,
     )
     device_status_projector = DeviceStatusProjector(
         devices=devices,

@@ -11,6 +11,7 @@ from application.actions import ApplicationActionMapper
 from application.monitor_service import MonitorApplicationService
 from domain.alarm_state_machine import AlarmStateMachine
 from domain.models import (
+    AlarmAction,
     AlarmActionType,
     AlarmLifecycleState,
     AlarmState,
@@ -65,7 +66,7 @@ class _Source:
                     {"设备编号": "TH-02", "默认异常责任人": [{"open_id": "ou_owner_2"}]},
                 ),
             )
-        return ()
+        return getattr(self, "events", ())
 
 
 class _Sender:
@@ -200,10 +201,66 @@ class PrewarningPipelineTests(unittest.TestCase):
             action_executor=executor,
             task_repository=self.tasks,
             event_repository=self.events,
+            unclosed_event_provider=self.writer.has_unclosed_event,
         )
 
     def _sample(self, temperature: float) -> MonitorSample:
         return MonitorSample("TH-01", NOW, temperature, 50.0)
+
+    def test_recovered_unclosed_incident_suppresses_until_manual_closure(self) -> None:
+        event = self.events.create_or_get_active(
+            device_id="TH-01", event_key="historical", opened_at=NOW,
+        )
+        self.events.mark_recovered(event.event_id, recovered_at=NOW)
+        remote = FeishuRawRecord("rec-unclosed", {
+            "监测点": "TH-01", "恢复时间": 1,
+            "闭环状态": {"type": 1, "value": [{"text": "未关闭"}]},
+        })
+        self.writer.source.events = (remote,)
+        service = self._service()
+        with patch.object(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", True):
+            suppressed = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=self._sample(25.9), now=NOW,
+            )
+            self.assertFalse(suppressed.transition.next.prewarning_active)
+            self.assertNotIn(AlarmActionType.NOTIFY_PREWARNING,
+                             [action.action_type for action in suppressed.actions])
+            self.assertEqual(self.sender.calls, [])
+            remote.fields["闭环状态"] = "已闭环"
+            resumed = service.handle_sample(
+                device=DeviceContext("TH-01", "仓库"),
+                sample=MonitorSample("TH-01", NOW + timedelta(minutes=1), 25.9, 50.0),
+                now=NOW + timedelta(minutes=1),
+            )
+            self.assertTrue(resumed.transition.next.prewarning_active)
+            self.assertEqual(len(self.sender.calls), 1)
+
+    def test_queued_warning_and_recovery_are_suppressed_by_unclosed_incident(self) -> None:
+        self.writer.source.events = (FeishuRawRecord("rec-unclosed", {
+            "监测点": "TH-01", "闭环状态": "未关闭", "恢复时间": 1,
+        }),)
+        for kind in (AlarmActionType.NOTIFY_PREWARNING, AlarmActionType.NOTIFY_PREWARNING_RECOVERY):
+            context = {"device_id": "TH-01", "created_at": NOW.isoformat()}
+            self.writer.handle_notification_action(
+                AlarmAction(action_type=kind, device_id="TH-01"),
+                context,
+            )
+            self.assertEqual(context["result"], "SUPPRESSED_UNCLOSED_EVENT")
+        self.assertEqual(self.sender.calls, [])
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM prewarning_external_effects"
+        ).fetchone()[0], 0)
+
+    def test_another_devices_unclosed_incident_does_not_suppress_warning(self) -> None:
+        self.writer.source.events = (FeishuRawRecord("other", {
+            "监测点": "TH-02", "闭环状态": "未关闭",
+        }),)
+        with patch.object(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", True):
+            self._service().handle_sample(
+                device=DeviceContext("TH-01", "仓库"), sample=self._sample(25.9), now=NOW,
+            )
+        self.assertEqual(len(self.sender.calls), 1)
 
     def test_active_warning_recovery_is_deduped_and_persisted(self) -> None:
         with patch.object(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", True), patch.object(

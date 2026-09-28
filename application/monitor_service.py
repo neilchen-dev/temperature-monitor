@@ -151,6 +151,7 @@ class MonitorApplicationService:
         task_repository: AutomationTaskRepository | None = None,
         event_repository: LocalEnvironmentEventRepository | None = None,
         latest_sample_repository: LatestSampleRepository | None = None,
+        unclosed_event_provider: Callable[[str], bool] | None = None,
     ) -> None:
         self.operation_state_provider = operation_state_provider
         self.standard_resolver = standard_resolver
@@ -162,6 +163,7 @@ class MonitorApplicationService:
         self.task_repository = task_repository
         self.event_repository = event_repository
         self.latest_sample_repository = latest_sample_repository
+        self.unclosed_event_provider = unclosed_event_provider
 
     def handle_sample(
         self,
@@ -363,6 +365,28 @@ class MonitorApplicationService:
             return replace(transition, next=next_state)
 
         reasons = tuple(monitor_result.prewarning_reasons)
+        if (reasons or previous.prewarning_active) and self.unclosed_event_provider is not None:
+            try:
+                blocked = self.unclosed_event_provider(next_state.device_id)
+            except Exception:
+                # Do not issue an advisory while business closure is unknown.
+                logger.exception("prewarning closure lookup failed | device_id=%s", next_state.device_id)
+                blocked = True
+            if blocked:
+                next_state = replace(
+                    next_state,
+                    prewarning_active=False,
+                    prewarning_started_at=None,
+                    prewarning_episode_id=None,
+                    prewarning_reasons=(),
+                    prewarning_details={},
+                    prewarning_message_id=None,
+                    prewarning_notify_task_id=None,
+                    prewarning_recovered_at=None,
+                    prewarning_recovery_task_id=None,
+                    prewarning_recovery_message_id=None,
+                )
+                return replace(transition, next=next_state)
         actions = list(transition.actions)
         if reasons:
             # A prewarning episode stays the same across a transient breach

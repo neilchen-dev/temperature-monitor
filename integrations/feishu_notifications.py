@@ -15,6 +15,7 @@ from typing import Any, Protocol
 import config
 from domain.models import AlarmActionType
 from integrations.feishu_records import FeishuRawRecord
+from integrations.feishu_observation import business_closed
 from repositories.environment_events import SQLiteEnvironmentEventRepository
 from services.feishu import FeishuIMError
 
@@ -354,6 +355,25 @@ class FeishuNotificationWriter:
             effect_key,
         )
 
+    def has_unclosed_event(self, device_id: str) -> bool:
+        """Physical recovery does not end the outstanding business incident."""
+        normalized = device_id.strip().upper()
+        if self.event_repository.list_active(device_id=normalized):
+            return True
+        try:
+            records = self.source.read_records(self.event_table_id)
+        except Exception as exc:
+            raise FeishuNotificationError(
+                f"unable to check unresolved environmental events: {exc}",
+                error_code="event_closure_lookup_failed",
+                retryable=True,
+            ) from exc
+        return any(
+            _text(record.fields.get(config.FEISHU_EVENT_DEVICE_FIELD)).upper() == normalized
+            and not business_closed(record.fields)
+            for record in records
+        )
+
     def _handle_prewarning_notification(
         self,
         action_type: str,
@@ -369,6 +389,18 @@ class FeishuNotificationWriter:
         device_id = _text(getattr(action, "device_id", None)) or _text(
             context.get("device_id")
         )
+        # Recheck at delivery time: an alarm may have appeared since this
+        # notification task was queued, including tasks restored after restart.
+        if self.has_unclosed_event(device_id):
+            self._set_context(
+                context, result="SUPPRESSED_UNCLOSED_EVENT",
+                error_code=None, retryable=False,
+            )
+            logger.info(
+                "prewarning_suppressed | device_id=%s action_type=%s reason=unclosed_event",
+                device_id, action_type,
+            )
+            return
         effect_key = _notification_effect_key(
             action_type,
             "",
