@@ -190,6 +190,43 @@
   .threshold-shell .section-heading { margin-bottom: 10px; }
   .threshold-shell table { min-width: 640px; }
 
+  /* ---- Settings pane (系统配置) ---- */
+  .settings-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.15fr) minmax(300px, .85fr); align-items: start; }
+  .settings-shell, .runtime-shell, .settings-standards-shell, .settings-audit-shell { padding: 12px 14px; }
+  .settings-shell .section-heading, .runtime-shell .section-heading,
+  .settings-standards-shell .section-heading, .settings-audit-shell .section-heading { margin-bottom: 10px; }
+  .settings-group-title { margin: 12px 0 8px; padding-bottom: 4px; color: #54636b; font-size: 10px; font-weight: 700; letter-spacing: .05em; border-bottom: 1px solid var(--line-soft); }
+  .settings-group-title:first-of-type { margin-top: 2px; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+  .setting-field { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; background: var(--surface-soft); border: 1px solid var(--line-soft); border-radius: 2px; }
+  .setting-field .setting-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .setting-field label { color: var(--ink); font-size: 11px; font-weight: 600; }
+  .setting-field input { width: 100%; font: inherit; font-size: 13px; padding: 5px 7px; border: 1px solid var(--control-line); border-radius: 2px; background: #fff; color: var(--ink); outline: none; }
+  .setting-hint { color: var(--muted); font-size: 10px; }
+  .badge { flex: none; padding: 1px 5px; border-radius: 2px; font-size: 9px; letter-spacing: .04em; }
+  .badge.default { color: var(--muted); background: var(--surface); border: 1px solid var(--line-soft); }
+  .badge.override { color: var(--warn); background: #faf3e6; border: 1px solid #e3cf9f; }
+  .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; background: var(--surface-soft); border: 1px solid var(--line-soft); border-radius: 2px; }
+  .switch-row label { color: var(--ink); font-size: 11px; font-weight: 600; }
+  .switch { position: relative; width: 34px; height: 18px; flex: none; display: inline-block; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; background: #b9c6cc; border-radius: 9px; transition: background .12s ease; pointer-events: none; }
+  .switch .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; background: #fff; border-radius: 50%; transition: left .12s ease; }
+  .switch input:checked + .track { background: var(--brand); }
+  .switch input:checked + .track::after { left: 18px; }
+  .switch input:focus-visible + .track { outline: 2px solid var(--brand); outline-offset: 1px; }
+  .settings-reason-row { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .settings-reason-row label { color: var(--muted); font-size: 11px; font-weight: 600; }
+  .settings-reason-row input { font: inherit; font-size: 12px; padding: 6px 8px; border: 1px solid var(--control-line); border-radius: 2px; background: #fff; color: var(--ink); outline: none; }
+  .settings-actions { display: flex; align-items: center; gap: 7px; margin-top: 10px; }
+  .settings-actions .muted { font-size: 11px; }
+  .settings-standards-shell, .settings-audit-shell { margin-top: 14px; }
+  .settings-standards-shell table, .settings-audit-shell table { min-width: 720px; }
+  .runtime-shell table { min-width: 0; }
+  .runtime-shell td.k { color: var(--muted); white-space: nowrap; }
+  .settings-audit-shell td.reason { max-width: 360px; white-space: normal; word-break: break-all; }
+  .settings-audit-shell td.chg { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
   /* ---- Dialogs ---- */
   dialog { width: min(440px, 92vw); padding: 16px; border: 1px solid var(--line); border-radius: 2px; box-shadow: none; background: var(--surface); color: var(--ink); }
   dialog::backdrop { background: rgba(31,42,49,.3); }
@@ -219,6 +256,7 @@
   @media (max-width: 1000px) {
     .monitor-layout { grid-template-columns: 200px minmax(0, 1fr); }
     .events-layout { grid-template-columns: 1fr; }
+    .settings-layout { grid-template-columns: 1fr; }
   }
   @media (max-width: 760px) {
     header.app-header { height: auto; min-height: 56px; flex-wrap: wrap; padding: 8px 12px; }
@@ -247,7 +285,7 @@
 <header class="app-header">
   <div class="brand-block">
     <h1>温湿度监控台</h1>
-    <p>环境监测 · 操作员控制台</p>
+    <p>环境监测与控制 · 操作员控制台</p>
   </div>
   <div class="header-side">
     <div class="header-status">
@@ -285,6 +323,7 @@
   <button class="tab-btn" data-tab="trend">历史趋势</button>
   <button class="tab-btn" data-tab="events">设备与事件</button>
   <button class="tab-btn" data-tab="thresholds">环境标准</button>
+  <button class="tab-btn" data-tab="settings">系统配置</button>
 </nav>
 
 <!-- Tab 1: 实时监控 -->
@@ -365,7 +404,67 @@
   </div>
 </section>
 
-<footer id="footer"><span id="footerStatus">SQLite OK | 等待设备数据 | 刷新 10 秒</span><span class="footer-api">本地镜像 · /api/devices · /api/events · /api/thresholds · /history/query</span></footer>
+<!-- Tab 5: 系统配置 -->
+<section class="tab-panel" id="tab-settings">
+  <div class="settings-layout">
+    <div class="card settings-shell">
+      <div class="section-heading">
+        <div>
+          <h2 class="card-title">告警与通知策略</h2>
+          <div class="muted">受控运行参数 · 白名单显式 schema · 保存后立即热更新生效，无需重启</div>
+        </div>
+        <div class="muted">SQLite override 优先 · 默认值来自 .env/config.py</div>
+      </div>
+      <h3 class="settings-group-title">告警策略 · 接近限值预警</h3>
+      <div class="settings-grid" id="marginSettings"><div class="empty">未加载</div></div>
+      <h3 class="settings-group-title">通知策略 · 飞书消息</h3>
+      <div class="settings-grid" id="notifySettings"><div class="empty">未加载</div></div>
+      <div class="settings-reason-row">
+        <label for="settingsReason">变更原因（必填 · 记入审计日志）</label>
+        <input id="settingsReason" type="text" maxlength="500" placeholder="例如：PE仓库预警灵敏度试运行调整" autocomplete="off">
+      </div>
+      <div class="settings-actions">
+        <span class="muted" id="settingsFormMeta"></span>
+        <span class="toolbar-spacer"></span>
+        <button type="button" id="settingsReload">重新加载</button>
+        <button type="button" id="settingsDiscard">放弃修改</button>
+        <button type="button" class="primary" id="settingsSave">保存并生效</button>
+      </div>
+      <div class="dialog-error" id="settingsError" role="alert"></div>
+    </div>
+    <div class="card runtime-shell">
+      <div class="section-heading">
+        <div>
+          <h2 class="card-title">Runtime 状态</h2>
+          <div class="muted">只读 · 高风险参数保持 .env + 重启的安全边界</div>
+        </div>
+      </div>
+      <div id="runtimeStatusWrap"><div class="empty">未加载</div></div>
+    </div>
+  </div>
+  <div class="card settings-standards-shell">
+    <div class="section-heading">
+      <div>
+        <h2 class="card-title">环境标准（只读）</h2>
+        <div class="muted">正式环境标准由 Feishu validated standard 管理，本页面只读。</div>
+      </div>
+      <div class="muted" id="standardsMeta">权威来源：Feishu</div>
+    </div>
+    <div id="settingsStandardsWrap"><div class="empty">暂无标准数据</div></div>
+  </div>
+  <div class="card settings-audit-shell">
+    <div class="section-heading">
+      <div>
+        <h2 class="card-title">配置变更历史</h2>
+        <div class="muted">每次变更：校验 → 事务写入 → 审计留痕 → 立即生效</div>
+      </div>
+      <div class="muted">runtime_setting_audit · 最近 50 条</div>
+    </div>
+    <div id="settingsAuditWrap"><div class="empty">暂无变更记录</div></div>
+  </div>
+</section>
+
+<footer id="footer"><span id="footerStatus">SQLite OK | 等待设备数据 | 刷新 10 秒</span><span class="footer-api">本地镜像 · /api/devices · /api/events · /api/thresholds · /api/settings · /history/query</span></footer>
 
 <script>
 "use strict";
@@ -379,6 +478,8 @@
   var state = {
     key: sessionStorage.getItem(KEY_STORAGE) || "",
     thresholds: {},       // device -> {temp_min, temp_max, humidity_min, humidity_max}
+    thresholdsItems: [],  // /api/thresholds items 原始列表（系统配置页使用）
+    thresholdsMeta: {},   // {standard_source, standards_ready, active_snapshot_id, ...}
     devices: [],          // /api/devices items（每个 设备×数据源 一项）
     events: [],
     activeTab: "monitor",
@@ -391,6 +492,10 @@
     charts: { temp: null, hum: null },
     timer: null,
     refreshing: false,
+    settingsData: null,     // GET /api/settings 响应 {settings, runtime}
+    settingsSnapshot: {},  // 保存时的原始值（用于脏检查）
+    settingsDirty: {},     // key -> true（用户已修改待保存）
+    settingsAudit: [],     // /api/settings/audit items
   };
 
   function $(id) { return document.getElementById(id); }
@@ -416,6 +521,12 @@
     deviceTableWrap: $("deviceTableWrap"), eventTimeline: $("eventTimeline"),
     eventsFilterChip: $("eventsFilterChip"), eventsHint: $("eventsHint"),
     thresholdTableWrap: $("thresholdTableWrap"), footer: $("footer"), footerStatus: $("footerStatus"),
+    marginSettings: $("marginSettings"), notifySettings: $("notifySettings"),
+    settingsReason: $("settingsReason"), settingsFormMeta: $("settingsFormMeta"),
+    settingsReload: $("settingsReload"), settingsDiscard: $("settingsDiscard"),
+    settingsSave: $("settingsSave"), settingsError: $("settingsError"),
+    runtimeStatusWrap: $("runtimeStatusWrap"), standardsMeta: $("standardsMeta"),
+    settingsStandardsWrap: $("settingsStandardsWrap"), settingsAuditWrap: $("settingsAuditWrap"),
   };
 
   function setConn(kind, text) {
@@ -427,6 +538,16 @@
     var headers = {};
     if (state.key) headers["X-History-Key"] = state.key;
     return fetch(path, { headers: headers }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { status: res.status, ok: res.ok, data: data };
+      });
+    });
+  }
+
+  function apiPatch(path, body) {
+    var headers = { "Content-Type": "application/json" };
+    if (state.key) headers["X-History-Key"] = state.key;
+    return fetch(path, { method: "PATCH", headers: headers, body: JSON.stringify(body) }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         return { status: res.status, ok: res.ok, data: data };
       });
@@ -495,6 +616,11 @@
       // 隐藏容器中初始化的图表尺寸为 0，切回时强制重算
       if (state.charts.temp) state.charts.temp.resize();
       if (state.charts.hum) state.charts.hum.resize();
+    }
+    if (tabId === "settings") {
+      // 有未保存修改时不自动重载，避免覆盖用户编辑
+      if (!Object.keys(state.settingsDirty).length) loadSettings();
+      renderSettingsStandards();
     }
   }
 
@@ -1095,6 +1221,384 @@
     });
   }
 
+  // ---- Tab 5: 系统配置 ----
+  var MARGIN_KEYS = [
+    "temperature_prewarning_margin_c",
+    "humidity_prewarning_margin_rh",
+    "temperature_prewarning_exit_margin_c",
+    "humidity_prewarning_exit_margin_rh",
+  ];
+  var NOTIFY_KEYS = [
+    "feishu_alarm_notify_enabled",
+    "feishu_recovery_notify_enabled",
+    "feishu_prewarning_notify_enabled",
+    "feishu_prewarning_recovery_notify_enabled",
+  ];
+
+  function settingsEmpty(main, sub) {
+    var div = document.createElement("div");
+    div.className = "empty";
+    div.textContent = sub ? main + " · " + sub : main;
+    return div;
+  }
+
+  function settingBadge(item) {
+    var isOverride = item.source === "override";
+    var span = document.createElement("span");
+    span.className = "badge " + (isOverride ? "override" : "default");
+    span.title = isOverride ? "SQLite override 生效中" : "使用 .env/config.py 默认值";
+    span.textContent = isOverride ? "override" : "default";
+    return span;
+  }
+
+  function loadSettings() {
+    if (!state.key) {
+      state.settingsData = null;
+      renderSettings();
+      renderRuntimeStatus();
+      return;
+    }
+    apiGet("/api/settings").then(function (res) {
+      if (res.status === 401) { authFailure(); return; }
+      if (!res.ok) {
+        els.settingsError.textContent = "加载系统配置失败："
+          + (res.data.error || ("HTTP " + res.status));
+        return;
+      }
+      state.settingsData = res.data;
+      state.settingsSnapshot = {};
+      var settings = res.data.settings || {};
+      Object.keys(settings).forEach(function (key) {
+        state.settingsSnapshot[key] = settings[key].value;
+      });
+      els.settingsError.textContent = "";
+      renderSettings();
+      renderRuntimeStatus();
+    }).catch(function () {
+      els.settingsError.textContent = "加载系统配置失败：网络错误";
+    });
+    loadSettingsAudit();
+  }
+
+  function loadSettingsAudit() {
+    if (!state.key) {
+      state.settingsAudit = [];
+      renderSettingsAudit();
+      return;
+    }
+    apiGet("/api/settings/audit?limit=50").then(function (res) {
+      if (res.status === 401) { authFailure(); return; }
+      if (!res.ok) return;  // 审计加载失败不打断配置编辑区
+      state.settingsAudit = res.data.items || [];
+      renderSettingsAudit();
+    }).catch(function () { /* 静默：下一次刷新重试 */ });
+  }
+
+  function markSettingDirty() {
+    var key = this.dataset && this.dataset.key;
+    if (!key) return;
+    var item = ((state.settingsData || {}).settings || {})[key];
+    var current;
+    if (item && item.type === "bool") {
+      current = this.checked;
+    } else {
+      var num = Number(this.value);
+      current = this.value === "" || !isFinite(num) ? null : num;
+    }
+    var original = state.settingsSnapshot[key];
+    if (current === null || current === original) {
+      delete state.settingsDirty[key];
+    } else {
+      state.settingsDirty[key] = true;
+    }
+    syncSettingsMeta();
+  }
+
+  function syncSettingsMeta() {
+    var count = Object.keys(state.settingsDirty).length;
+    els.settingsFormMeta.textContent = count
+      ? count + " 项修改待保存"
+      : (state.key ? "无未保存修改" : "");
+  }
+
+  function renderSettings() {
+    // 告警策略：数值参数
+    els.marginSettings.textContent = "";
+    els.notifySettings.textContent = "";
+    if (!state.settingsData) {
+      els.marginSettings.appendChild(settingsEmpty(
+        state.key ? "配置加载中" : "需要配置访问凭据",
+        state.key ? "等待 /api/settings 响应" : "点击右上角“凭据设置”配置 HISTORY_API_KEY"
+      ));
+      els.notifySettings.appendChild(settingsEmpty(
+        state.key ? "配置加载中" : "需要配置访问凭据", ""
+      ));
+      syncSettingsMeta();
+      return;
+    }
+    var settings = state.settingsData.settings || {};
+    MARGIN_KEYS.forEach(function (key) {
+      var item = settings[key];
+      if (!item) return;
+      var box = document.createElement("div");
+      box.className = "setting-field";
+      var head = document.createElement("div");
+      head.className = "setting-head";
+      var label = document.createElement("label");
+      label.textContent = item.label + (item.unit ? " (" + item.unit + ")" : "");
+      head.append(label, settingBadge(item));
+      var input = document.createElement("input");
+      input.type = "number";
+      input.step = "0.1";
+      input.min = String(item.min);
+      input.max = String(item.max);
+      input.value = String(item.value);
+      input.dataset.key = key;
+      input.addEventListener("change", markSettingDirty);
+      var hint = document.createElement("div");
+      hint.className = "setting-hint";
+      hint.textContent = "合法范围 " + item.min + " ~ " + item.max
+        + (item.unit ? " " + item.unit : "") + " · 默认 " + item.default;
+      box.append(head, input, hint);
+      els.marginSettings.appendChild(box);
+    });
+    var note = document.createElement("div");
+    note.className = "setting-hint";
+    note.style.gridColumn = "1 / -1";
+    note.textContent = "退出裕量实际生效值 = max(提前量, 退出裕量)，与 .env 语义一致；保存后对下一个样本立即生效。";
+    els.marginSettings.appendChild(note);
+    // 通知策略：开关
+    NOTIFY_KEYS.forEach(function (key) {
+      var item = settings[key];
+      if (!item) return;
+      var row = document.createElement("div");
+      row.className = "switch-row";
+      var text = document.createElement("div");
+      var label = document.createElement("label");
+      label.textContent = item.label;
+      var hint = document.createElement("div");
+      hint.className = "setting-hint";
+      hint.textContent = "默认 " + (item.default ? "开启" : "关闭")
+        + " · " + (item.source === "override" ? "override" : "default");
+      text.append(label, hint);
+      var toggle = document.createElement("span");
+      toggle.className = "switch";
+      var input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = !!item.value;
+      input.dataset.key = key;
+      input.addEventListener("change", markSettingDirty);
+      var track = document.createElement("span");
+      track.className = "track";
+      toggle.append(input, track);
+      row.append(text, toggle);
+      els.notifySettings.appendChild(row);
+    });
+    syncSettingsMeta();
+  }
+
+  function renderRuntimeStatus() {
+    els.runtimeStatusWrap.textContent = "";
+    if (!state.settingsData || !state.settingsData.runtime) {
+      els.runtimeStatusWrap.appendChild(settingsEmpty(
+        state.key ? "配置加载中" : "需要配置访问凭据", ""
+      ));
+      return;
+    }
+    var rt = state.settingsData.runtime;
+    var table = document.createElement("table");
+    var tbody = document.createElement("tbody");
+    function statusRow(name, value, cls) {
+      var tr = document.createElement("tr");
+      var k = document.createElement("td");
+      k.className = "k";
+      k.textContent = name;
+      var v = document.createElement("td");
+      if (cls) v.className = cls;
+      v.textContent = value;
+      tr.append(k, v);
+      tbody.appendChild(tr);
+    }
+    statusRow("AUTOMATION_MODE", rt.automation_mode);
+    statusRow("FEISHU_WRITE_ENABLED", rt.feishu_write_enabled ? "已启用" : "未启用",
+      rt.feishu_write_enabled ? "warn" : "");
+    statusRow("ACTIVE_DEVICE_IDS", (rt.active_device_ids || []).join(", ") || "未配置");
+    statusRow("ACTIVE_CUTOVER_ACK", rt.active_cutover_ack_valid ? "有效" : "无效",
+      rt.active_cutover_ack_valid ? "ok" : "");
+    statusRow("standards_ready", rt.standards_ready ? "已就绪" : "未就绪",
+      rt.standards_ready ? "ok" : "warn");
+    statusRow("Shadow Runtime",
+      rt.shadow_available
+        ? "运行中"
+        : ("未运行" + (rt.shadow_reason ? " · " + rt.shadow_reason : "")),
+      rt.shadow_available ? "ok" : "bad");
+    statusRow("Active Canary", rt.active_canary_enabled ? "已启用" : "未启用",
+      rt.active_canary_enabled ? "warn" : "");
+    statusRow("最近标准同步", rt.latest_sync_status || "—");
+    if (rt.active_block_reason) {
+      statusRow("Active 阻断原因", rt.active_block_reason, "warn");
+    }
+    table.appendChild(tbody);
+    els.runtimeStatusWrap.appendChild(table);
+  }
+
+  function renderSettingsStandards() {
+    els.settingsStandardsWrap.textContent = "";
+    var meta = state.thresholdsMeta || {};
+    els.standardsMeta.textContent = "权威来源：" + (meta.standard_source || "feishu")
+      + " · 标准" + (meta.standards_ready ? "已就绪" : "未就绪");
+    var items = state.thresholdsItems || [];
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    ["区域", "设备", "温度控制区间", "湿度控制区间", "standard_id", "revision", "来源", "生效时间"].forEach(function (title) {
+      var th = document.createElement("th");
+      th.textContent = title;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    var tbody = document.createElement("tbody");
+    if (!items.length) {
+      tbody.appendChild(placeholderRow(8, "暂无标准数据", "等待 Feishu validated standard 同步"));
+    } else {
+      items.forEach(function (t) {
+        var tr = document.createElement("tr");
+        function cell(text, cls) {
+          var td = document.createElement("td");
+          if (cls) td.className = cls;
+          td.textContent = text === null || text === undefined || text === "" ? "—" : String(text);
+          return td;
+        }
+        tr.append(
+          cell(t.area),
+          cell(t.device_id || t.device),
+          cell(bandText(t, "temp"), "num"),
+          cell(bandText(t, "humidity"), "num"),
+          cell(t.standard_id),
+          cell(t.revision),
+          cell(t.standard_source || "feishu"),
+          cell(fmtShort(t.effective_from), "num"),
+        );
+        tbody.appendChild(tr);
+      });
+    }
+    table.append(thead, tbody);
+    els.settingsStandardsWrap.appendChild(table);
+  }
+
+  function renderSettingsAudit() {
+    els.settingsAuditWrap.textContent = "";
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    ["时间", "参数", "原值", "新值", "操作者", "原因"].forEach(function (title) {
+      var th = document.createElement("th");
+      th.textContent = title;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    var tbody = document.createElement("tbody");
+    var items = state.settingsAudit;
+    if (!items.length) {
+      tbody.appendChild(placeholderRow(6, "暂无变更记录", "配置修改后会在此留痕"));
+    } else {
+      items.forEach(function (a) {
+        var tr = document.createElement("tr");
+        function cell(text, cls) {
+          var td = document.createElement("td");
+          if (cls) td.className = cls;
+          td.textContent = text === null || text === undefined || text === "" ? "—" : String(text);
+          return td;
+        }
+        tr.append(
+          cell(fmtShort(a.changed_at), "num"),
+          cell(a.label || a.key, "", a.key),
+          cell(a.old_value, "chg"),
+          cell(a.new_value, "chg"),
+          cell(a.changed_by),
+          cell(a.reason, "reason"),
+        );
+        tbody.appendChild(tr);
+      });
+    }
+    table.append(thead, tbody);
+    els.settingsAuditWrap.appendChild(table);
+  }
+
+  els.settingsSave.addEventListener("click", function () {
+    if (!state.key) { authFailure(); return; }
+    els.settingsError.textContent = "";
+    var dirty = Object.keys(state.settingsDirty);
+    if (!dirty.length) {
+      els.settingsError.textContent = "没有需要保存的修改";
+      return;
+    }
+    var reason = els.settingsReason.value.trim();
+    if (!reason) {
+      els.settingsError.textContent = "请填写变更原因（必填，记入审计日志）";
+      els.settingsReason.focus();
+      return;
+    }
+    var changes = {};
+    for (var i = 0; i < dirty.length; i++) {
+      var key = dirty[i];
+      var input = document.querySelector('#tab-settings [data-key="' + key + '"]');
+      if (!input) continue;
+      var item = (state.settingsData.settings || {})[key];
+      if (!item) continue;
+      if (item.type === "bool") {
+        changes[key] = input.checked;
+        continue;
+      }
+      var num = Number(input.value);
+      if (input.value === "" || !isFinite(num)) {
+        els.settingsError.textContent = item.label + " 必须是数字";
+        input.focus();
+        return;
+      }
+      if (num < item.min || num > item.max) {
+        els.settingsError.textContent = item.label + " 超出合法范围 "
+          + item.min + " ~ " + item.max + (item.unit ? " " + item.unit : "");
+        input.focus();
+        return;
+      }
+      changes[key] = num;
+    }
+    if (!Object.keys(changes).length) {
+      els.settingsError.textContent = "没有需要保存的修改";
+      return;
+    }
+    els.settingsSave.disabled = true;
+    apiPatch("/api/settings", { changes: changes, reason: reason }).then(function (res) {
+      els.settingsSave.disabled = false;
+      if (res.status === 401) { authFailure(); return; }
+      if (!res.ok) {
+        els.settingsError.textContent = res.data.error || ("保存失败：HTTP " + res.status);
+        return;
+      }
+      els.settingsReason.value = "";
+      state.settingsDirty = {};
+      loadSettings();
+      loadSettingsAudit();
+    }).catch(function () {
+      els.settingsSave.disabled = false;
+      els.settingsError.textContent = "保存失败：网络错误";
+    });
+  });
+
+  els.settingsDiscard.addEventListener("click", function () {
+    state.settingsDirty = {};
+    els.settingsError.textContent = "";
+    loadSettings();
+  });
+
+  els.settingsReload.addEventListener("click", function () {
+    state.settingsDirty = {};
+    els.settingsError.textContent = "";
+    loadSettings();
+    loadSettingsAudit();
+  });
+
   // ---- 系统状态（免鉴权） ----
   function loadSystemStatus() {
     apiGet("/api/system/status").then(function (res) {
@@ -1135,6 +1639,13 @@
       renderCards();
       renderDeviceTable();
       renderThresholds();
+      if (state.activeTab === "settings") {
+        state.settingsData = null;
+        state.settingsAudit = [];
+        renderSettings();
+        renderRuntimeStatus();
+        renderSettingsAudit();
+      }
       return;
     }
     if (state.refreshing) return;
@@ -1158,8 +1669,12 @@
       state.devices = devicesRes.data.items || [];
       state.events = eventsRes.ok ? (eventsRes.data.items || []) : [];
       state.thresholds = {};
+      state.thresholdsItems = [];
+      state.thresholdsMeta = {};
       if (thresholdsRes.ok) {
-        (thresholdsRes.data.items || []).forEach(function (t) {
+        state.thresholdsItems = thresholdsRes.data.items || [];
+        state.thresholdsMeta = thresholdsRes.data;
+        state.thresholdsItems.forEach(function (t) {
           state.thresholds[t.device] = t;
         });
       }
@@ -1175,6 +1690,11 @@
       if (state.activeTab === "trend") {
         ensureTrendSelection();
         loadTrend();
+      }
+      if (state.activeTab === "settings") {
+        // 只刷新只读区域；不重载编辑表单，避免覆盖未保存的修改
+        renderSettingsStandards();
+        loadSettingsAudit();
       }
       if (state.eventsFilter && !state.devices.some(function (it) {
         return it.device_id === state.eventsFilter;

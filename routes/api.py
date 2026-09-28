@@ -42,7 +42,7 @@ from integrations.feishu_writers import (
     FeishuOperationRecordWriter,
     FeishuWriteError,
 )
-from services import db, devices, projection
+from services import db, devices, projection, runtime_settings
 from services.collector import get_collector_status
 
 
@@ -485,6 +485,102 @@ def replace_threshold(device_id: str):
         "authoritative_source": "feishu",
         "device_id": device_id.strip().upper() or None,
     }), 409
+
+
+# ---- 系统配置（白名单运行参数，热更新）----
+# 鉴权与 /api/devices 完全同策略：未配置 HISTORY_API_KEY 一律 503（fail
+# closed），密钥错误 401。修改仅接受显式白名单 schema——不存在任意
+# key/value 写入口，正式环境标准与 secret 永远不可经此修改。
+
+
+def _settings_runtime_summary() -> dict:
+    """Read-only high-risk runtime switches for the settings page.
+
+    Values only — no endpoints, no secret material; ACTIVE_CUTOVER_ACK is
+    reduced to a validity boolean, never the acknowledgement string itself.
+    """
+    status = runtime_status()
+    canary = active_canary_status()
+    return {
+        "automation_mode": (
+            str(status.get("mode") or config.AUTOMATION_MODE or "disabled")
+            .strip().lower() or "disabled"
+        ),
+        "feishu_write_enabled": bool(config.FEISHU_WRITE_ENABLED),
+        "active_device_ids": list(config.ACTIVE_DEVICE_IDS),
+        "active_cutover_ack_valid": (
+            config.ACTIVE_CUTOVER_ACK == config.ACTIVE_CUTOVER_ACK_EXPECTED
+            and bool(config.ACTIVE_CUTOVER_ACK)
+        ),
+        "standards_ready": bool(status.get("standards_ready")),
+        "shadow_available": bool(status.get("available")),
+        "shadow_reason": status.get("reason"),
+        "active_canary_enabled": bool(canary.get("active_canary_enabled")),
+        "latest_sync_status": canary.get("latest_sync_status"),
+        "active_block_reason": status.get("active_block_reason"),
+    }
+
+
+@api_bp.get("/api/settings")
+def get_settings():
+    """List the whitelisted runtime settings with schema and provenance."""
+    error = _auth_error() or _mirror_disabled_error()
+    if error:
+        return error
+
+    return jsonify({
+        "status": "success",
+        "settings": runtime_settings.settings_overview(),
+        "runtime": _settings_runtime_summary(),
+    }), 200
+
+
+@api_bp.patch("/api/settings")
+def patch_settings():
+    """Apply one whitelisted settings change set (validated, audited, hot)."""
+    error = _auth_error() or _mirror_disabled_error()
+    if error:
+        return error
+
+    payload, payload_error = _json_payload()
+    if payload_error:
+        return payload_error
+    assert payload is not None
+    try:
+        result = runtime_settings.apply_changes(
+            payload.get("changes"),
+            reason=payload.get("reason"),
+            changed_by="console",
+        )
+    except runtime_settings.SettingsValidationError as exc:
+        body = {"status": "error", "error": str(exc)}
+        if exc.field:
+            body["field"] = exc.field
+        return jsonify(body), 400
+    except runtime_settings.SettingsWriteError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 503
+    return jsonify({
+        "status": "success",
+        "updated": result["updated"],
+        "settings": result["settings"],
+    }), 200
+
+
+@api_bp.get("/api/settings/audit")
+def settings_audit():
+    """Recent runtime-settings change records, newest first (limit <= 100)."""
+    error = _auth_error() or _mirror_disabled_error()
+    if error:
+        return error
+
+    limit = request.args.get("limit", default=50, type=int) or 50
+    items = runtime_settings.fetch_audit(limit=limit)
+    return jsonify({
+        "status": "success",
+        "count": len(items),
+        "limit": max(1, min(int(limit), 100)),
+        "items": items,
+    }), 200
 
 
 @api_bp.get("/api/system/status")

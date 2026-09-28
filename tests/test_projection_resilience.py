@@ -41,6 +41,24 @@ def _ok(*_args, **_kwargs):
     return {"code": 0, "msg": "success"}
 
 
+class _MonotonicFakeTime:
+    """严格递增的假时钟：连续两次 /temperature 上报不会落在同一毫秒。
+
+    device_samples 主键是 (device, source, sample_time_ms)，同毫秒的两次
+    上报会被 INSERT OR REPLACE 合并为一行（生产幂等语义）。真实时钟在同
+    一毫秒内连续两次调用会让断言“两行样本”的用例随机失败；这里每次调用
+    前进 1ms，保证样本时间戳确定性地互不相同，且远小于 5000ms 的
+    内容去重窗口，不影响 dedupe 语义的验证。
+    """
+
+    def __init__(self, start: float) -> None:
+        self._now = start
+
+    def time(self) -> float:
+        self._now += 0.001
+        return self._now
+
+
 class ProjectionResilienceTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -394,7 +412,9 @@ class ProjectionResilienceTests(unittest.TestCase):
 
     def test_offline_failure_preserves_local_evidence(self) -> None:
         """offline 心跳在飞书失败时：本地离线证据（样本+事件）不丢。"""
+        clock = _MonotonicFakeTime(time.time())
         with (
+            patch("services.devices.time", clock),
             patch("routes.temperature.resolve_record_id", return_value="rec_01"),
             patch("routes.temperature.update_feishu_fields", return_value={"code": 0}),
             patch("routes.temperature.save_history"),
@@ -402,6 +422,7 @@ class ProjectionResilienceTests(unittest.TestCase):
             self._post(temperature=25.0, humidity=50.0)
 
         with (
+            patch("services.devices.time", clock),
             patch("routes.temperature.resolve_record_id", side_effect=_connection_error),
             patch("routes.temperature.update_feishu_fields"),
             patch("routes.temperature.save_history"),
@@ -459,7 +480,9 @@ class ProjectionResilienceTests(unittest.TestCase):
     def test_client_retry_no_duplicate_side_effects(self) -> None:
         """抑制窗口内的客户端重试：不重复飞书调用、不重复 sample/派发。"""
         config.FEISHU_PROJECTION_INLINE_SUPPRESS_SECONDS = 30.0
+        clock = _MonotonicFakeTime(time.time())
         with (
+            patch("services.devices.time", clock),
             patch.object(
                 projection,
                 "should_suppress_inline_attempt",

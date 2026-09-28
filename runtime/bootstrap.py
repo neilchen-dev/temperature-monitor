@@ -54,6 +54,7 @@ from repositories import (
 )
 from services.device_status_projection import DeviceStatusProjector
 from services import projection as temperature_projection
+from services import runtime_settings
 from repositories.sqlite import verify_runtime_schema
 from scheduler.worker import TaskScheduler
 
@@ -158,15 +159,23 @@ def _active_readiness_non_blocking_task_types() -> tuple[str, ...]:
 def _active_action_enabled(action: Any) -> bool:
     """Apply the independent message switch after the common Active gate."""
     action_type = str(getattr(getattr(action, "action_type", None), "value", ""))
+    if action_type not in {
+        AlarmActionType.NOTIFY_ALARM.value,
+        AlarmActionType.NOTIFY_RECOVERY.value,
+        AlarmActionType.NOTIFY_PREWARNING.value,
+        AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value,
+    }:
+        return True
+    # 通知开关支持运行时热更新：每次执行时从 runtime settings 解析当前
+    # 生效值（SQLite override 优先，fallback config.py 默认值）。
+    flags = runtime_settings.feishu_notify_flags()
     if action_type == AlarmActionType.NOTIFY_ALARM.value:
-        return bool(config.FEISHU_ALARM_NOTIFY_ENABLED)
+        return flags["alarm"]
     if action_type == AlarmActionType.NOTIFY_RECOVERY.value:
-        return bool(config.FEISHU_RECOVERY_NOTIFY_ENABLED)
+        return flags["recovery"]
     if action_type == AlarmActionType.NOTIFY_PREWARNING.value:
-        return bool(config.FEISHU_PREWARNING_NOTIFY_ENABLED)
-    if action_type == AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value:
-        return bool(config.FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED)
-    return True
+        return flags["prewarning"]
+    return flags["prewarning_recovery"]
 
 
 def active_block_reason(

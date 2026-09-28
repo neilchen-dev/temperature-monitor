@@ -23,6 +23,7 @@ from domain.models import (
 )
 from domain.monitor_engine import MonitorEngine
 from domain.standard_resolver import StandardNotFoundError, StandardResolver
+from services import runtime_settings
 from services.event_identity import epoch_milliseconds, external_effect_key
 
 from .action_executor import (
@@ -190,6 +191,10 @@ class MonitorApplicationService:
         current_state = self.alarm_state_repository.get(device.device_id)
         if current_state is None:
             current_state = AlarmState.normal(device.device_id)
+        # 近限值裕量支持运行时热更新：每次评估都从 runtime settings 解析
+        # 当前生效值（SQLite override 优先，fallback config.py 默认值），
+        # 不在 import 阶段缓存，控制台修改后对下一个样本立即生效。
+        margins = runtime_settings.prewarning_margins()
         monitor_result = MonitorEngine.evaluate(
             device=device,
             sample=sample,
@@ -200,10 +205,10 @@ class MonitorApplicationService:
                 if current_state.prewarning_active
                 else ()
             ),
-            temperature_prewarning_margin=config.TEMPERATURE_PREWARNING_MARGIN_C,
-            humidity_prewarning_margin=config.HUMIDITY_PREWARNING_MARGIN_RH,
-            temperature_prewarning_exit_margin=config.TEMPERATURE_PREWARNING_EXIT_MARGIN_C,
-            humidity_prewarning_exit_margin=config.HUMIDITY_PREWARNING_EXIT_MARGIN_RH,
+            temperature_prewarning_margin=margins["temperature"],
+            humidity_prewarning_margin=margins["humidity"],
+            temperature_prewarning_exit_margin=margins["temperature_exit"],
+            humidity_prewarning_exit_margin=margins["humidity_exit"],
         )
         if monitor_result.control_type_consistency == "mismatch" and standard is not None:
             legacy_control = getattr(device.control_type, "value", device.control_type)
@@ -1412,18 +1417,17 @@ class MonitorApplicationService:
     ) -> bool:
         if not self._active_event_writes_enabled(device_id):
             return False
-        import config
-
+        # 通知开关支持运行时热更新：与 bootstrap._active_action_enabled
+        # 读取同一份 runtime settings（SQLite override 优先）。
+        flags = runtime_settings.feishu_notify_flags()
         if action_type is AlarmActionType.NOTIFY_ALARM:
-            return bool(getattr(config, "FEISHU_ALARM_NOTIFY_ENABLED", False))
+            return flags["alarm"]
         if action_type is AlarmActionType.NOTIFY_RECOVERY:
-            return bool(getattr(config, "FEISHU_RECOVERY_NOTIFY_ENABLED", False))
+            return flags["recovery"]
         if action_type is AlarmActionType.NOTIFY_PREWARNING:
-            return bool(getattr(config, "FEISHU_PREWARNING_NOTIFY_ENABLED", False))
+            return flags["prewarning"]
         if action_type is AlarmActionType.NOTIFY_PREWARNING_RECOVERY:
-            return bool(
-                getattr(config, "FEISHU_PREWARNING_RECOVERY_NOTIFY_ENABLED", False)
-            )
+            return flags["prewarning_recovery"]
         return False
 
     def _project_local_actions(

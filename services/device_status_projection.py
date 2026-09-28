@@ -32,6 +32,7 @@ from domain.standard_resolver import StandardResolutionError
 from integrations.feishu_writers import FeishuDeviceStatusWriter, _user_cell
 from repositories.automation_tasks import SQLiteAutomationTaskRepository
 from repositories.runtime_state import SQLiteDeviceStatusProjectionRepository
+from services import runtime_settings
 from services.feishu import FeishuAPIError
 
 
@@ -136,16 +137,17 @@ def _alarm_state_text(
     state = alarm_state.state
     if state is AlarmLifecycleState.NORMAL and sample is not None and standard is not None:
         try:
+            margins = runtime_settings.prewarning_margins()
             result = MonitorEngine.evaluate(
                 device=device,
                 sample=sample,
                 standard=standard,
                 operation_state=operation_state,
                 previous_prewarning_reasons=(),
-                temperature_prewarning_margin=config.TEMPERATURE_PREWARNING_MARGIN_C,
-                humidity_prewarning_margin=config.HUMIDITY_PREWARNING_MARGIN_RH,
-                temperature_prewarning_exit_margin=config.TEMPERATURE_PREWARNING_EXIT_MARGIN_C,
-                humidity_prewarning_exit_margin=config.HUMIDITY_PREWARNING_EXIT_MARGIN_RH,
+                temperature_prewarning_margin=margins["temperature"],
+                humidity_prewarning_margin=margins["humidity"],
+                temperature_prewarning_exit_margin=margins["temperature_exit"],
+                humidity_prewarning_exit_margin=margins["humidity_exit"],
             )
             if result.applicability is not ApplicabilityStatus.APPLICABLE:
                 return "N/A"

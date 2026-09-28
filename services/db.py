@@ -160,6 +160,28 @@ CREATE TABLE IF NOT EXISTS feishu_remote_record_state (
 );
 CREATE INDEX IF NOT EXISTS idx_feishu_remote_record_state_entity
     ON feishu_remote_record_state(entity_type, entity_id, state);
+
+-- Whitelisted runtime-configurable parameters (console-editable, hot reload).
+-- Overrides only: config.py/.env remain the default/bootstrap layer, and the
+-- formal Feishu validated standards are never stored in this table.
+CREATE TABLE IF NOT EXISTS runtime_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    value_type TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+-- Append-only audit trail: exactly one row per key per successful change.
+CREATE TABLE IF NOT EXISTS runtime_setting_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    changed_at TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    reason TEXT
+);
 """
 
 # 加性列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列。
@@ -293,6 +315,20 @@ def _get_connection() -> sqlite3.Connection | None:
 def init_db() -> None:
     """Initialize the local mirror early at startup; failures disable it."""
     _get_connection()
+
+
+def peek_connection() -> sqlite3.Connection | None:
+    """Return the shared mirror connection without lazily opening it.
+
+    Hot-path readers (e.g. runtime-settings lookups during sample evaluation)
+    use this so a settings read can never create a database file or open a
+    second connection manager as a side effect.  When the mirror is not
+    enabled or not yet initialized, callers fall back to config.py defaults.
+    """
+    with _lock:
+        if _init_failed or not config.SQLITE_ENABLED:
+            return None
+        return _connection
 
 
 def close() -> None:
