@@ -379,7 +379,7 @@ class SQLiteEnvironmentEventRepository:
         *,
         record_id: str,
     ) -> EnvironmentEventRecord:
-        """Persist the exact Feishu record created for this monitoring cycle."""
+        """Bind a cycle to its Feishu event and transfer ownership on reuse."""
         if not record_id.strip():
             raise ValueError("record_id cannot be empty")
         with self._lock:
@@ -394,16 +394,32 @@ class SQLiteEnvironmentEventRepository:
                     )
                 for row in self.connection.execute(
                     """
-                    SELECT event_id, payload_json FROM environment_events
+                    SELECT event_id, device_id, status, opened_at, payload_json FROM environment_events
                     WHERE event_id <> ?
                     """,
                     (event_id,),
                 ):
                     other_payload = json.loads(row["payload_json"])
                     if other_payload.get("feishu_record_id") == record_id:
-                        raise ValueError(
-                            f"Feishu record {record_id} is already bound to "
-                            f"environment event {row['event_id']}"
+                        if (
+                            row["device_id"] != record.device_id
+                            or row["status"] != EnvironmentEventStatus.CLOSED
+                            or _time_value(row["opened_at"]) >= record.opened_at
+                        ):
+                            raise ValueError(
+                                f"Feishu record {record_id} is already bound to "
+                                f"environment event {row['event_id']}"
+                            )
+                        # Retain the historical binding but transfer projection
+                        # ownership so delayed recovery cannot overwrite a new cycle.
+                        other_payload.update(
+                            feishu_superseded_by=event_id,
+                            feishu_recovery_pending=False,
+                            feishu_update_pending=False,
+                        )
+                        self.connection.execute(
+                            "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                            (json.dumps(other_payload, ensure_ascii=False), row["event_id"]),
                         )
                 payload["feishu_record_id"] = record_id
                 payload["feishu_binding_status"] = "BOUND"

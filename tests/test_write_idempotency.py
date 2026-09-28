@@ -188,7 +188,7 @@ class EnvironmentEventIdempotencyTests(unittest.TestCase):
         self.assertNotIn("existing", result)
         self.assertEqual(len(self.writer.writer.created), 1)
 
-    def test_distinct_unclosed_cycles_do_not_block_new_cycle(self) -> None:
+    def test_distinct_unclosed_cycles_reuse_latest_record(self) -> None:
         later = self.start.replace(minute=30)
         for i, moment in enumerate((self.start, later)):
             self.source.add(
@@ -204,8 +204,9 @@ class EnvironmentEventIdempotencyTests(unittest.TestCase):
             )
         newest = self.start.replace(minute=45)
         result = self._create(start_time=newest)
-        self.assertNotIn("existing", result)
-        self.assertEqual(len(self.writer.writer.created), 1)
+        self.assertTrue(result["existing"])
+        self.assertEqual(result["record_id"], "rec-1")
+        self.assertEqual(len(self.writer.writer.created), 0)
 
 
 class OperationRegistrationIdempotencyTests(unittest.TestCase):

@@ -288,7 +288,7 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             recording.created[1][1]["开始时间"],
         )
 
-    def test_recovered_unclosed_event_does_not_block_new_alarm_cycle(self) -> None:
+    def test_recovered_unclosed_event_is_reused_by_new_alarm_cycle(self) -> None:
         recording = _RecordingWriter()
         historical = FeishuRawRecord(
             record_id="rec-historical",
@@ -307,7 +307,44 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
             start_time=_sample().sample_time,
             temperature=46,
         )
+        self.assertEqual(len(recording.created), 0)
+        self.assertEqual(recording.updated[-1][1], "rec-historical")
+        self.assertIsNone(recording.updated[-1][2]["恢复时间"])
+
+    def test_business_closed_event_allows_new_record(self) -> None:
+        recording = _RecordingWriter()
+        remote = FeishuRawRecord(
+            record_id="closed",
+            fields={"监测点": "TH-03", "闭环状态": "已闭环"},
+        )
+        self._writer(recording, (remote,)).create_event(
+            device_id="TH-03", area="仓库", start_time=_sample().sample_time,
+        )
         self.assertEqual(len(recording.created), 1)
+
+    def test_latest_unclosed_event_is_reused_and_peaks_preserved(self) -> None:
+        recording = _RecordingWriter()
+        records = tuple(
+            FeishuRawRecord(
+                record_id=record_id,
+                fields={
+                    "监测点": "TH-03", "开始时间": started,
+                    "闭环状态": {"type": 1, "value": [{"text": "未关闭"}]},
+                    "峰值温度(°C)": 50, "峰值湿度(%RH)": 80,
+                },
+            )
+            for record_id, started in (("older", 1000), ("latest", 2000))
+        )
+        self._writer(recording, records).create_event(
+            device_id="TH-03", area="仓库", start_time=_sample().sample_time,
+            temperature=46, humidity=71,
+        )
+        self.assertEqual(recording.created, [])
+        _, record_id, fields = recording.updated[-1]
+        self.assertEqual(record_id, "latest")
+        self.assertEqual(fields["峰值温度(°C)"], 50)
+        self.assertEqual(fields["峰值湿度(%RH)"], 80)
+        self.assertIsNone(fields["恢复时间"])
 
     def test_mark_recovered_updates_exact_cycle_without_manual_fields(self) -> None:
         recording = _RecordingWriter()

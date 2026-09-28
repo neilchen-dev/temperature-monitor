@@ -83,6 +83,23 @@ class EnvironmentEventRepositoryTests(unittest.TestCase):
         self.assertEqual(historical.payload["feishu_record_id"], "rec-A")
         self.assertEqual(historical.closed_at, self.opened_at + timedelta(minutes=5))
 
+    def test_recovered_cycle_transfers_remote_projection_to_new_cycle(self) -> None:
+        first = self.repository.create_or_get_active(
+            device_id="TH-01", event_key="first", opened_at=self.opened_at,
+        )
+        self.repository.bind_external_record(first.event_id, record_id="rec-A")
+        self.repository.mark_recovered(first.event_id, recovered_at=self.opened_at)
+        self.repository.patch_external_projection(first.event_id, feishu_recovery_pending=True)
+        second = self.repository.create_or_get_active(
+            device_id="TH-01", event_key="second",
+            opened_at=self.opened_at + timedelta(minutes=6),
+        )
+        self.repository.bind_external_record(second.event_id, record_id="rec-A")
+        old = self.repository.get(first.event_id)
+        self.assertEqual(old.payload["feishu_superseded_by"], second.event_id)
+        self.assertFalse(old.payload["feishu_recovery_pending"])
+        self.assertEqual(self.repository.get(second.event_id).payload["feishu_record_id"], "rec-A")
+
     def test_two_alarm_cycles_keep_distinct_external_record_bindings(self) -> None:
         first = self.repository.create_or_get_active(
             device_id="TH-01",

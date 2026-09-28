@@ -175,7 +175,7 @@ def test_concurrent_ten_paths_and_expired_lease_cannot_send_second_post():
         connection.close()
 
 
-def test_duplicate_cycle_rejected_but_distinct_unclosed_cycles_are_independent():
+def test_duplicate_cycle_rejected_and_unclosed_event_reused():
     connection, repo, event, remote, writer, context = setup()
     try:
         writer.handle_alarm_action(action(event), context)
@@ -184,11 +184,38 @@ def test_duplicate_cycle_rejected_but_distinct_unclosed_cycles_are_independent()
         second = repo.create_or_get_active(device_id="TH-01", event_key=f"ENV:TH-01:{later.isoformat()}", opened_at=later)
         other = dict(context, created_at=later.isoformat(), python_alarm_transition={"violation_started_at": later.isoformat()})
         writer.handle_alarm_action(action(second), other)
-        assert repo.get(second.event_id).payload["feishu_record_id"] == "rec2"
+        assert repo.get(second.event_id).payload["feishu_record_id"] == "rec1"
+        assert remote.posts == 1
         assert repo.get(event.event_id).payload["feishu_record_id"] == "rec1"
-        remote.records.append(FeishuRawRecord("duplicate", dict(remote.records[1].fields)))
+        remote.records.append(FeishuRawRecord("duplicate", dict(remote.records[0].fields)))
         with pytest.raises(FeishuWriteError, match="EVENT_DUPLICATED"):
-            writer._find_event_by_business_key("TH-01", later)
+            writer._find_event_by_business_key("TH-01", NOW)
+    finally:
+        connection.close()
+
+
+def test_reused_event_ignores_old_recovery_and_recovers_current_cycle():
+    connection, repo, event, remote, writer, context = setup()
+    try:
+        writer.handle_alarm_action(action(event), context)
+        recovered = dict(context, created_at=(NOW + timedelta(minutes=1)).isoformat())
+        writer.handle_alarm_action(action(event, AlarmActionType.MARK_ALARM_RECOVERED), recovered)
+        repo.mark_recovered(event.event_id, recovered_at=NOW + timedelta(minutes=1))
+        later = NOW + timedelta(minutes=10)
+        second = repo.create_or_get_active(
+            device_id="TH-01", event_key=f"ENV:TH-01:{later.isoformat()}", opened_at=later,
+        )
+        current = dict(context, created_at=later.isoformat(),
+                       python_alarm_transition={"violation_started_at": later.isoformat()})
+        writer.handle_alarm_action(action(second), current)
+        assert remote.records[0].fields["恢复时间"] is None
+        delayed = dict(context, created_at=(NOW + timedelta(minutes=2)).isoformat())
+        writer.handle_alarm_action(action(event, AlarmActionType.MARK_ALARM_RECOVERED), delayed)
+        assert remote.records[0].fields["恢复时间"] is None
+        current["created_at"] = (later + timedelta(minutes=2)).isoformat()
+        writer.handle_alarm_action(action(second, AlarmActionType.MARK_ALARM_RECOVERED), current)
+        assert remote.records[0].fields["恢复时间"] == epoch_milliseconds(later + timedelta(minutes=2))
+        assert remote.posts == 1
     finally:
         connection.close()
 

@@ -21,6 +21,7 @@ from domain.models import MonitorResult, MonitorSample
 from domain.operation import OperationAction, OperationObservation
 
 from .feishu_records import FeishuRawRecord
+from .feishu_observation import business_closed
 from services.feishu import FeishuAPIError, normalize_client_token
 from services.event_identity import epoch_milliseconds, external_effect_key
 from repositories.environment_events import ExternalCreateOutcome
@@ -820,7 +821,10 @@ class FeishuEnvironmentEventWriter:
         # 重试会在这里找到既有记录并复用 record_id——包括事件已被人工
         # 提前关闭的情况（active 检查对已关闭记录不可见，会误判可创建）。
         self._binding_log("binding_lookup_existing", local_event_id)
-        existing_by_key = self._find_event_by_business_key(normalized_device, start_time)
+        records = tuple(self.source.read_records(self.event_table_id))
+        existing_by_key = self._find_event_by_business_key(
+            normalized_device, start_time, records=records,
+        )
         if existing_by_key is not None:
             self._binding_log("binding_recovered", local_event_id)
             return {
@@ -828,6 +832,32 @@ class FeishuEnvironmentEventWriter:
                 "idempotent": True,
                 "record_id": existing_by_key.record_id,
             }
+        # Recovery ends a monitoring cycle, but only manual business closure
+        # permits a new remote event. Reuse the latest unresolved legacy row.
+        unresolved = self._active_events(normalized_device, records=records)
+        if unresolved:
+            if local_event_id is not None and self.event_repository is not None:
+                local = self.event_repository.get(local_event_id)
+                if local is not None and local.payload.get("feishu_create_attempted"):
+                    raise FeishuWriteError(
+                        "binding_retry: uncertain prior CREATE requires exact business-key reconciliation"
+                    )
+            existing = max(
+                unresolved,
+                key=lambda record: (
+                    _field_text(record.fields.get(self.fields.start_time)).zfill(20),
+                    record.record_id,
+                ),
+            )
+            self.update_event(
+                record_id=existing.record_id,
+                temperature=temperature,
+                humidity=humidity,
+                temperature_status=temperature_status,
+                humidity_status=humidity_status,
+                clear_recovery=True,
+            )
+            return {"existing": True, "record_id": existing.record_id}
         owner_cell = _user_cell(owner) if owner is not None else self._device_owner(
             normalized_device
         )
@@ -908,8 +938,23 @@ class FeishuEnvironmentEventWriter:
         humidity: float | None = None,
         temperature_status: str | None = None,
         humidity_status: str | None = None,
+        clear_recovery: bool = False,
     ) -> Mapping[str, Any]:
         fields: dict[str, Any] = {}
+        if clear_recovery:
+            fields[self.fields.recovery_time] = None
+        remote = next(
+            (record for record in self.source.read_records(self.event_table_id)
+             if record.record_id == record_id),
+            None,
+        )
+        if remote is not None:
+            old_temperature = _number_value(remote.fields.get(self.fields.peak_temperature))
+            old_humidity = _number_value(remote.fields.get(self.fields.peak_humidity))
+            if old_temperature is not None and temperature is not None:
+                temperature = max(old_temperature, temperature)
+            if old_humidity is not None and humidity is not None:
+                humidity = max(old_humidity, humidity)
         _put_number(fields, self.fields.peak_temperature, temperature)
         _put_number(fields, self.fields.peak_humidity, humidity)
         _put_status(fields, self.fields.trigger_temperature_status, temperature_status)
@@ -1183,12 +1228,15 @@ class FeishuEnvironmentEventWriter:
                 action_type=action_type,
                 requested_at=effect_at,
             )
-            if event.payload.get("feishu_record_missing"):
+            if event.payload.get("feishu_record_missing") or event.payload.get("feishu_superseded_by"):
                 self.event_repository.mark_external_effect_succeeded(
                     local_event_id,
                     effect_key=effect_key,
                     completed_at=effect_at,
-                    metadata={"outcome": "linked_record_already_deleted"},
+                    metadata={"outcome": (
+                        "superseded_monitoring_cycle" if event.payload.get("feishu_superseded_by")
+                        else "linked_record_already_deleted"
+                    )},
                 )
                 return
         if action_type == "CREATE_ALARM_EVENT":
@@ -1477,25 +1525,33 @@ class FeishuEnvironmentEventWriter:
             f"本地环境异常 {local_event_id} 的 Feishu CREATE/reconciliation 已由其他任务执行"
         )
 
-    def _active_events(self, device_id: str) -> tuple[FeishuRawRecord, ...]:
+    def _active_events(
+        self, device_id: str, *, records: tuple[FeishuRawRecord, ...] | None = None,
+    ) -> tuple[FeishuRawRecord, ...]:
         normalized_device = _device_id(device_id)
         return tuple(
             record
-            for record in self.source.read_records(self.event_table_id)
+            for record in (records if records is not None else self.source.read_records(self.event_table_id))
             if _field_text(record.fields.get(self.fields.device_id)).upper()
             == normalized_device
-            and _field_text(record.fields.get(self.fields.status)).lower()
-            not in self.closed_statuses
+            and not business_closed(record.fields)
+            and (
+                "闭环状态" in record.fields
+                or _field_text(record.fields.get(self.fields.status)).lower()
+                not in self.closed_statuses
+            )
         )
 
     def _find_event_by_business_key(
         self,
         device_id: str,
         start_time: datetime,
+        *,
+        records: tuple[FeishuRawRecord, ...] | None = None,
     ) -> FeishuRawRecord | None:
         """Business key: (监测点, 开始时间); status-agnostic by design."""
         matches = []
-        for record in self.source.read_records(self.event_table_id):
+        for record in (records if records is not None else self.source.read_records(self.event_table_id)):
             if (
                 _field_text(record.fields.get(self.fields.device_id)).upper()
                 != device_id
