@@ -235,6 +235,8 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
 
         _, fields, token = recording.created[-1]
         self.assertEqual(token, normalize_client_token("event-1"))
+        self.assertEqual(fields["监测点"], "TH-03")
+        self.assertEqual(fields["监测点编号文本"], "TH-03")
         self.assertEqual(fields["责任人"], [{"id": "ou_owner"}])
         self.assertEqual(fields["异常类型"], "温度高于上限")
         self.assertEqual(fields["处理状态"], "待处理")
@@ -310,6 +312,7 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
         self.assertEqual(len(recording.created), 0)
         self.assertEqual(recording.updated[-1][1], "rec-historical")
         self.assertIsNone(recording.updated[-1][2]["恢复时间"])
+        self.assertEqual(recording.updated[0][2], {"监测点编号文本": "TH-03"})
 
     def test_business_closed_event_allows_new_record(self) -> None:
         recording = _RecordingWriter()
@@ -820,6 +823,20 @@ class FeishuEnvironmentEventWriterTests(unittest.TestCase):
         )
 
         self.assertEqual(result["record_id"], "recA")
+
+    def test_exact_retry_repairs_device_text_without_duplicate_creation(self) -> None:
+        recording = _RecordingWriter()
+        remote = FeishuRawRecord("rec-existing", {
+            "监测点": "TH-03", "开始时间": int(_sample().sample_time.timestamp() * 1000),
+        })
+        result = self._writer(recording, (remote,)).create_event(
+            device_id="TH-03", area="仓库", start_time=_sample().sample_time,
+        )
+        self.assertEqual(result["record_id"], "rec-existing")
+        self.assertEqual(recording.created, [])
+        self.assertEqual(recording.updated, [
+            ("tbl-events", "rec-existing", {"监测点编号文本": "TH-03"}),
+        ])
 
     def test_close_requires_manual_closure_fields(self) -> None:
         recording = _RecordingWriter()

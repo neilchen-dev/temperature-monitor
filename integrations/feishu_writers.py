@@ -747,6 +747,7 @@ class FeishuEventWriteFieldMap:
     """
 
     device_id: str = "监测点"
+    device_id_text: str = "监测点编号文本"
     area: str = "区域"
     start_time: str = "开始时间"
     recovery_time: str = "恢复时间"
@@ -826,6 +827,7 @@ class FeishuEnvironmentEventWriter:
             normalized_device, start_time, records=records,
         )
         if existing_by_key is not None:
+            self._ensure_device_id_text(existing_by_key, normalized_device)
             self._binding_log("binding_recovered", local_event_id)
             return {
                 "existing": True,
@@ -849,6 +851,7 @@ class FeishuEnvironmentEventWriter:
                     record.record_id,
                 ),
             )
+            self._ensure_device_id_text(existing, normalized_device)
             self.update_event(
                 record_id=existing.record_id,
                 temperature=temperature,
@@ -872,6 +875,7 @@ class FeishuEnvironmentEventWriter:
             raise ValueError("area 不能为空")
         fields: dict[str, Any] = {
             self.fields.device_id: normalized_device,
+            self.fields.device_id_text: normalized_device,
             self.fields.area: _area_text(area),
             self.fields.start_time: _datetime_cell(start_time),
             self.fields.status: "待处理",
@@ -929,6 +933,15 @@ class FeishuEnvironmentEventWriter:
                     observed_at=outcome_at,
                 )
             raise
+
+    def _ensure_device_id_text(self, record: FeishuRawRecord, device_id: str) -> None:
+        """Repair the independent automation lookup field when reusing a row."""
+        if _field_text(record.fields.get(self.fields.device_id_text)) == device_id:
+            return
+        self.writer.update(
+            self.event_table_id, record.record_id,
+            {self.fields.device_id_text: device_id},
+        )
 
     def update_event(
         self,
