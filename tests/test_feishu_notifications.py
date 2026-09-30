@@ -274,6 +274,46 @@ class NotificationTestCase(unittest.TestCase):
         self.assertEqual(len(sender.calls), 1)
         self.assertIn("恢复", sender.calls[0]["text"])
 
+    def test_alarm_message_uses_feishu_event_number_for_form_reference(self) -> None:
+        sender = _Sender()
+        self.source.records[self.event_table] = (
+            FeishuRawRecord(
+                "rec-event-1",
+                {"责任人": [{"open_id": "ou_owner_1"}], "编号": "ENV-20260909-001"},
+            ),
+        )
+        self._writer(sender).handle_notification_action(
+            self._action(AlarmActionType.NOTIFY_ALARM, f"NOTIFY_ALARM:{self.event.event_id}"),
+            self._context(),
+        )
+        text = sender.calls[0]["text"]
+        self.assertIn("事件编号：ENV-20260909-001", text)
+        self.assertNotIn(self.event.event_id, text)
+
+    def test_recovery_message_uses_feishu_event_number(self) -> None:
+        sender = _Sender()
+        self.source.records[self.event_table] = (
+            FeishuRawRecord(
+                "rec-event-1",
+                {"责任人": [{"open_id": "ou_owner_1"}], "编号": "ENV-20260909-001"},
+            ),
+        )
+        key = f"NOTIFY_RECOVERY:{self.event.event_id}:2026-09-09T09:59:00+00:00"
+        self._writer(sender).handle_notification_action(
+            self._action(AlarmActionType.NOTIFY_RECOVERY, key),
+            self._context(recovery=True),
+        )
+        self.assertIn("事件编号：ENV-20260909-001", sender.calls[0]["text"])
+
+    def test_message_without_event_number_falls_back_to_local_event_id(self) -> None:
+        message = self._writer()._message(
+            action_type=AlarmActionType.NOTIFY_ALARM.value,
+            event_id=self.event.event_id,
+            record_id="rec-event-1",
+            context=self._context(),
+        )
+        self.assertIn(f"事件 ID：{self.event.event_id}", message)
+
     def test_event_owner_takes_priority_over_device_owner(self) -> None:
         sender = _Sender()
         self._writer(sender).handle_notification_action(
@@ -588,7 +628,8 @@ class NotificationTestCase(unittest.TestCase):
             [call["receive_id"] for call in sender.calls],
             ["ou_owner_1", "ou_owner_1"],
         )
-        self.assertIn("峰值温度/湿度：31.0 / 70.0", sender.calls[1]["text"])
+        self.assertIn("峰值温度：31.0", sender.calls[1]["text"])
+        self.assertIn("峰值湿度：70.0", sender.calls[1]["text"])
         task_types = [row[0] for row in connection.execute(
             "SELECT task_type FROM automation_tasks WHERE task_type LIKE 'NOTIFY_%'"
         ).fetchall()]

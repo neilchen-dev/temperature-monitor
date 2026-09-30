@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import logging
+import re
 from typing import Any, Protocol
 
 import config
@@ -199,9 +200,10 @@ class FeishuNotificationWriter:
             return
 
         try:
+            event_record = self._read_record(self.event_table_id, record_id)
             recipient, receive_id_type = self._resolve_recipient(
                 event=event,
-                record_id=record_id,
+                event_record=event_record,
             )
         except FeishuNotificationError as exc:
             self._mark_failed(
@@ -236,6 +238,7 @@ class FeishuNotificationWriter:
             action_type=action_type,
             event_id=event_id,
             record_id=record_id,
+            event_record=event_record,
             context={**dict(context), "event_payload": dict(event.payload)},
         )
         try:
@@ -562,8 +565,9 @@ class FeishuNotificationWriter:
             effect_key,
         )
 
-    def _resolve_recipient(self, *, event: Any, record_id: str) -> tuple[str, str]:
-        event_record = self._read_record(self.event_table_id, record_id)
+    def _resolve_recipient(
+        self, *, event: Any, event_record: FeishuRawRecord | None
+    ) -> tuple[str, str]:
         candidate = (
             event_record.fields.get(self.event_owner_field)
             if event_record is not None
@@ -652,6 +656,7 @@ class FeishuNotificationWriter:
         event_id: str,
         record_id: str,
         context: Mapping[str, Any],
+        event_record: FeishuRawRecord | None = None,
     ) -> str:
         sample = _mapping(context.get("sample"))
         result = _mapping(context.get("python_monitor_result"))
@@ -686,13 +691,14 @@ class FeishuNotificationWriter:
             )
             return "\n".join(
                 (
-                    "[温湿度异常恢复]",
+                    "【温湿度异常恢复】",
                     f"设备 ID：{_text(context.get('device_id')) or _text(sample.get('device_id'))}",
                     f"区域：{area}",
                     f"恢复时间：{recovered_at}",
-                    f"峰值温度/湿度：{_number_text(peak_temperature)} / {_number_text(peak_humidity)}",
-                    f"事件 ID：{event_id}",
                     f"持续时间：{duration}",
+                    f"峰值温度：{_number_text(peak_temperature)}",
+                    f"峰值湿度：{_number_text(peak_humidity)}",
+                    _event_reference(event_record, event_id),
                 )
             )
 
@@ -704,10 +710,6 @@ class FeishuNotificationWriter:
                 f"温度={_text(result.get('temperature_status'))} "
                 f"湿度={_text(result.get('humidity_status'))}"
             )
-        standard_range = (
-            f"温度 {_number_text(standard.get('temperature_min'))}~{_number_text(standard.get('temperature_max'))}；"
-            f"湿度 {_number_text(standard.get('humidity_min'))}~{_number_text(standard.get('humidity_max'))}"
-        )
         start_time = (
             _text(transition.get("violation_started_at"))
             or _text(transition.get("alarm_started_at"))
@@ -715,17 +717,15 @@ class FeishuNotificationWriter:
             or "未提供"
         )
         lines = (
-            "[温湿度异常告警]",
+            "【温湿度异常告警】",
             f"设备 ID：{_text(context.get('device_id')) or _text(sample.get('device_id'))}",
             f"区域：{area}",
-            f"当前温度/湿度：{_number_text(sample.get('temperature'))} / {_number_text(sample.get('humidity'))}",
+            f"当前温度：{_value_with_standard(sample.get('temperature'), standard.get('temperature_min'), standard.get('temperature_max'))}",
+            f"当前湿度：{_value_with_standard(sample.get('humidity'), standard.get('humidity_min'), standard.get('humidity_max'))}",
             f"超限项：{exceeded}",
-            f"标准范围：{standard_range}",
             f"异常开始时间：{start_time}",
-            f"事件 ID：{event_id}",
-            f"标准：{_text(standard.get('standard_id')) or _text(result.get('standard_id')) or '未提供'} "
-            f"revision={_text(standard.get('revision')) or _text(result.get('standard_revision')) or '未提供'} "
-            f"source={_text(standard.get('standard_source')) or _text(result.get('standard_source')) or '未提供'}",
+            _event_reference(event_record, event_id),
+            f"执行标准：{_standard_text(standard, result)}",
         )
         link = self._event_link(record_id)
         if link:
@@ -742,22 +742,30 @@ class FeishuNotificationWriter:
         device_id = _text(context.get("device_id")) or _text(sample.get("device_id"))
         timestamp = _text(context.get("sample_time")) or _text(context.get("created_at")) or "未提供"
         if action_type == AlarmActionType.NOTIFY_PREWARNING_RECOVERY.value:
-            title = "[温湿度接近阈值预警解除]"
+            title = "【温湿度接近阈值预警解除】"
             status = "已离开预警区，当前仍未触发正式告警。"
         else:
-            title = "[温湿度接近阈值预警]"
+            title = "【温湿度接近阈值预警】"
             status = "当前尚未超标，请提前关注。"
         warning_reasons = result.get("prewarning_reasons") or context.get(
             "prewarning_reasons"
         )
+        if isinstance(warning_reasons, (list, tuple)):
+            warning_items = (
+                "、".join(_text(item) for item in warning_reasons if _text(item))
+                or "未提供"
+            )
+        else:
+            warning_items = _text(warning_reasons) or "未提供"
         details = _mapping(
             result.get("prewarning_details") or context.get("prewarning_details")
         )
         lines = [
             title,
             f"设备 ID：{device_id}",
-            f"当前温度/湿度：{_number_text(sample.get('temperature'))} / {_number_text(sample.get('humidity'))}",
-            f"预警项：{_text(warning_reasons) or '未提供'}",
+            f"当前温度：{_number_text(sample.get('temperature'))}",
+            f"当前湿度：{_number_text(sample.get('humidity'))}",
+            f"预警项：{warning_items}",
         ]
         for reason, detail in details.items():
             item = _mapping(detail)
@@ -768,9 +776,7 @@ class FeishuNotificationWriter:
             )
         lines.extend(
             (
-                f"标准：{_text(standard.get('standard_id')) or _text(result.get('standard_id')) or '未提供'} "
-                f"revision={_text(standard.get('revision')) or _text(result.get('standard_revision')) or '未提供'} "
-                f"source={_text(standard.get('standard_source')) or _text(result.get('standard_source')) or '未提供'}",
+                f"执行标准：{_standard_text(standard, result)}",
                 f"时间：{timestamp}",
                 status,
             )
@@ -970,6 +976,59 @@ def _text(value: Any) -> str:
 
 def _number_text(value: Any) -> str:
     return _text(value) if value is not None else "未提供"
+
+
+def _standard_text(standard: Mapping[str, Any], result: Mapping[str, Any]) -> str:
+    standard_id = (
+        _text(standard.get("standard_id"))
+        or _text(result.get("standard_id"))
+        or "未提供"
+    )
+    details = []
+    revision = _text(standard.get("revision")) or _text(result.get("standard_revision"))
+    if revision:
+        details.append(f"修订 {revision}")
+    source = _text(standard.get("standard_source")) or _text(
+        result.get("standard_source")
+    )
+    if source:
+        details.append(f"来源 {source}")
+    if not details:
+        return standard_id
+    return f"{standard_id}（{'，'.join(details)}）"
+
+
+def _value_with_standard(value: Any, low: Any, high: Any) -> str:
+    text = _number_text(value)
+    if low is None and high is None:
+        return text
+    return f"{text}（标准 {_number_text(low)}~{_number_text(high)}）"
+
+
+_EVENT_NUMBER_PATTERN = re.compile(r"ENV-\d{8}-\d+")
+
+
+def _event_number(event_record: FeishuRawRecord | None) -> str:
+    """Extract the human-facing Feishu auto number (``ENV-YYYYMMDD-NNN``).
+
+    The event table's number is an auto-number field whose name is not
+    fixed in code, so scan the bound record's fields for the documented
+    value format instead of hard-coding a field name.
+    """
+    if event_record is None:
+        return ""
+    for value in event_record.fields.values():
+        text = _text(value)
+        if text and _EVENT_NUMBER_PATTERN.fullmatch(text):
+            return text
+    return ""
+
+
+def _event_reference(event_record: FeishuRawRecord | None, event_id: str) -> str:
+    number = _event_number(event_record)
+    if number:
+        return f"事件编号：{number}"
+    return f"事件 ID：{event_id}"
 
 
 def _message_id(response: Mapping[str, Any]) -> str | None:
