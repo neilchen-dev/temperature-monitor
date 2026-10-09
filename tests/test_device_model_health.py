@@ -128,6 +128,7 @@ class DeviceModelHealthTests(unittest.TestCase):
         now = time.time()
         config.SHADOW_DEVICE_IDS = ("TH-01", "TH-02", "TH-03")
         with (
+            patch("services.devices.db.fetch_latest_device_presence", return_value=[]),
             patch(
                 "services.devices.db.fetch_device_summary",
                 return_value={"last_sample_time_ms": now * 1000},

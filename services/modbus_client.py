@@ -500,6 +500,8 @@ class ModbusPoller:
         try:
             while not self._stop.is_set():
                 sample = self.poll_once()
+                if self._stop.is_set():
+                    break
                 if sample is not None:
                     self._record_sample(
                         device=sample["device"],

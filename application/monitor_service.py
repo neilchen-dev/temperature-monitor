@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import logging
+import sqlite3
+import threading
 import uuid
 from typing import Any, Callable, Mapping, Protocol
 
@@ -24,6 +26,7 @@ from domain.models import (
 from domain.monitor_engine import MonitorEngine
 from domain.standard_resolver import StandardNotFoundError, StandardResolver
 from services import runtime_settings
+from repositories.sqlite import sqlite_unit_of_work
 from services.event_identity import epoch_milliseconds, external_effect_key
 
 from .action_executor import (
@@ -165,6 +168,7 @@ class MonitorApplicationService:
         self.event_repository = event_repository
         self.latest_sample_repository = latest_sample_repository
         self.unclosed_event_provider = unclosed_event_provider
+        self._sample_lock = threading.RLock()
 
     def handle_sample(
         self,
@@ -173,9 +177,32 @@ class MonitorApplicationService:
         sample: MonitorSample,
         now: datetime | None = None,
         scheduler_task_id: str | None = None,
-    ) -> MonitorHandlingResult:
-        if self.latest_sample_repository is not None:
-            self.latest_sample_repository.save(sample)
+    ) -> MonitorHandlingResult | None:
+        with self._sample_lock:
+            return self._handle_sample(
+                device=device, sample=sample, now=now, scheduler_task_id=scheduler_task_id,
+            )
+
+    def _local_connection(self) -> sqlite3.Connection | None:
+        connections = {
+            connection for repository in (
+                self.alarm_state_repository, self.latest_sample_repository,
+                self.task_repository, self.event_repository,
+            ) if isinstance((connection := getattr(repository, "connection", None)), sqlite3.Connection)
+        }
+        if len(connections) > 1:
+            raise ValueError("sample unit of work requires one shared SQLite connection")
+        return next(iter(connections), None)
+
+    def _handle_sample(
+        self, *, device: DeviceContext, sample: MonitorSample,
+        now: datetime | None = None, scheduler_task_id: str | None = None,
+    ) -> MonitorHandlingResult | None:
+        get_latest = getattr(self.latest_sample_repository, "get", None)
+        latest = get_latest(sample.device_id) if callable(get_latest) else None
+        if latest is not None and epoch_milliseconds(sample.sample_time) < epoch_milliseconds(latest.sample_time):
+            logger.info("old observation ignored | device=%s | sample_time=%s", sample.device_id, sample.sample_time)
+            return None
         operation_state = self.operation_state_provider.get(device)
         try:
             standard = self.standard_resolver.resolve(
@@ -233,71 +260,76 @@ class MonitorApplicationService:
             monitor_result=monitor_result,
             now=evaluated_at,
         )
-        actions = self.action_mapper.map(transition)
-        transition = self._project_local_actions(
-            transition,
-            actions,
-            sample=sample,
-            operation_state=operation_state,
-            created_at=evaluated_at,
-            scheduler_task_id=scheduler_task_id,
-        )
-        actions = self._enrich_action_metadata(
-            transition,
-            actions,
-            sample=sample,
-            monitor_result=monitor_result,
-            created_at=evaluated_at,
-            scheduler_task_id=scheduler_task_id,
-        )
-        event_reconciliation_task_ids = self._prepare_event_reconciliation_tasks(
-            transition,
-            actions,
-            sample=sample,
-            monitor_result=monitor_result,
-            operation_state=operation_state,
-            standard=standard,
-            created_at=evaluated_at,
-        )
-        actions = self._attach_reconciliation_task_metadata(
-            actions,
-            event_reconciliation_task_ids,
-            event_id=transition.next.active_alarm_id or transition.previous.active_alarm_id,
-        )
-        notification_task_ids = self._prepare_notification_tasks(
-            transition,
-            actions,
-            sample=sample,
-            monitor_result=monitor_result,
-            operation_state=operation_state,
-            standard=standard,
-            created_at=evaluated_at,
-        )
-        actions = self._attach_notification_task_metadata(
-            actions,
-            notification_task_ids,
-            event_id=transition.next.active_alarm_id or transition.previous.active_alarm_id,
-        )
-        transition = self._attach_prewarning_task_metadata(
-            transition,
-            actions,
-            notification_task_ids,
-        )
-        self.alarm_state_repository.save(transition.next)
-        runtime_context = self._runtime_context_metadata()
-        context = {
-            "device_id": sample.device_id,
-            "created_mode": runtime_context["created_mode"],
-            "active_epoch": runtime_context["active_epoch"],
-            "automation_task_id": scheduler_task_id,
-            "created_at": evaluated_at.isoformat(),
-            "sample_time": sample.sample_time.isoformat(),
-            "sample": _sample_dict(sample),
-            "python_monitor_result": _monitor_result_dict(monitor_result),
-            "python_alarm_transition": _transition_dict(transition),
-            "operation_state": _operation_state_dict(operation_state),
-            "standard": _standard_dict(standard, monitor_result),
-        }
+        # Remote prewarning closure lookup above is complete before the local
+        # transaction. Repository commits below join this single local unit.
+        with sqlite_unit_of_work(self._local_connection()):
+            if self.latest_sample_repository is not None:
+                self.latest_sample_repository.save(sample)
+            actions = self.action_mapper.map(transition)
+            transition = self._project_local_actions(
+                transition,
+                actions,
+                sample=sample,
+                operation_state=operation_state,
+                created_at=evaluated_at,
+                scheduler_task_id=scheduler_task_id,
+            )
+            actions = self._enrich_action_metadata(
+                transition,
+                actions,
+                sample=sample,
+                monitor_result=monitor_result,
+                created_at=evaluated_at,
+                scheduler_task_id=scheduler_task_id,
+            )
+            event_reconciliation_task_ids = self._prepare_event_reconciliation_tasks(
+                transition,
+                actions,
+                sample=sample,
+                monitor_result=monitor_result,
+                operation_state=operation_state,
+                standard=standard,
+                created_at=evaluated_at,
+            )
+            actions = self._attach_reconciliation_task_metadata(
+                actions,
+                event_reconciliation_task_ids,
+                event_id=transition.next.active_alarm_id or transition.previous.active_alarm_id,
+            )
+            notification_task_ids = self._prepare_notification_tasks(
+                transition,
+                actions,
+                sample=sample,
+                monitor_result=monitor_result,
+                operation_state=operation_state,
+                standard=standard,
+                created_at=evaluated_at,
+            )
+            actions = self._attach_notification_task_metadata(
+                actions,
+                notification_task_ids,
+                event_id=transition.next.active_alarm_id or transition.previous.active_alarm_id,
+            )
+            transition = self._attach_prewarning_task_metadata(
+                transition,
+                actions,
+                notification_task_ids,
+            )
+            self.alarm_state_repository.save(transition.next)
+            runtime_context = self._runtime_context_metadata()
+            context = {
+                "device_id": sample.device_id,
+                "created_mode": runtime_context["created_mode"],
+                "active_epoch": runtime_context["active_epoch"],
+                "automation_task_id": scheduler_task_id,
+                "created_at": evaluated_at.isoformat(),
+                "sample_time": sample.sample_time.isoformat(),
+                "sample": _sample_dict(sample),
+                "python_monitor_result": _monitor_result_dict(monitor_result),
+                "python_alarm_transition": _transition_dict(transition),
+                "operation_state": _operation_state_dict(operation_state),
+                "standard": _standard_dict(standard, monitor_result),
+            }
         executions = self.action_executor.execute(
             actions,
             context=context,

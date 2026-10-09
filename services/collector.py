@@ -127,6 +127,10 @@ def stop_collectors() -> None:
         if thread is not None and thread is not threading.current_thread():
             # 等线程退出，避免它仍持有 SQLite 连接时资源被清理。
             thread.join(timeout=5.0)
+        if thread is not None and thread.is_alive():
+            _modbus_error = "collector stopping: worker did not exit before shutdown timeout"
+            logger.error("采集线程仍在停止中，保留资源并禁止重复启动")
+            return
         _modbus_poller = None
         _modbus_thread = None
         _modbus_error = None

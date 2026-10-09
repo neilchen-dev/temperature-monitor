@@ -172,6 +172,43 @@ class HistoryServiceTests(unittest.TestCase):
         self.assertIn("TH-01", payload["failures"])
         self.assertEqual(len(payload["created"]), 10)
 
+    def test_local_failure_does_not_send_or_advance_remote_watermark(self) -> None:
+        now = datetime(2026, 8, 18, 1, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with (
+            patch.object(history, "list_realtime_snapshots", return_value=self._snapshot_records()),
+            patch.object(history, "get_latest_history_timestamp", return_value=None),
+            patch.object(db, "save_history_snapshot", return_value=False),
+            patch.object(history, "create_history_record") as create,
+        ):
+            payload, status = history.sample_history(now)
+        self.assertEqual(status, 502)
+        self.assertEqual(len(payload["failures"]), len(history.EXPECTED_HISTORY_DEVICES))
+        create.assert_not_called()
+        self.assertTrue(all(value is None for value in history._latest_sample_cache.values()))
+        with (
+            patch.object(history, "list_realtime_snapshots", return_value=self._snapshot_records()),
+            patch.object(history, "create_history_record", return_value={"code": 0}) as create,
+        ):
+            _, status = history.sample_history(now)
+        self.assertEqual(status, 200)
+        self.assertEqual(create.call_count, len(history.EXPECTED_HISTORY_DEVICES))
+
+    def test_local_snapshot_survives_external_failure_and_restart(self) -> None:
+        now = datetime(2026, 8, 18, 1, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
+        def reject_external(table_id, fields):
+            rows = db.fetch_history_snapshots()
+            self.assertTrue(any(row["sample_time_ms"] == fields["采集时间"] for row in rows))
+            raise RuntimeError("remote unavailable")
+        with (
+            patch.object(history, "list_realtime_snapshots", return_value=self._snapshot_records()),
+            patch.object(history, "get_latest_history_timestamp", return_value=None),
+            patch.object(history, "create_history_record", side_effect=reject_external),
+        ):
+            _, status = history.sample_history(now)
+        self.assertEqual(status, 502)
+        db.close()
+        self.assertEqual(len(db.fetch_history_snapshots()), len(history.EXPECTED_HISTORY_DEVICES))
+
     def test_disabled_cleanup_short_circuits_without_feishu_calls(self) -> None:
         sample_time = datetime(2026, 8, 18, 2, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         with (

@@ -29,6 +29,7 @@ from runtime.bootstrap import (
     active_canary_status,
     resolved_feishu_standards,
     runtime_status,
+    runtime_liveness,
     shadow_summary_snapshot,
 )
 
@@ -587,6 +588,22 @@ def settings_audit():
 def system_status():
     summary = db.fetch_device_summary()
     last_sample_ms = summary.get("last_sample_time_ms")
+    if request.headers.get("X-History-Key") or request.headers.get("Authorization"):
+        auth_error = _auth_error()
+        if auth_error:
+            return auth_error
+    else:
+        collectors = get_collector_status()
+        return jsonify({
+            "status": "ok", "service": "temperature-monitor",
+            "sqlite": {"enabled": db.is_enabled()},
+            "runtime": runtime_liveness(),
+            "collectors": {name: {key: value.get(key) for key in ("enabled", "running")}
+                           for name, value in collectors.items()},
+            "device_count": summary.get("device_count", 0),
+            "identity_count": summary.get("identity_count", 0),
+            "last_sample_time_ms": last_sample_ms,
+        }), 200
     canary = active_canary_status()
     return jsonify({
         "status": "ok",

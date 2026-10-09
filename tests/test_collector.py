@@ -59,6 +59,8 @@ class CollectorLifecycleTests(unittest.TestCase):
         self.server = ModbusTestServer([252, 481, 1])
         self.server.start()
         self.addCleanup(self.server.stop)
+        # LIFO cleanup: stop the polling client before closing its TCP server.
+        self.addCleanup(collector.stop_collectors)
         config.MODBUS_ENABLED = True
         config.MODBUS_HOST = "127.0.0.1"
         config.MODBUS_PORT = self.server.port
@@ -105,6 +107,8 @@ class CollectorLifecycleTests(unittest.TestCase):
         self.server = ModbusTestServer([252, 481, 1])
         self.server.start()
         self.addCleanup(self.server.stop)
+        # LIFO cleanup: stop the polling client before closing its TCP server.
+        self.addCleanup(collector.stop_collectors)
         config.MODBUS_ENABLED = True
         config.MODBUS_HOST = "127.0.0.1"
         config.MODBUS_PORT = self.server.port

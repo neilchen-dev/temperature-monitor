@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from functools import wraps
+from contextlib import contextmanager
+from itertools import count
 import logging
 import sqlite3
 import threading
@@ -21,6 +23,89 @@ logger = logging.getLogger("temperature_monitor")
 SQLITE_WRITE_LOCK = threading.RLock()
 _SQLITE_LOCK_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2)
 _T = TypeVar("_T")
+_transaction_local = threading.local()
+_savepoints = count()
+
+
+def _frames(connection: sqlite3.Connection) -> list[tuple[str, str | None]]:
+    if not hasattr(_transaction_local, "frames"):
+        _transaction_local.frames = {}
+    return _transaction_local.frames.get(connection, [])
+
+
+def _begin(connection: sqlite3.Connection, kind: str) -> None:
+    name = f"monitor_uow_{next(_savepoints)}" if connection.in_transaction else None
+    connection.execute(f"SAVEPOINT {name}" if name else "BEGIN IMMEDIATE")
+    _frames(connection)
+    _transaction_local.frames.setdefault(connection, []).append((kind, name))
+
+
+def begin_sqlite_write(connection: sqlite3.Connection) -> None:
+    """Start a repository transaction, nesting safely inside an application unit."""
+    _begin(connection, "repository")
+
+
+def _finish_frame(connection: sqlite3.Connection, *, rollback: bool) -> None:
+    _, name = _frames(connection).pop()
+    if name:
+        if rollback:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
+        connection.execute(f"RELEASE SAVEPOINT {name}")
+    elif rollback:
+        connection.rollback()
+    else:
+        connection.commit()
+    if not _frames(connection):
+        _transaction_local.frames.pop(connection, None)
+
+
+def commit_sqlite(connection: sqlite3.Connection) -> None:
+    frames = _frames(connection)
+    if frames and frames[-1][0] == "unit":
+        return
+    if frames:
+        _finish_frame(connection, rollback=False)
+    else:
+        connection.commit()
+        _transaction_local.frames.pop(connection, None)
+
+
+def rollback_sqlite(connection: sqlite3.Connection) -> None:
+    frames = _frames(connection)
+    if frames and frames[-1][0] == "unit":
+        # The enclosing unit owns cleanup; its exception handler rolls back.
+        return
+    if frames:
+        _finish_frame(connection, rollback=True)
+    else:
+        connection.rollback()
+        _transaction_local.frames.pop(connection, None)
+
+
+@contextmanager
+def sqlite_unit_of_work(connection: sqlite3.Connection | None):
+    """Commit local state together. Never perform external I/O in this scope."""
+    if connection is None:
+        yield
+        return
+    with SQLITE_WRITE_LOCK:
+        depth = len(_frames(connection))
+        _begin(connection, "unit")
+        try:
+            yield
+        except BaseException:
+            while len(_frames(connection)) > depth:
+                _finish_frame(connection, rollback=True)
+            raise
+        else:
+            try:
+                _finish_frame(connection, rollback=False)
+            except BaseException:
+                # COMMIT may fail (e.g. disk full); do not leave partial work.
+                if connection.in_transaction:
+                    connection.rollback()
+                _transaction_local.frames.pop(connection, None)
+                raise
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -64,16 +149,13 @@ def run_sqlite_write_with_retry(
     retry budget are propagated to the caller for normal error handling.
     """
     max_attempts = len(_SQLITE_LOCK_RETRY_DELAYS) + 1
-    caller_transaction_open = connection.in_transaction
     for attempt in range(max_attempts):
         retry = False
         with SQLITE_WRITE_LOCK:
+            caller_transaction_open = connection.in_transaction
             try:
                 return callback()
-            except sqlite3.OperationalError as error:
-                if not is_sqlite_lock_error(error) or attempt >= max_attempts - 1:
-                    raise
-                retry = True
+            except Exception as error:
                 # A repository may be called inside a caller-owned savepoint
                 # (standard snapshot code supports this).  Only roll back a
                 # transaction opened by this operation; the callback owns the
@@ -81,13 +163,16 @@ def run_sqlite_write_with_retry(
                 if not caller_transaction_open:
                     try:
                         if connection.in_transaction:
-                            connection.rollback()
+                            rollback_sqlite(connection)
                     except sqlite3.Error:
                         logger.warning(
                             "SQLite lock retry rollback failed | operation=%s",
                             operation,
                             exc_info=True,
                         )
+                if caller_transaction_open or not is_sqlite_lock_error(error) or attempt >= max_attempts - 1:
+                    raise
+                retry = True
         if retry:
             delay = _SQLITE_LOCK_RETRY_DELAYS[attempt]
             logger.warning(

@@ -322,8 +322,8 @@ def dashboard():
         )
 
     trend_by_date: dict[str, dict[str, int]] = {}
-    temperature_by_device: dict[str, list[float]] = {}
-    humidity_by_device: dict[str, list[float]] = {}
+    temperature_by_device: dict[str, list[tuple[float, int]]] = {}
+    humidity_by_device: dict[str, list[tuple[float, int]]] = {}
     for row in daily:
         date_key = str(row["local_date"])
         bucket = trend_by_date.setdefault(
@@ -336,22 +336,22 @@ def dashboard():
         if row["avg_temperature"] is not None:
             temperature_by_device.setdefault(
                 str(row["device"]), []
-            ).append(row["avg_temperature"])
+            ).append((row["temperature_sum"], row["temperature_sample_count"]))
         if row["avg_humidity"] is not None:
             humidity_by_device.setdefault(
                 str(row["device"]), []
-            ).append(row["avg_humidity"])
+            ).append((row["humidity_sum"], row["humidity_sample_count"]))
 
     # Unified device axis: every dataset is aligned to the same sorted device
     # list with None for missing values, so a device that has temperature but
     # no humidity (or vice versa) can never shift the other series' labels.
     devices_axis = sorted(set(temperature_by_device) | set(humidity_by_device))
 
-    def _window_average(values_by_device: dict[str, list[float]], device: str):
+    def _window_average(values_by_device: dict[str, list[tuple[float, int]]], device: str):
         values = values_by_device.get(device)
         if not values:
             return None
-        return round(sum(values) / len(values), 2)
+        return round(sum(total for total, _ in values) / sum(count for _, count in values), 2)
 
     payload = {
         "trend": {

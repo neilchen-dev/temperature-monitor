@@ -16,6 +16,8 @@ from repositories.sqlite import (
     run_sqlite_write_with_retry,
 )
 
+from repositories.sqlite import begin_sqlite_write, commit_sqlite, rollback_sqlite
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS automation_tasks (
@@ -170,7 +172,7 @@ class SQLiteAutomationTaskRepository:
             raise ValueError(f"unsupported runtime mode: {mode!r}")
         current_time = now or datetime.now().astimezone()
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 previous = self.connection.execute(
                     "SELECT * FROM automation_runtime_state WHERE singleton_id = 1"
@@ -208,9 +210,9 @@ class SQLiteAutomationTaskRepository:
                         _datetime_text(current_time),
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
             except Exception:
-                self.connection.rollback()
+                rollback_sqlite(self.connection)
                 raise
         return self.runtime_context()
 
@@ -757,7 +759,7 @@ class SQLiteAutomationTaskRepository:
                 """,
                 params,
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
         return max(cursor.rowcount, 0)
 
     @retry_sqlite_write
@@ -781,7 +783,7 @@ class SQLiteAutomationTaskRepository:
         now_text = _datetime_text(current_time)
         stale_cutoff = _datetime_text(current_time - stale_after)
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 cursor = self.connection.execute(
                     """
@@ -809,9 +811,9 @@ class SQLiteAutomationTaskRepository:
                         stale_cutoff,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
             except Exception:
-                self.connection.rollback()
+                rollback_sqlite(self.connection)
                 raise
         return max(cursor.rowcount, 0)
 
@@ -912,7 +914,7 @@ class SQLiteAutomationTaskRepository:
                     """,
                     values,
                 )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
             if dedupe_key is not None:
                 row = self.connection.execute(
@@ -970,7 +972,7 @@ class SQLiteAutomationTaskRepository:
         )
         with self._lock:
             created_mode, active_epoch = self._creation_metadata()
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 if task_type == "RECONCILE_ALARM_EVENT":
                     # Reconciliation identity is one local alarm cycle, not
@@ -1070,7 +1072,7 @@ class SQLiteAutomationTaskRepository:
                         # cycle. Preserve its due_at so exponential backoff
                         # remains effective; the base key can be reclaimed
                         # after the retry reaches a terminal state.
-                        self.connection.commit()
+                        commit_sqlite(self.connection)
                         return self._require(winner["id"])
 
                     self._release_dedupe_key_from_other_row(
@@ -1100,7 +1102,7 @@ class SQLiteAutomationTaskRepository:
                                 _datetime_text(due_at),
                             ),
                         )
-                    self.connection.commit()
+                    commit_sqlite(self.connection)
                     return self._require(winner["id"])
 
                 self._release_dedupe_key_from_other_row(
@@ -1131,11 +1133,11 @@ class SQLiteAutomationTaskRepository:
                         active_epoch,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(task_id)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     def get_unfinished_by_dedupe_key(self, dedupe_key: str) -> AutomationTask | None:
@@ -1187,6 +1189,7 @@ class SQLiteAutomationTaskRepository:
         limit: int = 20,
         worker_id: str = "scheduler",
         lease_for: timedelta = timedelta(minutes=5),
+        exclude_task_ids: tuple[str, ...] = (),
     ) -> tuple[AutomationTask, ...]:
         """Atomically claim due tasks, including expired leases."""
         if limit <= 0:
@@ -1197,22 +1200,26 @@ class SQLiteAutomationTaskRepository:
             raise ValueError("lease_for must be positive")
         now_text = _datetime_text(now)
         lease_until_text = _datetime_text(now + lease_for)
+        exclusion = ""
+        if exclude_task_ids:
+            exclusion = " AND id NOT IN (" + ",".join("?" for _ in exclude_task_ids) + ")"
         # Re-check at claim time as a restart-safe last line of defence.  A
         # task inserted by a previous mode/epoch is moved to LEGACY_PENDING
         # before it can enter RUNNING, even if startup reconciliation raced
         # with the first scheduler poll.
         self.quarantine_legacy_external_tasks(now=now)
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 rows = self.connection.execute(
                     """
                     SELECT id FROM automation_tasks
-                    WHERE (
+                    WHERE ((
                         status = ? AND due_at <= ?
                     ) OR (
                         status = ? AND lease_until IS NOT NULL AND lease_until <= ?
-                    )
+                    ))
+                    """ + exclusion + """
                     ORDER BY due_at, id
                     LIMIT ?
                     """,
@@ -1221,6 +1228,7 @@ class SQLiteAutomationTaskRepository:
                         now_text,
                         AutomationTaskStatus.RUNNING.value,
                         now_text,
+                        *exclude_task_ids,
                         limit,
                     ),
                 ).fetchall()
@@ -1251,9 +1259,9 @@ class SQLiteAutomationTaskRepository:
                             now_text,
                         ),
                     )
-                self.connection.commit()
+                commit_sqlite(self.connection)
             except Exception:
-                self.connection.rollback()
+                rollback_sqlite(self.connection)
                 raise
 
             claimed = [self.get(task_id) for task_id in task_ids]
@@ -1286,7 +1294,7 @@ class SQLiteAutomationTaskRepository:
                 (_datetime_text(due_at), _datetime_text(updated_at),
                  json.dumps(dict(payload)), task.task_id, task.worker_id),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
             if cursor.rowcount != 1:
                 raise TaskStateError("reconciliation task ownership was lost")
 
@@ -1329,7 +1337,7 @@ class SQLiteAutomationTaskRepository:
                     task_id,
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
             return self._require(task_id)
 
     @retry_sqlite_write
@@ -1367,7 +1375,7 @@ class SQLiteAutomationTaskRepository:
                     task_id,
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
             return self._require(task_id)
 
     def _require(self, task_id: str) -> AutomationTask:
@@ -1423,7 +1431,7 @@ def purge_finished_automation_tasks(
             ")",
             (_datetime_text(cutoff), limit),
         )
-        connection.commit()
+        commit_sqlite(connection)
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
     return run_sqlite_write_with_retry(

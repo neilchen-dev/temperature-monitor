@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
 import sqlite3
+import time
 from typing import Callable, Mapping
 
 from domain.models import AutomationTask
-from repositories.automation_tasks import SQLiteAutomationTaskRepository
+from repositories.automation_tasks import SQLiteAutomationTaskRepository, TaskStateError
 from repositories.sqlite import is_sqlite_lock_error
 
 
@@ -60,24 +61,43 @@ class TaskScheduler:
         limit: int = 20,
     ) -> SchedulerRunReport:
         current_time = now or self.now_provider()
-        tasks = self.repository.claim_due(
-            now=current_time,
-            limit=limit,
-            worker_id=self.worker_id,
-            lease_for=self.lease_for,
-        )
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        started = time.monotonic()
+
+        def clock_now() -> datetime:
+            # Explicit `now` remains a usable simulation clock while elapsed
+            # handler time still counts towards lease validity.
+            if now is not None:
+                return current_time + timedelta(seconds=time.monotonic() - started)
+            return self.now_provider()
+
+        processed: list[str] = []
         succeeded = 0
         failed = 0
         skipped = 0
-        for task in tasks:
+        for _ in range(limit):
+            tasks = self.repository.claim_due(
+                now=clock_now(), limit=1, worker_id=self.worker_id,
+                lease_for=self.lease_for, exclude_task_ids=tuple(processed),
+            )
+            if not tasks:
+                break
+            task = tasks[0]
+            processed.append(task.task_id)
             handler = self.handlers.get(task.task_type)
             if handler is None:
-                self.repository.mark_failed(
-                    task.task_id,
-                    finished_at=current_time,
-                    error=f"no handler for task type {task.task_type}",
-                    worker_id=self.worker_id,
-                )
+                try:
+                    self.repository.mark_failed(
+                        task.task_id,
+                        finished_at=clock_now(),
+                        error=f"no handler for task type {task.task_type}",
+                        worker_id=self.worker_id,
+                    )
+                except TaskStateError:
+                    logger.warning("Task failure lost lease | task_id=%s", task.task_id)
+                    skipped += 1
+                    continue
                 failed += 1
                 continue
             try:
@@ -89,22 +109,34 @@ class TaskScheduler:
                     # its identity and backoff. Do not overwrite with FAILED.
                     failed += 1
                     continue
-                self.repository.mark_failed(
-                    task.task_id,
-                    finished_at=current_time,
-                    error=str(exc),
-                    worker_id=self.worker_id,
-                )
+                try:
+                    self.repository.mark_failed(
+                        task.task_id,
+                        finished_at=clock_now(),
+                        error=str(exc),
+                        worker_id=self.worker_id,
+                    )
+                except TaskStateError:
+                    logger.warning("Task failure lost lease | task_id=%s", task.task_id)
+                    skipped += 1
+                    continue
                 failed += 1
                 continue
-            self.repository.mark_succeeded(
-                task.task_id,
-                finished_at=current_time,
-                worker_id=self.worker_id,
-            )
+            try:
+                self.repository.mark_succeeded(
+                    task.task_id,
+                    finished_at=clock_now(),
+                    worker_id=self.worker_id,
+                )
+            except TaskStateError:
+                # Leave expired/stolen leases available to their current owner
+                # or recovery; never report an uncommitted success.
+                logger.warning("Task completion lost lease | task_id=%s", task.task_id)
+                skipped += 1
+                continue
             succeeded += 1
         return SchedulerRunReport(
-            claimed=len(tasks),
+            claimed=len(processed),
             succeeded=succeeded,
             failed=failed,
             skipped=skipped,

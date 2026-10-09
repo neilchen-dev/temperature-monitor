@@ -179,12 +179,13 @@ class ApiRouteTests(unittest.TestCase):
         self.assertEqual(filtered["count"], 0)
 
     def test_system_status_shape_and_no_sensitive_fields(self) -> None:
+        self._set_key()
         with patch("routes.api.get_collector_status") as status:
             status.return_value = {
                 "modbus": {"enabled": True, "running": False,
                            "last_success": None, "last_error_summary": None}
             }
-            response = self.client.get("/api/system/status")
+            response = self.client.get("/api/system/status", headers=self.headers)
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["status"], "ok")

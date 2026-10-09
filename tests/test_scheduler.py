@@ -78,6 +78,35 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertEqual(reclaimed[0].worker_id, "worker-b")
 
+    def test_waiting_tasks_receive_fresh_leases_and_actual_completion_times(self) -> None:
+        ids = [self._create(f"fresh-{index}") for index in range(2)]
+        clock = [self.now]
+        def handle(task):
+            clock[0] += timedelta(seconds=40)
+        scheduler = TaskScheduler(
+            repository=self.repository, handlers={"VERIFY_ALARM": handle},
+            now_provider=lambda: clock[0], lease_for=timedelta(seconds=60),
+        )
+        report = scheduler.run_once()
+        self.assertEqual(report.succeeded, 2)
+        finished = sorted(self.repository.get(task_id).finished_at for task_id in ids)
+        self.assertEqual(finished, [self.now + timedelta(seconds=40),
+                                    self.now + timedelta(seconds=80)])
+
+    def test_handler_exceeding_lease_is_not_marked_succeeded(self) -> None:
+        task_id = self._create("expired")
+        clock = [self.now]
+        def handle(task):
+            clock[0] += timedelta(seconds=61)
+        scheduler = TaskScheduler(
+            repository=self.repository, handlers={"VERIFY_ALARM": handle},
+            now_provider=lambda: clock[0], lease_for=timedelta(seconds=60),
+        )
+        report = scheduler.run_once()
+        self.assertEqual(report.succeeded, 0)
+        self.assertEqual(report.skipped, 1)
+        self.assertEqual(self.repository.get(task_id).status.value, "RUNNING")
+
 
 if __name__ == "__main__":
     unittest.main()

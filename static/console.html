@@ -534,24 +534,30 @@
     els.connText.textContent = text;
   }
 
+  function apiRequest(path, options) {
+    var controller = new AbortController();
+    var timeout = setTimeout(function () { controller.abort(); }, 15000);
+    options.signal = controller.signal;
+    return fetch(path, options).then(function (res) {
+      return res.json().catch(function (error) {
+        if (error.name === "AbortError") throw error;
+        return {};
+      }).then(function (data) {
+        return { status: res.status, ok: res.ok, data: data };
+      });
+    }).finally(function () { clearTimeout(timeout); });
+  }
+
   function apiGet(path) {
     var headers = {};
     if (state.key) headers["X-History-Key"] = state.key;
-    return fetch(path, { headers: headers }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        return { status: res.status, ok: res.ok, data: data };
-      });
-    });
+    return apiRequest(path, { headers: headers });
   }
 
   function apiPatch(path, body) {
     var headers = { "Content-Type": "application/json" };
     if (state.key) headers["X-History-Key"] = state.key;
-    return fetch(path, { method: "PATCH", headers: headers, body: JSON.stringify(body) }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        return { status: res.status, ok: res.ok, data: data };
-      });
-    });
+    return apiRequest(path, { method: "PATCH", headers: headers, body: JSON.stringify(body) });
   }
 
   // ---- 判定与格式化 ----
@@ -939,7 +945,9 @@
     box.appendChild(empty);
   }
 
+  var trendRequestId = 0;
   function loadTrend() {
+    var requestId = ++trendRequestId;
     if (!state.trendSelection) {
       els.trendMeta.textContent = "暂无设备，无法加载趋势";
       chartFallback(els.tempChartBox, "无数据");
@@ -947,6 +955,12 @@
       return;
     }
     var sel = state.trendSelection;
+    var selectedWindow = state.trendWindow;
+    var selectedKey = state.key;
+    function isCurrent() {
+      return requestId === trendRequestId && state.trendSelection === sel
+        && state.trendWindow === selectedWindow && state.key === selectedKey;
+    }
     var end = Date.now();
     var start = end - WINDOW_MS[state.trendWindow];
     els.trendMeta.textContent = "加载中…";
@@ -954,7 +968,8 @@
     // 主数据源：飞书业务快照（10 分钟粒度，TH 设备全覆盖，支持 30 天窗口）
     var snapUrl = "/history/query?device=" + encodeURIComponent(sel.device_id)
       + "&start=" + start + "&end=" + end + "&limit=10000";
-    apiGet(snapUrl).then(function (res) {
+    return apiGet(snapUrl).then(function (res) {
+      if (!isCurrent()) return;
       if (res.ok && res.data.count > 0) {
         renderTrend(res.data.items, "业务快照（10 分钟粒度）");
         return;
@@ -962,7 +977,8 @@
       // 回退：本地实时采集样本（覆盖 Modbus 等无快照设备，最多 1000 条）
       var sampleUrl = "/api/devices/" + encodeURIComponent(sel.device_id)
         + "?source=" + encodeURIComponent(sel.source) + "&limit=1000";
-      apiGet(sampleUrl).then(function (sampleRes) {
+      return apiGet(sampleUrl).then(function (sampleRes) {
+        if (!isCurrent()) return;
         if (!sampleRes.ok) {
           els.trendMeta.textContent = "趋势加载失败："
             + (sampleRes.data.error || ("HTTP " + sampleRes.status));
@@ -977,7 +993,7 @@
         renderTrend(inWindow.reverse(), "实时采集样本（最多 1000 条）");
       });
     }).catch(function () {
-      els.trendMeta.textContent = "趋势加载失败：网络错误";
+      if (isCurrent()) els.trendMeta.textContent = "趋势加载失败：网络错误";
     });
   }
 
@@ -1632,6 +1648,7 @@
   }
 
   function refresh() {
+    if (state.refreshing) return;
     loadSystemStatus();
     els.toolbarConfigureBtn.hidden = !!state.key;
     if (!state.key) {
@@ -1648,12 +1665,12 @@
       }
       return;
     }
-    if (state.refreshing) return;
     state.refreshing = true;
+    function unavailable() { return { status: 0, ok: false, data: {} }; }
     Promise.all([
-      apiGet("/api/devices"),
-      apiGet("/api/events?limit=50"),
-      apiGet("/api/thresholds"),
+      apiGet("/api/devices").catch(unavailable),
+      apiGet("/api/events?limit=50").catch(unavailable),
+      apiGet("/api/thresholds").catch(unavailable),
     ]).then(function (results) {
       state.refreshing = false;
       var devicesRes = results[0], eventsRes = results[1], thresholdsRes = results[2];
@@ -1678,7 +1695,8 @@
           state.thresholds[t.device] = t;
         });
       }
-      setConn("ok", "已连接");
+      setConn(eventsRes.ok && thresholdsRes.ok ? "ok" : "warn",
+        eventsRes.ok && thresholdsRes.ok ? "已连接" : "设备已更新，部分接口暂不可用");
       els.lastRefresh.textContent = "刷新于 "
         + new Date().toLocaleTimeString("zh-CN", { hour12: false });
       renderKpis();

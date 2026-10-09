@@ -128,7 +128,8 @@ jobs:
             # 禁止 git clean -fdx：.env、data/、logs/ 必须保留。
             if [ -d .git ]; then
               git fetch origin main
-              git reset --hard origin/main
+              git cat-file -e "${IMAGE_TAG}^{commit}"
+              git reset --hard "${IMAGE_TAG}"
             fi
 
             # 安全读取 .env 中的 PORT（不 source .env，避免特殊字符破坏 shell）
@@ -150,10 +151,15 @@ jobs:
 
             # 记录旧镜像，用于失败回滚
             OLD_IMAGE=$(docker inspect temperature-monitor --format='{{.Config.Image}}' 2>/dev/null || true)
+            OLD_IMAGE_ID=$(docker inspect temperature-monitor --format='{{.Image}}' 2>/dev/null || true)
             OLD_TAG=$(grep -E '^IMAGE_TAG=' .env | tail -n 1 | cut -d= -f2 | tr -d '\r' || true)
             echo "Previous image: ${OLD_IMAGE:-none}"
 
             IMAGE_REPOSITORY="${REGISTRY}/${IMAGE_NAME}"
+            export DEPLOY_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+            compose_release() {
+              docker compose -f compose.yaml -f compose.deploy.yaml "$@"
+            }
 
             echo "Deployment SQLite backup and full-database scan are disabled"
 
@@ -175,8 +181,19 @@ jobs:
               # override the restored .env value during Compose interpolation.
               # Pull explicitly so a failed deployment cannot leave the new
               # image running while merely reporting a rollback.
-              env -u IMAGE_TAG docker compose pull || true
-              if env -u IMAGE_TAG docker compose up -d --remove-orphans --wait --wait-timeout 600; then
+              if [ -n "${OLD_IMAGE_ID}" ] && docker image inspect "${OLD_IMAGE_ID}" >/dev/null 2>&1; then
+                # Pin rollback to the exact previous contents even if its tag moved.
+                DEPLOY_IMAGE="temperature-monitor:rollback-${OLD_IMAGE_ID#sha256:}"
+                export DEPLOY_IMAGE
+                docker tag "${OLD_IMAGE_ID}" "${DEPLOY_IMAGE}"
+              elif [ -n "${OLD_IMAGE}" ]; then
+                export DEPLOY_IMAGE="${OLD_IMAGE}"
+                compose_release pull || true
+              else
+                echo "ERROR: no previous image is available for rollback"
+                exit 1
+              fi
+              if compose_release up -d --remove-orphans --pull never --wait --wait-timeout 600; then
                 echo "Rolled back to ${ROLLBACK_TAG}"
               else
                 echo "ERROR: rollback to ${ROLLBACK_TAG} could not be verified"
@@ -191,12 +208,17 @@ jobs:
               echo "IMAGE_TAG=${IMAGE_TAG}" >> .env
             fi
 
-            docker compose pull || rollback
+            compose_release pull || rollback
 
             # 不使用 down -v；data/ 与 logs/ 挂载卷中的 SQLite 数据和日志保持不动
-            docker compose up -d --remove-orphans --wait --wait-timeout 600 || rollback
+            compose_release up -d --remove-orphans --wait --wait-timeout 600 || rollback
 
-            docker compose ps
+            compose_release ps
+            RUNNING_IMAGE=$(docker inspect temperature-monitor --format='{{.Config.Image}}')
+            if [ "${RUNNING_IMAGE}" != "${DEPLOY_IMAGE}" ]; then
+              echo "ERROR: running image does not match the requested release"
+              rollback
+            fi
 
             if ! HEALTH_STATUS=$(curl --connect-timeout 3 --max-time 5 \
               --fail --silent --show-error --retry 10 --retry-delay 3 \

@@ -199,7 +199,8 @@ class TemperatureRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["record_type"], "HEARTBEAT")
-        dispatch.assert_called_once()
+        dispatch.assert_not_called()
+        self.assertEqual(len(db.fetch_pending_heartbeats()), 1)
         self.assertEqual(db.fetch_device_samples("DEV-01"), [])
         presence = db.fetch_latest_device_presence()
         self.assertEqual(len(presence), 1)

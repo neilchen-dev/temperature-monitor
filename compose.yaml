@@ -1,6 +1,6 @@
 services:
   temperature-monitor:
-    image: ${IMAGE_REPOSITORY:-your-registry.example.com/your-namespace/temperature-monitor}:${IMAGE_TAG:-latest}
+    image: temperature-monitor:latest
     container_name: temperature-monitor
     restart: unless-stopped
     env_file:

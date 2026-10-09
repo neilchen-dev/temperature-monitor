@@ -80,6 +80,7 @@ the caller falls back to legacy semantics.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timedelta
@@ -88,7 +89,7 @@ from typing import Any
 import requests
 
 import config
-from domain.models import MonitorSample
+from domain.models import DataQualityStatus, MonitorSample
 from services import db, devices
 from services.feishu import FeishuAPIError, resolve_record_id, update_feishu_fields
 
@@ -510,6 +511,38 @@ def ensure_projection_tasks(task_repository: Any, now: datetime | None = None) -
         logger.exception("FEISHU_PROJECTION 任务扫描失败；下一 tick 重试")
 
 
+def recover_pending_heartbeats(now: datetime | None = None) -> None:
+    """Deliver durable heartbeats on the scheduler; acknowledge only success."""
+    blocked: set[str] = set()
+    try:
+        for row in db.fetch_pending_heartbeats():
+            device = row["device"]
+            if device in blocked:
+                continue
+            try:
+                presence = json.loads(row["presence_json"])
+                observed = datetime.fromtimestamp(row["heartbeat_time_ms"] / 1000).astimezone()
+                measurement_ms = presence.get("last_measurement_at_ms")
+                status = presence["availability"]
+                sample = MonitorSample(
+                    device_id=device, sample_time=observed,
+                    temperature=presence.get("temperature") if status != devices.STATUS_OFFLINE else None,
+                    humidity=presence.get("humidity") if status != devices.STATUS_OFFLINE else None,
+                    online_status=status, availability=status, record_type="HEARTBEAT",
+                    heartbeat_time=observed,
+                    measurement_time=(datetime.fromtimestamp(measurement_ms / 1000).astimezone()
+                                      if measurement_ms is not None else None),
+                    data_quality=DataQualityStatus.OFFLINE if status == devices.STATUS_OFFLINE else None,
+                )
+                if devices.dispatch_sample(sample) is False or not db.acknowledge_heartbeat(row["id"]):
+                    blocked.add(device)
+            except Exception:
+                blocked.add(device)
+                logger.exception("心跳派发失败，保留队列 | device=%s", device)
+    except Exception:
+        logger.exception("心跳队列恢复失败；下一 tick 重试")
+
+
 def recover_pending_dispatches(now: datetime | None = None) -> None:
     """Dispatch projected samples that are not dispatched yet (every tick).
 
@@ -649,7 +682,9 @@ def dispatch_projected_sample(
         )
         return False
 
-    devices.dispatch_sample(sample)
+    if devices.dispatch_sample(sample) is False:
+        logger.warning("sample dispatch not acknowledged | device=%s | sample_time_ms=%s", device, sample_time_ms)
+        return False
     advanced = db.mark_projection_dispatched(device, sample_time_ms)
     if not advanced:
         # A previous crash between notify and mark could leave a higher

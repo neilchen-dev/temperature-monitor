@@ -437,11 +437,11 @@ class ShadowRuntime:
         except sqlite3.Error:
             logger.exception("关闭 Shadow Runtime SQLite 连接失败")
 
-    def handle_sample(self, sample: MonitorSample) -> MonitorHandlingResult | None:
+    def handle_sample(self, sample: MonitorSample) -> MonitorHandlingResult | bool | None:
         """Route one normalized acquisition sample into the Shadow pipeline."""
         device_id = sample.device_id.strip().upper()
         if not self._accepting_samples:
-            return None
+            return False
         if device_id not in self.devices:
             # 这里是"只有 TH-10 有 SHADOW_COMPARE"的直接根因路径：
             # 白名单外的设备直接丢弃。每台设备只提示一次，日志包含
@@ -461,11 +461,15 @@ class ShadowRuntime:
             else replace(sample, device_id=device_id)
         )
         with self._execution_lock:
+            if not self._accepting_samples:
+                return False
             result = self.monitor_service.handle_sample(
                 device=self.devices[device_id],
                 sample=normalized_sample,
                 now=self.now_provider(),
             )
+            if result is None:
+                return None
             active_events = self.event_repository.list_active(device_id=device_id)
             expected = expected_state_from(
                 device_id=device_id,
@@ -1344,6 +1348,7 @@ class ShadowRuntime:
         from services import projection
 
         projection.recover_pending_dispatches(now=now)
+        projection.recover_pending_heartbeats(now=now)
         projection.ensure_projection_tasks(self.task_repository, now=now)
 
     def _request_device_status_projection(

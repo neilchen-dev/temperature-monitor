@@ -296,6 +296,7 @@ def sample_history(now: datetime | None = None) -> tuple[dict[str, Any], int]:
 
         for device in EXPECTED_HISTORY_DEVICES:
             table_id = config.HISTORY_TABLE_MAP[device]
+            external_attempted = False
             try:
                 if device not in _latest_sample_cache:
                     latest_raw = get_latest_history_timestamp(table_id)
@@ -309,15 +310,28 @@ def sample_history(now: datetime | None = None) -> tuple[dict[str, Any], int]:
                     continue
 
                 history_fields = build_history_fields(snapshots[device], sample_time)
+                # Capture locally before the external effect. A local failure
+                # must not advance the remote watermark or the dedupe cache.
+                if config.SQLITE_ENABLED and not db.save_history_snapshot(
+                    device, sample_time, history_fields
+                ):
+                    raise RuntimeError("SQLite 历史快照保存失败，未发送飞书")
+                if config.SQLITE_ENABLED:
+                    captured = db.fetch_history_snapshot_fields(device, history_fields["采集时间"])
+                    if captured is None:
+                        raise RuntimeError("SQLite 历史快照读取失败，未发送飞书")
+                    history_fields = captured
+                external_attempted = True
                 result = create_history_record(table_id, history_fields)
                 if int(result.get("code", -1)) != 0:
                     raise RuntimeError(
                         f"code={result.get('code')}, msg={result.get('msg')}"
                     )
-                db.save_history_snapshot(device, sample_time, history_fields)
                 _latest_sample_cache[device] = sample_time
                 created.append(device)
             except Exception as exc:
+                if external_attempted:
+                    _latest_sample_cache.pop(device, None)
                 logger.exception("历史快照写入失败 | device=%s", device)
                 failures[device] = str(exc)
 

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
+from repositories.sqlite import begin_sqlite_write, commit_sqlite, rollback_sqlite
 
 
 class EnvironmentEventStatus(str):
@@ -37,6 +38,7 @@ class EnvironmentEventRecord:
     opened_at: datetime
     closed_at: datetime | None
     payload: Mapping[str, Any]
+
 
 
 _SCHEMA = """
@@ -118,13 +120,13 @@ class SQLiteEnvironmentEventRepository:
             separators=(",", ":"),
         )
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 existing = self._find_by_key(event_key)
                 if existing is None:
                     existing = self._find_active(device_id)
                 if existing is not None:
-                    self.connection.commit()
+                    commit_sqlite(self.connection)
                     return existing
 
                 event_id = uuid.uuid4().hex
@@ -148,15 +150,15 @@ class SQLiteEnvironmentEventRepository:
                 except sqlite3.IntegrityError:
                     # A separate connection may have won after this process
                     # began.  Roll back before reading the committed winner.
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                     existing = self._find_by_key(event_key) or self._find_active(device_id)
                     if existing is None:
                         raise
                     return existing
-                self.connection.commit()
+                commit_sqlite(self.connection)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
             return self._require(event_id)
 
@@ -181,7 +183,7 @@ class SQLiteEnvironmentEventRepository:
                     EnvironmentEventStatus.CLOSED,
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
             if cursor.rowcount == 0:
                 record = self.get(event_id)
                 if record is None:
@@ -199,7 +201,7 @@ class SQLiteEnvironmentEventRepository:
     ) -> EnvironmentEventRecord:
         """Close local tracking when the linked Feishu row was deleted."""
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
@@ -233,11 +235,11 @@ class SQLiteEnvironmentEventRepository:
                         event_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(event_id)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     def mark_recovered(
@@ -257,7 +259,7 @@ class SQLiteEnvironmentEventRepository:
     def patch_external_projection(self, event_id: str, **values: Any) -> EnvironmentEventRecord:
         """Merge projection metadata under a database write transaction."""
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
@@ -266,10 +268,10 @@ class SQLiteEnvironmentEventRepository:
                     "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
                     (json.dumps(payload, ensure_ascii=False), event_id),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(event_id)
             except Exception:
-                self.connection.rollback()
+                rollback_sqlite(self.connection)
                 raise
 
     @retry_sqlite_write
@@ -283,16 +285,16 @@ class SQLiteEnvironmentEventRepository:
         another POST.
         """
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
                 if payload.get("feishu_record_id"):
-                    self.connection.commit()
+                    commit_sqlite(self.connection)
                     return False
                 create_state = payload.get("feishu_create_state")
                 if payload.get("feishu_create_attempted") and create_state != ExternalCreateOutcome.RETRYABLE:
-                    self.connection.commit()
+                    commit_sqlite(self.connection)
                     return False
                 payload["feishu_create_attempted"] = True
                 payload["feishu_create_state"] = ExternalCreateOutcome.IN_FLIGHT
@@ -311,10 +313,10 @@ class SQLiteEnvironmentEventRepository:
                         event_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return True
             except Exception:
-                self.connection.rollback()
+                rollback_sqlite(self.connection)
                 raise
 
     @retry_sqlite_write
@@ -337,7 +339,7 @@ class SQLiteEnvironmentEventRepository:
         if outcome not in allowed:
             raise ValueError(f"unsupported external CREATE outcome: {outcome}")
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
@@ -365,11 +367,11 @@ class SQLiteEnvironmentEventRepository:
                         event_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(event_id)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     @retry_sqlite_write
@@ -383,7 +385,7 @@ class SQLiteEnvironmentEventRepository:
         if not record_id.strip():
             raise ValueError("record_id cannot be empty")
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
@@ -445,11 +447,11 @@ class SQLiteEnvironmentEventRepository:
                         event_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(event_id)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     def get_external_effect(
@@ -545,7 +547,7 @@ class SQLiteEnvironmentEventRepository:
         if not effect_key.strip():
             raise ValueError("effect_key cannot be empty")
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
@@ -553,7 +555,7 @@ class SQLiteEnvironmentEventRepository:
                 effects = dict(effects) if isinstance(effects, Mapping) else {}
                 existing = effects.get(effect_key)
                 if isinstance(existing, Mapping) and existing.get("status") == "SUCCEEDED":
-                    self.connection.commit()
+                    commit_sqlite(self.connection)
                     return record
                 marker = dict(existing) if isinstance(existing, Mapping) else {}
                 marker.update(values)
@@ -571,11 +573,11 @@ class SQLiteEnvironmentEventRepository:
                         event_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(event_id)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     @retry_sqlite_write
@@ -587,12 +589,12 @@ class SQLiteEnvironmentEventRepository:
     ) -> EnvironmentEventRecord:
         """Persist that this local cycle entered an external CREATE path."""
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 record = self._require(event_id)
                 payload = dict(record.payload)
                 if payload.get("feishu_record_id"):
-                    self.connection.commit()
+                    commit_sqlite(self.connection)
                     return record
                 payload["feishu_binding_status"] = "PENDING"
                 payload.setdefault("feishu_create_requested_at", _time_text(requested_at))
@@ -608,11 +610,11 @@ class SQLiteEnvironmentEventRepository:
                         event_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return self._require(event_id)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     def list_pending_external_bindings(self) -> tuple[EnvironmentEventRecord, ...]:
@@ -717,7 +719,7 @@ class SQLiteEnvironmentEventRepository:
                     _time_text(claimed_at),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
             if cursor.rowcount:
                 return True
             if self.get(event_id) is None:

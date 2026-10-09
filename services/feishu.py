@@ -9,6 +9,8 @@ import uuid
 from typing import Any, Mapping
 from urllib.parse import urlencode
 
+import requests
+
 import config
 from services.http_client import request_with_retry
 from services.token import clear_token, get_token
@@ -124,14 +126,21 @@ def _request_bitable_json(
             if json_data is not None:
                 headers["Content-Type"] = "application/json; charset=utf-8"
 
-            response = request_with_retry(
-                method,
-                url,
-                headers=headers,
-                json_data=json_data,
-                attempts=max_attempts,
-                timeout=timeout,
-            )
+            try:
+                response = request_with_retry(
+                    method,
+                    url,
+                    headers=headers,
+                    json_data=json_data,
+                    attempts=1,
+                    timeout=timeout,
+                )
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt >= attempts_limit:
+                    raise
+                time.sleep(config.REQUEST_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                attempt += 1
+                continue
             try:
                 result = response.json()
             except ValueError:
@@ -142,6 +151,10 @@ def _request_bitable_json(
                 }
 
             code = int(result.get("code", -1))
+            if code == 99991663:
+                # Cache invalidation costs no external call. A bounded task
+                # obtains a fresh token on its next scheduled attempt.
+                clear_token()
             if (
                 code == 99991663
                 and not token_refreshed
@@ -151,8 +164,8 @@ def _request_bitable_json(
                 # 会额外增加一次网络调用，破坏单次 handler 的耗时可预算
                 # 性；token 失效直接按失败返回，交给 backoff 调度下一次。
                 logger.warning("Token 无效，清空缓存后重试 | operation=%s", operation)
-                clear_token()
                 token_refreshed = True
+                attempt += 1
                 continue
 
             transient = (
@@ -764,7 +777,9 @@ def get_latest_history_timestamp(table_id: str) -> Any | None:
 def create_history_record(table_id: str, fields: dict[str, Any]) -> dict[str, Any]:
     """Create one history record with an idempotency token reused by retries."""
     _validate_bitable_config()
-    query = urlencode({"client_token": normalize_client_token(uuid.uuid4())})
+    query = urlencode({"client_token": normalize_client_token(
+        f"HISTORY:{table_id}:{normalize_field_value(fields.get('设备编号')).upper()}:{fields['采集时间']}"
+    )})
     return _request_bitable_json(
         "POST",
         f"{_bitable_table_url(table_id, '/records')}?{query}",

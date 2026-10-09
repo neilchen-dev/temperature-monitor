@@ -131,7 +131,7 @@ class RecordDiscoveryTests(unittest.TestCase):
         ):
             result = feishu.create_history_record(
                 "tbl_history",
-                {"设备编号": "TH-01"},
+                {"设备编号": "TH-01", "采集时间": 1791547200000},
             )
 
         self.assertEqual(result["code"], 0)

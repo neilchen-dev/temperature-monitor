@@ -420,6 +420,7 @@ def temperature_heartbeat():
         availability=final_status,
         temperature=temperature_value,
         humidity=humidity_value,
+        queue_for_dispatch=True,
     )
     if outcome.sample is None:
         logger.error(
@@ -435,7 +436,8 @@ def temperature_heartbeat():
 
     # Heartbeats have no Feishu projection.  They are runtime observations,
     # so existing alarm/prewarning timers continue to advance on stable data.
-    devices.dispatch_sample(outcome.sample)
+    # The scheduler owns delivery. Presence and the observation intent were
+    # committed together, so this request never waits for runtime/network I/O.
     logger.info(
         "heartbeat_received | device=%s | status=%s | heartbeat_time_ms=%s",
         bitable_device,

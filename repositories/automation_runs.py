@@ -12,6 +12,8 @@ from application.action_executor import ActionExecution
 from application.shadow import AutomationDiff
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write, run_sqlite_write_with_retry
 
+from repositories.sqlite import commit_sqlite
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS automation_runs (
@@ -105,7 +107,7 @@ class SQLiteAutomationRunRepository:
                 "CREATE INDEX IF NOT EXISTS idx_automation_runs_event "
                 "ON automation_runs(event_id)"
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def record(self, execution: ActionExecution) -> str:
@@ -187,7 +189,7 @@ class SQLiteAutomationRunRepository:
                 monitor_result.get("standard_source"),
             ),
         )
-        self.connection.commit()
+        commit_sqlite(self.connection)
         return run_id
 
     @retry_sqlite_write
@@ -230,7 +232,7 @@ class SQLiteAutomationRunRepository:
                 expected.get("standard_source"),
             ),
         )
-        self.connection.commit()
+        commit_sqlite(self.connection)
         return run_id
 
 
@@ -251,7 +253,7 @@ def purge_automation_runs(
             ")",
             (cutoff.isoformat(), limit),
         )
-        connection.commit()
+        commit_sqlite(connection)
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
     return run_sqlite_write_with_retry(connection, "purge_automation_runs", delete)

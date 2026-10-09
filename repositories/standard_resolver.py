@@ -18,6 +18,8 @@ from domain.models import EnvironmentStandard, parse_control_type
 from domain.standard_resolver import StandardNotFoundError, select_standard
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
 
+from repositories.sqlite import begin_sqlite_write, commit_sqlite, rollback_sqlite
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS standard_versions (
@@ -210,7 +212,7 @@ class SQLiteStandardRepository:
         owns_transaction = not self.connection.in_transaction
         savepoint = f"standard_apply_{sync_id}"
         if owns_transaction:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
         else:
             self.connection.execute(f"SAVEPOINT {savepoint}")
         try:
@@ -246,12 +248,12 @@ class SQLiteStandardRepository:
                 ("SUCCEEDED", timestamp, snapshot_id, sync_id),
             )
             if owns_transaction:
-                self.connection.commit()
+                commit_sqlite(self.connection)
             else:
                 self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
             if owns_transaction:
-                self.connection.rollback()
+                rollback_sqlite(self.connection)
             else:
                 self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -286,7 +288,7 @@ class SQLiteStandardRepository:
                 _datetime_text(finished_at),
             ),
         )
-        self.connection.commit()
+        commit_sqlite(self.connection)
         return sync_id
 
     def _insert_or_validate_no_commit(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import math
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -46,9 +47,17 @@ def _parse_time_to_ms(raw: str | None) -> int | None:
         return None
     try:
         value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"无法解析时间参数: {raw}")
         if value > 10_000_000_000:
-            return int(value)
-        return int(value * 1000)
+            milliseconds = int(value)
+        else:
+            milliseconds = int(value * 1000)
+        if not -(2 ** 63) <= milliseconds < 2 ** 63:
+            raise ValueError(f"时间参数超出范围: {raw}")
+        return milliseconds
+    except OverflowError:
+        raise ValueError(f"时间参数超出范围: {raw}") from None
     except ValueError:
         pass
 
@@ -83,6 +92,8 @@ def query_snapshots():
     end_ms, parse_error = _parse_time_arg("end")
     if parse_error:
         return jsonify({"status": "error", "error": parse_error}), 400
+    if start_ms is not None and end_ms is not None and start_ms >= end_ms:
+        return jsonify({"status": "error", "error": "start 必须早于 end"}), 400
 
     device = request.args.get("device", "").strip().upper() or None
     # ``type=int`` yields None for non-numeric input; fall back to the default
@@ -118,6 +129,8 @@ def daily_stats():
     end_ms, parse_error = _parse_time_arg("end")
     if parse_error:
         return jsonify({"status": "error", "error": parse_error}), 400
+    if start_ms is not None and end_ms is not None and start_ms >= end_ms:
+        return jsonify({"status": "error", "error": "start 必须早于 end"}), 400
 
     device = request.args.get("device", "").strip().upper() or None
     days = request.args.get("days", default=7, type=int) or 7

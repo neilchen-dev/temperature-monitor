@@ -23,6 +23,9 @@ from domain.models import (
 from domain.operation import ActiveOperation, OperationAction, OperationObservation
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
 
+from repositories.sqlite import begin_sqlite_write, commit_sqlite, rollback_sqlite, sqlite_unit_of_work
+from services.event_identity import epoch_milliseconds
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS alarm_states (
@@ -200,7 +203,7 @@ class SQLiteAlarmStateRepository:
                     self.connection.execute(
                         f"ALTER TABLE alarm_states ADD COLUMN {column} {definition}"
                     )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def get(self, device_id: str) -> AlarmState | None:
         row = self.connection.execute(
@@ -270,7 +273,7 @@ class SQLiteAlarmStateRepository:
                     now.isoformat(),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def list_prewarning_states(self) -> tuple[AlarmState, ...]:
         """Return active/recent warning state without exposing recipients."""
@@ -322,7 +325,7 @@ class SQLitePrewarningEffectRepository:
         self._lock = SQLITE_WRITE_LOCK
         with self._lock:
             self.connection.executescript(_SCHEMA)
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def get(self, effect_key: str) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -435,7 +438,7 @@ class SQLitePrewarningEffectRepository:
                     json.dumps(metadata, ensure_ascii=False, sort_keys=True),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
 
 class SQLiteLatestSampleRepository:
@@ -463,13 +466,16 @@ class SQLiteLatestSampleRepository:
                     self.connection.execute(
                         f"ALTER TABLE latest_monitor_samples ADD COLUMN {column} {definition}"
                     )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def save(self, sample: MonitorSample) -> None:
         quality = sample.data_quality
         quality_value = quality.value if hasattr(quality, "value") else quality
-        with self._lock:
+        with sqlite_unit_of_work(self.connection):
+            latest = self.get(sample.device_id)
+            if latest is not None and epoch_milliseconds(sample.sample_time) < epoch_milliseconds(latest.sample_time):
+                return
             self.connection.execute(
                 """
                 INSERT INTO latest_monitor_samples (
@@ -501,7 +507,7 @@ class SQLiteLatestSampleRepository:
                     sample.availability or sample.online_status,
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def get(self, device_id: str) -> MonitorSample | None:
         row = self.connection.execute(
@@ -612,7 +618,7 @@ class SQLiteOperationRepository:
         ):
             return
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 self.connection.execute(
                     """
@@ -666,10 +672,10 @@ class SQLiteOperationRepository:
                         observation.source_record_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     @retry_sqlite_write
@@ -810,7 +816,7 @@ class SQLiteOperationRepository:
                 ),
             )
             self._audit_no_commit(observation, accepted=True, reason="accepted_newer_source_record")
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def record_stale(self, observation: OperationObservation) -> None:
@@ -820,7 +826,7 @@ class SQLiteOperationRepository:
                 accepted=False,
                 reason="stale_or_duplicate_source_record",
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def get(self, device: DeviceContext) -> OperationState:
         row = self.connection.execute(
@@ -897,7 +903,7 @@ class SQLiteOperationRepository:
     ) -> bool:
         """Record reminder delivery only while the same operation remains open."""
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            begin_sqlite_write(self.connection)
             try:
                 cursor = self.connection.execute(
                     """
@@ -929,11 +935,11 @@ class SQLiteOperationRepository:
                         source_record_id,
                     ),
                 )
-                self.connection.commit()
+                commit_sqlite(self.connection)
                 return cursor.rowcount == 1
             except Exception:
                 if self.connection.in_transaction:
-                    self.connection.rollback()
+                    rollback_sqlite(self.connection)
                 raise
 
     def _audit_no_commit(
@@ -991,7 +997,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     ADD COLUMN changed_fields_json TEXT NOT NULL DEFAULT '[]'
                     """
                 )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def get(self, device_id: str) -> dict[str, Any] | None:
         normalized = str(device_id).strip().upper()
@@ -1082,7 +1088,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     _time(updated_at),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
         return changed
 
     @retry_sqlite_write
@@ -1111,7 +1117,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     str(device_id).strip().upper(),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def mark_success(
@@ -1144,7 +1150,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     str(device_id).strip().upper(),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def mark_gated(
@@ -1192,7 +1198,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     str(device_id).strip().upper(),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def mark_failure(
@@ -1221,7 +1227,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     str(device_id).strip().upper(),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def mark_remote_record_deleted(
@@ -1250,7 +1256,7 @@ class SQLiteDeviceStatusProjectionRepository:
                     str(device_id).strip().upper(),
                 ),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     @retry_sqlite_write
     def mark_shadow_only(self, *, device_id: str, updated_at: datetime) -> None:
@@ -1266,7 +1272,7 @@ class SQLiteDeviceStatusProjectionRepository:
                 """,
                 (_time(updated_at), str(device_id).strip().upper()),
             )
-            self.connection.commit()
+            commit_sqlite(self.connection)
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute(

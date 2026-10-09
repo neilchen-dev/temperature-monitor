@@ -1,0 +1,4 @@
+# Production uses an explicit immutable image; compose.yaml keeps local defaults.
+services:
+  temperature-monitor:
+    image: ${DEPLOY_IMAGE:?Set DEPLOY_IMAGE to the release image}

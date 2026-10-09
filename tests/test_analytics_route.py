@@ -123,6 +123,25 @@ class AnalyticsRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_time_parameters_reject_nonfinite_overflow_and_reversed_ranges(self) -> None:
+        for endpoint in ("/history/query", "/history/stats/daily"):
+            for args in ("start=inf", "end=-inf", "start=nan", "start=1e309",
+                         "end=1e100", "start=2&end=1", "start=1&end=1"):
+                with self.subTest(endpoint=endpoint, args=args):
+                    response = self.client.get(f"{endpoint}?{args}", headers=self.HEADERS)
+                    self.assertEqual(response.status_code, 400)
+
+    def test_cross_device_time_query_uses_index_without_temporary_sort(self) -> None:
+        connection = db.peek_connection()
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM history_snapshots "
+            "WHERE sample_time_ms >= ? AND sample_time_ms < ? "
+            "ORDER BY sample_time_ms LIMIT 500", (0, 2 ** 62),
+        ).fetchall()
+        details = " ".join(row[3] for row in plan)
+        self.assertIn("idx_history_snapshots_time", details)
+        self.assertNotIn("TEMP B-TREE", details)
+
     def test_query_invalid_limit_falls_back_without_500(self) -> None:
         response = self.client.get(
             "/history/query?limit=abc",

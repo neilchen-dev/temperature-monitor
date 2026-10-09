@@ -34,13 +34,17 @@ Design notes / semantics:
 from __future__ import annotations
 
 import logging
+from functools import wraps
 import json
 import sqlite3
 from datetime import datetime
 from typing import Any
 
 import config
-from repositories.sqlite import SQLITE_WRITE_LOCK, connect as connect_runtime_sqlite
+from repositories.sqlite import (
+    SQLITE_WRITE_LOCK, connect as connect_runtime_sqlite,
+    commit_sqlite, rollback_sqlite, sqlite_unit_of_work,
+)
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -76,6 +80,8 @@ CREATE TABLE IF NOT EXISTS history_snapshots (
     created_at TEXT NOT NULL,
     PRIMARY KEY (device, sample_time_ms)
 );
+CREATE INDEX IF NOT EXISTS idx_history_snapshots_time
+    ON history_snapshots(sample_time_ms);
 
 CREATE TABLE IF NOT EXISTS device_samples (
     device TEXT NOT NULL,
@@ -106,6 +112,14 @@ CREATE TABLE IF NOT EXISTS device_presence (
 );
 CREATE INDEX IF NOT EXISTS idx_device_presence_device
     ON device_presence(device, source);
+
+CREATE TABLE IF NOT EXISTS heartbeat_dispatch_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device TEXT NOT NULL,
+    source TEXT NOT NULL,
+    heartbeat_time_ms INTEGER NOT NULL,
+    presence_json TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS device_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,7 +225,7 @@ def _apply_column_migrations(connection: sqlite3.Connection) -> None:
         }
         if column not in columns:
             connection.execute(ddl)
-            connection.commit()
+            commit_sqlite(connection)
             logger.info(
                 "SQLite 结构迁移：为 %s 补充列 %s | path=%s",
                 table, column, config.SQLITE_DB_PATH,
@@ -265,7 +279,7 @@ def _backfill_device_presence(connection: sqlite3.Connection) -> None:
         )
         """
     )
-    connection.commit()
+    commit_sqlite(connection)
 
 # Keep the existing name because every mirror helper already uses it. The
 # shared lock closes the gap between HTTP/projection writes and Runtime writes
@@ -292,7 +306,7 @@ def _get_connection() -> sqlite3.Connection | None:
             config.SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
             connection = connect_runtime_sqlite(config.SQLITE_DB_PATH)
             connection.executescript(_SCHEMA)
-            connection.commit()
+            commit_sqlite(connection)
             _apply_column_migrations(connection)
             _backfill_device_presence(connection)
             _connection = connection
@@ -348,6 +362,32 @@ def is_enabled() -> bool:
     return bool(config.SQLITE_ENABLED) and _get_connection() is not None
 
 
+class _MirrorWriteFailed(Exception):
+    def __init__(self, result):
+        self.result = result
+
+
+def _mirror_write(function):
+    """Keep caught failures inside an operation-owned rollback boundary."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _lock:
+            connection = _get_connection()
+            if connection is None:
+                return function(*args, **kwargs)
+            failures = _write_failures
+            try:
+                with sqlite_unit_of_work(connection):
+                    result = function(*args, **kwargs)
+                    if result is False or _write_failures != failures:
+                        raise _MirrorWriteFailed(result)
+                return result
+            except _MirrorWriteFailed as error:
+                return error.result
+    return wrapped
+
+
+@_mirror_write
 def register_feishu_record_binding(
     table_id: str,
     record_id: str,
@@ -391,7 +431,7 @@ def register_feishu_record_binding(
                     now,
                 ),
             )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         logger.exception(
@@ -429,6 +469,7 @@ def is_feishu_record_missing(table_id: str, record_id: str) -> bool:
         return False
 
 
+@_mirror_write
 def mark_feishu_record_missing(
     table_id: str,
     record_id: str,
@@ -570,7 +611,7 @@ def mark_feishu_record_missing(
                             event_row["event_id"],
                         ),
                     )
-            connection.commit()
+            commit_sqlite(connection)
         logger.warning(
             "Feishu record 已标记为远端删除 | table_id=%s | record_id=%s",
             normalized_table,
@@ -586,6 +627,7 @@ def mark_feishu_record_missing(
         return False
 
 
+@_mirror_write
 def save_temperature_report(
     device: str,
     temperature_c: Any,
@@ -619,7 +661,7 @@ def save_temperature_report(
                     feishu_message,
                 ),
             )
-            connection.commit()
+            commit_sqlite(connection)
     except sqlite3.Error:
         global _write_failures
         _write_failures += 1
@@ -638,21 +680,40 @@ _SNAPSHOT_COLUMN_MAP = (
 )
 
 
+def fetch_history_snapshot_fields(device: str, sample_time_ms: int) -> dict[str, Any] | None:
+    """Reuse the first captured payload when an external response is lost."""
+    connection = _get_connection()
+    if connection is None:
+        return None
+    with _lock:
+        row = connection.execute(
+            "SELECT * FROM history_snapshots WHERE device = ? AND sample_time_ms = ?",
+            (device, sample_time_ms),
+        ).fetchone()
+    if row is None:
+        return None
+    fields = {"设备编号": row["device"], "采集时间": row["sample_time_ms"],
+              "当前温度": row["temperature"], "当前湿度": row["humidity"]}
+    fields.update({field: row[column] for column, field in _SNAPSHOT_COLUMN_MAP})
+    return fields
+
+
+@_mirror_write
 def save_history_snapshot(
     device: str,
     sample_time: datetime,
     history_fields: dict[str, Any],
-) -> None:
-    """Mirror a history snapshot after its successful Feishu write.
+) -> bool:
+    """Persist a captured history snapshot independently of Feishu delivery.
 
     Keyed by (device, sample_time_ms) so repeated calls are idempotent.
     """
     if not config.SQLITE_ENABLED:
-        return
+        return False
 
     connection = _get_connection()
     if connection is None:
-        return
+        return False
 
     columns = ["device", "sample_time_ms", "sample_time_iso", "temperature", "humidity"]
     values: list[Any] = [
@@ -669,18 +730,21 @@ def save_history_snapshot(
     values.append(_now_text())
 
     placeholders = ", ".join("?" for _ in columns)
-    try:
-        with _lock:
+    with _lock:
+        try:
             connection.execute(
-                f"INSERT OR REPLACE INTO history_snapshots ({', '.join(columns)}) "
+                f"INSERT OR IGNORE INTO history_snapshots ({', '.join(columns)}) "
                 f"VALUES ({placeholders})",
                 values,
             )
-            connection.commit()
-    except sqlite3.Error:
-        global _write_failures
-        _write_failures += 1
-        logger.exception("SQLite 写入历史快照镜像失败 | device=%s", device)
+            commit_sqlite(connection)
+            return True
+        except sqlite3.Error:
+            rollback_sqlite(connection)
+            global _write_failures
+            _write_failures += 1
+            logger.exception("SQLite 写入历史快照镜像失败 | device=%s", device)
+            return False
 
 
 def fetch_history_snapshots(
@@ -772,9 +836,13 @@ def fetch_daily_stats(
             substr(sample_time_iso, 1, 10) AS local_date,
             device,
             COUNT(*) AS sample_count,
+            COUNT(temperature) AS temperature_sample_count,
+            SUM(temperature) AS temperature_sum,
             AVG(temperature) AS avg_temperature,
             MIN(temperature) AS min_temperature,
             MAX(temperature) AS max_temperature,
+            COUNT(humidity) AS humidity_sample_count,
+            SUM(humidity) AS humidity_sum,
             AVG(humidity) AS avg_humidity,
             MIN(humidity) AS min_humidity,
             MAX(humidity) AS max_humidity,
@@ -814,44 +882,38 @@ def fetch_daily_stats(
 def fetch_device_stats() -> list[dict[str, Any]]:
     """Per-device overview: last snapshot values, counts, and report recency.
 
-    Uses a ROW_NUMBER() window function (instead of SQLite-specific bare
-    columns with MAX) so the query stays portable to PostgreSQL/MySQL:
-    rn = 1 selects each device's latest snapshot by ``sample_time_ms``.
+    Aggregate counts once per device and join the latest row by primary key,
+    avoiding window calculations and sorting over every historical row.
     """
     connection = _get_connection()
     if connection is None:
         return []
 
     snapshot_sql = """
-        WITH ranked AS (
+        WITH totals AS (
             SELECT
                 device,
-                sample_time_ms,
-                sample_time_iso,
-                temperature,
-                humidity,
-                online_status,
-                ROW_NUMBER() OVER (
-                    PARTITION BY device
-                    ORDER BY sample_time_ms DESC
-                ) AS rn,
-                COUNT(*) OVER (PARTITION BY device) AS snapshot_count,
+                MAX(sample_time_ms) AS last_sample_ms,
+                COUNT(*) AS snapshot_count,
                 SUM(CASE WHEN online_status = '离线' THEN 1 ELSE 0 END)
-                    OVER (PARTITION BY device) AS offline_sample_count
+                    AS offline_sample_count
             FROM history_snapshots
+            GROUP BY device
         )
         SELECT
-            device,
-            snapshot_count,
-            offline_sample_count,
-            sample_time_ms AS last_sample_ms,
-            sample_time_iso AS last_sample_iso,
-            temperature AS last_temperature,
-            humidity AS last_humidity,
-            online_status AS last_online_status
-        FROM ranked
-        WHERE rn = 1
-        ORDER BY device
+            totals.device,
+            totals.snapshot_count,
+            totals.offline_sample_count,
+            totals.last_sample_ms,
+            latest.sample_time_iso AS last_sample_iso,
+            latest.temperature AS last_temperature,
+            latest.humidity AS last_humidity,
+            latest.online_status AS last_online_status
+        FROM totals
+        JOIN history_snapshots AS latest
+          ON latest.device = totals.device
+         AND latest.sample_time_ms = totals.last_sample_ms
+        ORDER BY totals.device
     """
     report_sql = """
         SELECT
@@ -899,6 +961,7 @@ def fetch_device_stats() -> list[dict[str, Any]]:
     return results
 
 
+@_mirror_write
 def save_device_sample(
     device: str,
     source: str,
@@ -958,7 +1021,7 @@ def save_device_sample(
                 temperature=temperature,
                 humidity=humidity,
             )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         global _write_failures
@@ -1009,6 +1072,7 @@ def _upsert_device_presence_locked(
     )
 
 
+@_mirror_write
 def save_device_heartbeat(
     *,
     device: str,
@@ -1017,6 +1081,7 @@ def save_device_heartbeat(
     availability: str,
     temperature: Any = None,
     humidity: Any = None,
+    queue_for_dispatch: bool = False,
 ) -> dict[str, Any] | None:
     """Persist liveness without adding a row to ``device_samples``."""
     connection = _get_connection()
@@ -1035,17 +1100,44 @@ def save_device_heartbeat(
                 temperature=temperature,
                 humidity=humidity,
             )
-            connection.commit()
             row = connection.execute(
                 "SELECT * FROM device_presence WHERE device = ? AND source = ?",
                 (device, source),
             ).fetchone()
+            if queue_for_dispatch and row is not None:
+                connection.execute(
+                    "INSERT INTO heartbeat_dispatch_outbox "
+                    "(device, source, heartbeat_time_ms, presence_json) VALUES (?, ?, ?, ?)",
+                    (device, source, int(heartbeat_at_ms), json.dumps(dict(row))),
+                )
+            commit_sqlite(connection)
         return dict(row) if row is not None else None
     except sqlite3.Error:
         global _write_failures
         _write_failures += 1
         logger.exception("SQLite 写入设备 heartbeat 失败 | device=%s", device)
         return None
+
+
+def fetch_pending_heartbeats(limit: int = 100) -> list[dict[str, Any]]:
+    connection = _get_connection()
+    if connection is None:
+        return []
+    with _lock:
+        return [dict(row) for row in connection.execute(
+            "SELECT * FROM heartbeat_dispatch_outbox ORDER BY id LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()]
+
+
+@_mirror_write
+def acknowledge_heartbeat(outbox_id: int) -> bool:
+    connection = _get_connection()
+    if connection is None:
+        return False
+    connection.execute("DELETE FROM heartbeat_dispatch_outbox WHERE id = ?", (outbox_id,))
+    commit_sqlite(connection)
+    return True
 
 
 def fetch_latest_device_presence() -> list[dict[str, Any]]:
@@ -1203,6 +1295,7 @@ def fetch_device_samples(
         return []
 
 
+@_mirror_write
 def save_device_event(
     device_id: str,
     event_type: str,
@@ -1235,7 +1328,7 @@ def save_device_event(
                     _now_text(),
                 ),
             )
-            connection.commit()
+            commit_sqlite(connection)
     except sqlite3.Error:
         global _write_failures
         _write_failures += 1
@@ -1304,6 +1397,7 @@ def fetch_device_summary() -> dict[str, Any]:
         return {"device_count": 0, "identity_count": 0, "last_sample_time_ms": None}
 
 
+@_mirror_write
 def save_device_threshold(
     device: str,
     temp_min: float | None,
@@ -1332,7 +1426,7 @@ def save_device_threshold(
                     _now_text(),
                 ),
             )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         logger.exception("SQLite 写入设备阈值失败 | device=%s", device)
@@ -1424,6 +1518,7 @@ def fetch_projection_states(
         return []
 
 
+@_mirror_write
 def save_projection_state(state: dict[str, Any]) -> bool:
     """Upsert one device's projection state (full-row replace)."""
     connection = _get_connection()
@@ -1452,7 +1547,7 @@ def save_projection_state(state: dict[str, Any]) -> bool:
                     _now_text(),
                 ),
             )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         logger.exception(
@@ -1461,6 +1556,7 @@ def save_projection_state(state: dict[str, Any]) -> bool:
         return False
 
 
+@_mirror_write
 def note_projection_sample(device: str, sample_time_ms: int) -> bool:
     """Advance ``last_sample_time_ms`` only (monotonic, targeted UPDATE).
 
@@ -1494,13 +1590,14 @@ def note_projection_sample(device: str, sample_time_ms: int) -> bool:
                         ") VALUES (?, ?, 'ok', 0, ?)",
                         (device, sample_time_ms, _now_text()),
                     )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         logger.exception("SQLite 更新投影样本时间失败 | device=%s", device)
         return False
 
 
+@_mirror_write
 def mark_projection_projected(device: str, sample_time_ms: int) -> bool:
     """Advance ``last_projected_sample_time_ms`` only (monotonic, targeted).
 
@@ -1537,7 +1634,7 @@ def mark_projection_projected(device: str, sample_time_ms: int) -> bool:
                         ") VALUES (?, ?, 'ok', 0, ?)",
                         (device, sample_time_ms, _now_text()),
                     )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         logger.exception("SQLite 更新投影成功水位失败 | device=%s", device)
@@ -1595,6 +1692,7 @@ def fetch_device_sample_at(
     return dict(row) if row else None
 
 
+@_mirror_write
 def mark_projection_dispatched(device: str, sample_time_ms: int) -> bool:
     """Advance ``last_dispatched_sample_time_ms`` only (monotonic, targeted).
 
@@ -1630,13 +1728,14 @@ def mark_projection_dispatched(device: str, sample_time_ms: int) -> bool:
                         (device, sample_time_ms, _now_text()),
                     )
                     advanced = True
-            connection.commit()
+            commit_sqlite(connection)
         return advanced
     except sqlite3.Error:
         logger.exception("SQLite 更新投影派发时间失败 | device=%s", device)
         return False
 
 
+@_mirror_write
 def update_projection_status(
     device: str,
     *,
@@ -1693,7 +1792,7 @@ def update_projection_status(
                             _now_text(),
                         ),
                     )
-            connection.commit()
+            commit_sqlite(connection)
         return True
     except sqlite3.Error:
         logger.exception("SQLite 更新投影状态失败 | device=%s", device)

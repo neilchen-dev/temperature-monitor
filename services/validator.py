@@ -11,6 +11,8 @@ OFFLINE_VALUES = {"offline", "离线", "unavailable", "unknown", "0", "false"}
 
 
 def parse_number(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name}不能是布尔值")
     if isinstance(value, str) and value.strip().lower() in INVALID_VALUES:
         raise ValueError(f"{name}无有效数值: {value!r}")
 

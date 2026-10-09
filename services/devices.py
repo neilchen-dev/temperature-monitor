@@ -281,45 +281,53 @@ def get_device_model_health(*, now: float | None = None) -> dict[str, Any]:
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
 
-SampleListener = Callable[[MonitorSample], None]
+SampleListener = Callable[[MonitorSample], Any]
 _sample_listeners: list[SampleListener] = []
+_sample_listener_required: dict[SampleListener, bool] = {}
 _sample_listener_lock = threading.RLock()
 
 
-def register_sample_listener(listener: SampleListener) -> None:
-    """Register a non-blocking extension hook for normalized samples.
+def register_sample_listener(listener: SampleListener, *, required: bool = True) -> None:
+    """Register a consumer invoked after acquisition persistence.
 
-    The existing persistence and Feishu write path remains the caller's
-    responsibility.  Runtime listeners are invoked only after that legacy
-    path has accepted the sample, and listener failures are isolated.
+    Required consumers must complete successfully to acknowledge delivery.
+    Pass required=False for observational hooks whose failure may be ignored.
     """
     if not callable(listener):
         raise TypeError("listener must be callable")
     with _sample_listener_lock:
+        _sample_listener_required[listener] = required
         if listener not in _sample_listeners:
             _sample_listeners.append(listener)
 
 
 def unregister_sample_listener(listener: SampleListener) -> None:
     with _sample_listener_lock:
+        _sample_listener_required.pop(listener, None)
         try:
             _sample_listeners.remove(listener)
         except ValueError:
             pass
 
 
-def _notify_sample_listeners(sample: MonitorSample) -> None:
+def _notify_sample_listeners(sample: MonitorSample) -> bool:
     with _sample_listener_lock:
         listeners = tuple(_sample_listeners)
+        required = {listener: _sample_listener_required.get(listener, True) for listener in listeners}
+    acknowledged = any(required.values())
     for listener in listeners:
         try:
-            listener(sample)
+            if listener(sample) is False and required[listener]:
+                acknowledged = False
         except Exception:  # noqa: BLE001 - extensions must not break acquisition
+            if required[listener]:
+                acknowledged = False
             logger.exception(
                 "采样扩展处理失败 | device=%s | sample_time=%s",
                 sample.device_id,
                 sample.sample_time.isoformat(),
             )
+    return acknowledged
 
 
 def normalize_status(value: Any) -> str | None:
@@ -389,6 +397,8 @@ def persist_heartbeat(
     availability: str,
     temperature: Any = None,
     humidity: Any = None,
+    *,
+    queue_for_dispatch: bool = False,
 ) -> HeartbeatPersistOutcome:
     """Persist source liveness and build a runtime heartbeat observation.
 
@@ -415,6 +425,7 @@ def persist_heartbeat(
             source=normalized_source,
             heartbeat_at_ms=heartbeat_time_ms,
             availability=normalized_status,
+            queue_for_dispatch=queue_for_dispatch,
             temperature=(
                 current_temperature if normalized_status == STATUS_ONLINE else None
             ),
@@ -539,12 +550,12 @@ def record_sample(
     return list(outcome.transitions)
 
 
-def dispatch_sample(sample: MonitorSample) -> None:
+def dispatch_sample(sample: MonitorSample) -> bool:
     """Phase B: hand a persisted sample to Runtime/Shadow listeners.
 
     Pure notification — no persistence. Listener failures are isolated.
     """
-    _notify_sample_listeners(sample)
+    return _notify_sample_listeners(sample)
 
 
 def sample_from_row(
