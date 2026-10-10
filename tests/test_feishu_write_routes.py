@@ -109,7 +109,11 @@ class FeishuWriteRouteTests(unittest.TestCase):
         with (
             patch("routes.api.FeishuInspectionRecordWriter") as writer_class,
             patch("routes.api.FeishuBitableRecordWriter"),
+            patch("routes.api.FeishuBitableRecordSource") as source_class,
         ):
+            source_class.return_value.read_matching_records.return_value = (
+                FeishuRawRecord(record_id="rec-device", fields={config.DEVICE_ID_FIELD: "TH-10", "区域": "A"}),
+            )
             writer_class.return_value.create_snapshot.return_value = {
                 "record_id": "rec-inspection"
             }

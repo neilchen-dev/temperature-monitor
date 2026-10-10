@@ -123,6 +123,7 @@ class RuntimeComponents:
 # 测试会反复 build/stop，这里只保存引用，不持有额外资源。
 _last_components: Any = None
 _READINESS_CACHE_TTL_SECONDS = 5.0
+_READINESS_CACHE_MAX_AGE_SECONDS = 30.0
 _readiness_cache: dict[str, Any] | None = None
 _readiness_cache_at = 0.0
 _readiness_refreshing = False
@@ -364,7 +365,15 @@ def _compute_runtime_readiness(components: Any) -> dict[str, Any]:
     # remains constant-time because it only reads the cache below.
     execution_lock = getattr(components, "_execution_lock", None)
     if execution_lock is not None:
-        execution_lock.acquire()
+        if not execution_lock.acquire(timeout=_READINESS_CACHE_TTL_SECONDS):
+            return {
+                "ready": False,
+                "available": True,
+                "scheduler_running": bool(runtime_liveness().get("scheduler_running")),
+                "standards_ready": False,
+                "active_readiness": False,
+                "reasons": ["readiness execution lock timeout"],
+            }
     try:
         status = components.status()
         active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
@@ -449,6 +458,7 @@ def runtime_readiness() -> dict[str, Any]:
     now = time.monotonic()
     with _readiness_refresh_lock:
         cached = dict(_readiness_cache) if _readiness_cache is not None else None
+        cache_present = cached is not None
         cache_age = now - _readiness_cache_at
         refresh_needed = cached is None or cache_age >= _READINESS_CACHE_TTL_SECONDS
         if refresh_needed and not _readiness_refreshing:
@@ -470,6 +480,14 @@ def runtime_readiness() -> dict[str, Any]:
             "active_readiness": False,
             "reasons": ["readiness refresh pending"],
         }
+    elif cache_age >= _READINESS_CACHE_MAX_AGE_SECONDS:
+        cached["ready"] = False
+        cached["standards_ready"] = False
+        cached["active_readiness"] = False
+        cached["reasons"] = list(cached.get("reasons", ())) + [
+            "readiness cache expired"
+        ]
+    cached["cache_age_seconds"] = max(0.0, cache_age) if cache_present else None
     if not liveness.get("available"):
         cached["ready"] = False
         cached["available"] = False

@@ -1663,7 +1663,8 @@ class FeishuInspectionRecordWriter:
         state_recorded_at: datetime | None = None,
         idempotency_key: str | None = None,
     ) -> Mapping[str, Any]:
-        existing = self._find_snapshot_by_business_key(area, inspected_at)
+        effective_time = state_recorded_at if state_recorded_at is not None else inspected_at
+        existing = self._find_snapshot_by_business_key(area, effective_time)
         if existing is not None:
             # 同一 (仓库区域, 状态记录时间) 的点检已存在：复用，不重复创建。
             _register_remote_binding(
@@ -1698,7 +1699,7 @@ class FeishuInspectionRecordWriter:
             state_recorded_at=state_recorded_at,
         )
         token = normalize_client_token(
-            idempotency_key or f"WH:{area.strip()}:{_datetime_cell(inspected_at)}"
+            idempotency_key or f"WH:{area.strip()}:{_datetime_cell(effective_time)}"
         )
         response = self.writer.create(
             self.inspection_table_id,

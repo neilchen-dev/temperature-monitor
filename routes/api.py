@@ -36,6 +36,7 @@ from runtime.bootstrap import (
 import config
 from application.active_scope import active_scope_allows, normalize_device_id
 from integrations.feishu_records import FeishuBitableRecordSource
+from integrations.feishu_observation import _field_text
 from integrations.feishu_writers import (
     FeishuBitableRecordWriter,
     FeishuEnvironmentEventWriter,
@@ -168,6 +169,38 @@ def _json_payload() -> tuple[dict | None, tuple]:
     if not isinstance(payload, dict):
         return None, (jsonify({"status": "error", "error": "请求体必须是 JSON 对象"}), 400)
     return payload, ()
+
+
+def _inspection_scope_error(payload: dict, source: FeishuBitableRecordSource):
+    """Bind a regional inspection and its parent to the allowed device."""
+    device_id = normalize_device_id(payload.get("device_id"))
+    area = payload.get("area")
+    parent_id = payload.get("parent_record_id")
+    if not isinstance(area, str) or not area.strip():
+        return _active_scope_error(device_id, reason="点检区域不能为空")
+    if parent_id is not None and (
+        not isinstance(parent_id, str) or not parent_id.strip()
+    ):
+        return _active_scope_error(device_id, reason="父记录编号无效")
+    try:
+        records = source.read_matching_records(
+            config.FEISHU_DEVICE_TABLE_ID,
+            field_name=config.DEVICE_ID_FIELD, value=device_id,
+            max_attempts=1, timeout=config.FEISHU_PROJECTION_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        matches = [record for record in records
+                   if _record_field_device_ids(record.fields.get(config.DEVICE_ID_FIELD))
+                   == {device_id}]
+        if len(matches) != 1 or _field_text(matches[0].fields, "区域") != area.strip():
+            return _active_scope_error(device_id, reason="点检区域与设备权威区域不一致")
+        if parent_id is not None:
+            parents = [record for record in source.read_records(config.FEISHU_INSPECTION_TABLE_ID)
+                       if record.record_id == parent_id.strip()]
+            if len(parents) != 1 or _field_text(parents[0].fields, "仓库区域") != area.strip():
+                return _active_scope_error(device_id, reason="父记录不属于当前点检区域")
+    except Exception:  # noqa: BLE001 - uncertain identity must fail closed
+        return _active_scope_error(device_id, reason="无法确认点检区域或父记录归属，拒绝写入")
+    return None
 
 
 def _api_datetime(payload: dict, field_name: str) -> datetime:
@@ -426,11 +459,16 @@ def create_inspection_record():
     scope_error = _require_active_device_scope(payload.get("device_id"))
     if scope_error:
         return scope_error
+    source = FeishuBitableRecordSource()
+    scope_error = _inspection_scope_error(payload, source)
+    if scope_error:
+        return scope_error
     try:
         writer = FeishuInspectionRecordWriter(
             writer=FeishuBitableRecordWriter(),
             inspection_table_id=config.FEISHU_INSPECTION_TABLE_ID,
             device_table_id=config.FEISHU_DEVICE_TABLE_ID,
+            source=source,
         )
         result = writer.create_snapshot(
             area=str(payload.get("area", "")),
