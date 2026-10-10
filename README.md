@@ -441,3 +441,9 @@ HTTP 心跳将 presence 和待处理观察一起写入 SQLite，返回后由调�
 `/api/system/status` 无鉴权访问只返回健康与计数摘要；控制台使用有效 `HISTORY_API_KEY` 才能获取设备诊断详情。历史快照同一设备、同一采样桶保留首次捕获内容，并复用固定的飞书幂等标识。
 
 CD 使用 `compose.deploy.yaml` 覆盖本地镜像，以 `DEPLOY_IMAGE` 固定本次提交的 SHA 镜像；服务器仓库同步到相同 SHA。失败时优先从本地保留的旧镜像 ID 回滚，避免可变标签导致误回滚。手动运行生产 Compose 时需同时指定两个文件并设置 `DEPLOY_IMAGE`。
+
+### 备份保留预览
+
+`python tools/backup_retention.py --directory data/backups` 默认只预览。自动备份使用 `temperature_monitor_YYYYMMDDTHHMMSSZ.db` 命名，至少保留最近 3 份，且仅将超过 30 天的额外备份列为候选。手工备份、上线前快照、符号链接及带 WAL/SHM/journal 的数据库会被排除。明确确认预览结果后，添加 `--apply` 才会删除候选；该工具不在 CD 中自动执行。
+
+飞书预警闭环检查和 Shadow 观察使用按设备筛选的查询；预警仅请求设备和闭环字段，保留本地复核和失败时抑制预警的行为。正常异步投影排队记录 INFO，实际外部失败仍记录 WARNING。

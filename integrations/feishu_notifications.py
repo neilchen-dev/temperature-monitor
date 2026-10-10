@@ -364,7 +364,15 @@ class FeishuNotificationWriter:
         if self.event_repository.list_active(device_id=normalized):
             return True
         try:
-            records = self.source.read_records(self.event_table_id)
+            read_device_events = getattr(self.source, "read_device_events", None)
+            if callable(read_device_events):
+                records = read_device_events(
+                    self.event_table_id, normalized,
+                    device_field=config.FEISHU_EVENT_DEVICE_FIELD,
+                    max_attempts=1, timeout=self.attempt_timeout,
+                )
+            else:
+                records = self.source.read_records(self.event_table_id)
         except Exception as exc:
             raise FeishuNotificationError(
                 f"unable to check unresolved environmental events: {exc}",

@@ -72,6 +72,37 @@ class FeishuBitableRecordSource:
             )
         return tuple(records)
 
+    def read_matching_records(
+        self, table_id: str, *, field_name: str, value: str,
+        field_names: list[str] | None = None,
+        max_attempts: int | None = None, timeout: float | None = None,
+    ) -> tuple[FeishuRawRecord, ...]:
+        """Filter remotely while retaining the injected-source contract."""
+        if self._fetch_records is not None:
+            return self.read_records(table_id)
+        from services.feishu import list_bitable_records
+
+        def fetch(table):
+            return list_bitable_records(
+                table, field_names=field_names,
+                record_filter={"conjunction": "and", "conditions": [
+                    {"field_name": field_name, "operator": "is", "value": [value]},
+                ]},
+                max_attempts=max_attempts, timeout=timeout,
+            )
+        return FeishuBitableRecordSource(fetch_records=fetch).read_records(table_id)
+
+    def read_device_events(
+        self, table_id: str, device_id: str, *, device_field: str,
+        max_attempts: int | None = None, timeout: float | None = None,
+    ) -> tuple[FeishuRawRecord, ...]:
+        """Read only the device and closure fields used by prewarning checks."""
+        return self.read_matching_records(
+            table_id, field_name=device_field, value=device_id,
+            field_names=[device_field, "闭环状态"],
+            max_attempts=max_attempts, timeout=timeout,
+        )
+
     def read_field_names(self, table_id: str) -> tuple[str, ...]:
         """Read table metadata for lightweight integration schema checks."""
         from services.feishu import list_bitable_field_names

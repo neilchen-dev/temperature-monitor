@@ -72,7 +72,12 @@ class FeishuBitableObservationSource:
 
     def read(self, device_id: str) -> Mapping[str, Any]:
         normalized_device = device_id.strip().upper()
-        device_records = tuple(self.source.read_records(self.device_table_id))
+        read_matching = getattr(self.source, "read_matching_records", None)
+        def read_table(table_id, device_field):
+            if callable(read_matching):
+                return read_matching(table_id, field_name=device_field, value=normalized_device)
+            return self.source.read_records(table_id)
+        device_records = tuple(read_table(self.device_table_id, self.fields.device_id))
         matches = tuple(
             record
             for record in device_records
@@ -87,7 +92,7 @@ class FeishuBitableObservationSource:
         device_record = matches[0]
         open_events = tuple(
             record
-            for record in self.source.read_records(self.event_table_id)
+            for record in read_table(self.event_table_id, self.fields.event_device_id)
             if _field_text(record.fields, self.fields.event_device_id).upper()
             == normalized_device
             and not business_closed(

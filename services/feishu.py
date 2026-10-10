@@ -445,6 +445,9 @@ def list_bitable_records(
     table_id: str,
     *,
     field_names: list[str] | None = None,
+    record_filter: Mapping[str, Any] | None = None,
+    max_attempts: int | None = None,
+    timeout: float | None = None,
 ) -> list[dict[str, Any]]:
     """Read all records from an explicitly configured Base table.
 
@@ -459,6 +462,10 @@ def list_bitable_records(
     if field_names:
         body["field_names"] = list(field_names)
 
+    if record_filter is not None:
+        body["filter"] = dict(record_filter)
+    seen_tokens: set[str] = set()
+
     while True:
         query = {"page_size": "500"}
         if page_token:
@@ -470,6 +477,7 @@ def list_bitable_records(
                 operation="读取 Base 记录",
                 json_data=body,
                 lock_key=f"table:{table_id}:read",
+                max_attempts=max_attempts, timeout=timeout,
             ),
             "读取 Base 记录",
         )
@@ -478,8 +486,9 @@ def list_bitable_records(
         if not data.get("has_more"):
             return records
         page_token = str(data.get("page_token", "")).strip()
-        if not page_token:
-            raise RuntimeError("飞书 Base 记录分页响应缺少 page_token")
+        if not page_token or page_token in seen_tokens:
+            raise RuntimeError("飞书 Base 记录分页响应缺少或重复 page_token")
+        seen_tokens.add(page_token)
 
 
 def resolve_record_id(

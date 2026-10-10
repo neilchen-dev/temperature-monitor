@@ -262,7 +262,8 @@ def temperature():
             feishu_code if attempted else -1,
             f"projection_deferred: {error_summary}",
         )
-        logger.warning(
+        log_deferred = logger.warning if attempted else logger.info
+        log_deferred(
             "sample_accepted_projection_deferred | device=%s"
             " | sample_time_ms=%s | attempted=%s | error=%s",
             bitable_device,
