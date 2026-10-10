@@ -8,11 +8,11 @@ Industrial Environment Monitoring Platform
 
 Temperature Monitor 是一个面向工业现场的多源 IoT 环境监控平台。它接收 Home Assistant 或 Modbus 设备的温湿度数据，完成单位转换、设备状态判定、历史留存和事件记录，并将结果同步到飞书多维表格、本地 SQLite 和 Web 监控台。
 
-仓库中的设备编号、区域名称、业务表单和展示数据均为脱敏或 Demo 数据。真实凭据、飞书资源 ID、Home Assistant secrets、数据库和日志不会提交到公开仓库。
+预览图片使用脱敏或 Demo 数据。运行所需凭据、Home Assistant secrets、数据库和日志应仅保存在部署环境；文档与配置中的示例设备、区域、表 ID 和链接不可直接视为可用的公共服务，请替换为自己的资源。
 
 ## Preview
 
-公开 Demo 使用 `DEV-xx`、`Area-x` 和 `Storage-x` 等匿名标识展示从数据采集到业务协同的闭环。
+以下为既有脱敏 Demo 预览，使用 `DEV-xx`、`Area-x` 和 `Storage-x` 等匿名标识；图片用于展示界面，实时状态以实际部署为准。
 
 | Feishu monitoring records | Feishu environment dashboard |
 | --- | --- |
@@ -99,7 +99,8 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 - **实时监控**：设备数量、在线状态、当前告警和设备卡片；
 - **历史趋势**：24 小时、7 天和 30 天温湿度趋势，以及控制区间；
 - **设备与事件**：设备来源、最后样本和状态迁移时间线；
-- **控制区间**：直接在页面编辑设备的温湿度上下限。
+- **控制区间**：只读查看飞书 validated 标准中的温湿度上下限；
+- **系统设置**：热更新白名单运行参数并查询变更审计，不能修改凭据或生产标准。
 
 访问 `/dashboard` 可查看服务端渲染的本地分析看板。页面脚本和 Chart.js 均从服务本地提供，不依赖外部 CDN。
 
@@ -109,16 +110,18 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 1. Home Assistant 在温度、湿度变化时调用 `/temperature`；每分钟以及
    `available/unavailable` 状态变化时调用 `/temperature/heartbeat`。
-2. `/temperature` 校验设备和数值、完成单位转换并更新飞书实时记录；
-   heartbeat 只更新 presence 并驱动运行时观察。
-3. 测量数据镜像到 SQLite，并更新统一设备状态与状态迁移事件。
+2. `/temperature` 校验设备和数值、完成单位转换，先将样本持久化到 SQLite，
+   默认由调度器异步投影到飞书实时记录；飞书失败时保留本地样本并重试。
+3. heartbeat 将 presence 与待处理观察原子落盘，由调度器投递，
+   不新增测量历史；业务消费者失败时保留队列，恢复后重放。
 4. 每个整十分钟，Home Assistant 调用 `/history/sample`；服务读取实时表，为配置的监测点生成历史快照。
 5. Modbus collector 按轮询周期读取设备，直接进入统一设备模型和本地查询链路。
 6. Shadow Runtime 读取飞书业务数据，经过领域判定后持久化预期状态、运行结果和比对差异；写入仍由独立开关保护。
 
 | Endpoint | Purpose | Auth |
 | --- | --- | --- |
-| `GET /health` | 服务与 SQLite 健康摘要 | 无 |
+| `GET /health` | 进程及运行时存活探针；不因业务 readiness 阻塞而重启 | 无 |
+| `GET /readyz` | 严格告警链路就绪探针，未就绪返回 `503` | 无 |
 | `POST /temperature` | 接收 Home Assistant 温湿度上报 | `TEMPERATURE_API_KEY` 可选 |
 | `POST /temperature/heartbeat` | 接收 Home Assistant 在线心跳，不新增测量历史 | `TEMPERATURE_API_KEY` 可选 |
 | `POST /history/sample` | 生成历史快照 | `X-History-Key` |
@@ -128,14 +131,19 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 | `GET /history/stats/daily` | 按日统计温湿度和事件 | `X-History-Key` |
 | `GET /history/stats/devices` | 设备快照和离线时长估算 | `X-History-Key` |
 | `GET /api/devices` | 查询统一设备状态 | `X-History-Key` |
+| `GET /api/devices/<device_id>` | 查询设备明细与样本；多来源时需指定 `source` | `X-History-Key` |
 | `GET /api/events` | 查询设备事件 | `X-History-Key` |
 | `GET /api/thresholds` | 查询当前 Feishu validated 控制区间（`authoritative_source=feishu`） | `X-History-Key` |
 | `PUT /api/thresholds/<device_id>` | 已废止，返回 `409`，不能改变生产标准 | `X-History-Key` |
 | `POST /api/operations` | 写入一条作业登记 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` + 白名单设备 |
 | `POST /api/environment-events` | 写入一条环境异常事件 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true` + 白名单设备 |
 | `PATCH /api/environment-events/<record_id>` | 填写闭环资料并关闭环境异常 | `X-History-Key`；先按 `record_id` 解析事件设备，再检查白名单 |
-| `POST /api/inspections` | 写入一条仓库点检记录 | `X-History-Key`；请求必须提供白名单 `device_id`，且仅 Active + `FEISHU_WRITE_ENABLED=true` |
-| `GET /api/system/status` | 采集器和运行摘要 | 无 |
+| `POST /api/inspections` | 写入一条仓库点检记录 | `X-History-Key`；仅 Active + `FEISHU_WRITE_ENABLED=true`；核对白名单设备的飞书区域与父记录区域 |
+| `GET /api/settings` | 白名单运行参数、schema 和来源 | `X-History-Key` |
+| `PATCH /api/settings` | 校验、审计并热更新白名单运行参数 | `X-History-Key` |
+| `GET /api/settings/audit` | 最近参数变更记录 | `X-History-Key` |
+| `GET /api/shadow/summary` | 最近 Shadow 比对统计 | `X-History-Key` |
+| `GET /api/system/status` | 公开健康与计数摘要；带有效密钥时返回详细诊断 | 详情需 `X-History-Key` |
 
 程序化访问查询 API 时使用 `X-History-Key`，也可以使用 `Authorization: Bearer <HISTORY_API_KEY>`。密钥不会通过 URL 传递。
 
@@ -174,7 +182,7 @@ Modbus 采集线程只在 `python app.py` 的生产入口启动一次。若以�
 
 ### Docker Compose
 
-Docker Compose 默认拉取镜像，不在本地构建：
+仓库的 `compose.yaml` 使用本地 `temperature-monitor:latest` 镜像。初次运行先从源码构建；生产镜像部署使用下一节的覆盖文件。
 
 ```bash
 git clone https://github.com/neilchen-dev/temperature-monitor.git
@@ -185,18 +193,20 @@ cp .env.example .env
 编辑 `.env`，至少填写飞书应用凭据和实时数据表信息：
 
 ```dotenv
-IMAGE_REPOSITORY=your-registry.example.com/your-namespace/temperature-monitor
 APP_ID=your_feishu_app_id
 APP_SECRET=your_feishu_app_secret
 APP_TOKEN=your_bitable_app_token
 TABLE_ID=your_table_id
-HISTORY_API_KEY=generate-a-random-key-at-least-32-bytes
+HISTORY_API_KEY=replace-with-a-long-random-secret
+TEMPERATURE_API_KEY=replace-with-another-long-random-secret
 ```
+
+生产配置建议启用温度上报鉴权，并同步设置 Home Assistant 的 `X-Temperature-Key` 请求头。可用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 本地生成随机密钥，不要提交 `.env`。
 
 启动服务：
 
 ```bash
-docker compose pull
+docker build -t temperature-monitor:latest .
 docker compose up -d --remove-orphans --wait --wait-timeout 600
 curl http://127.0.0.1:5000/health
 ```
@@ -233,7 +243,8 @@ Analytics:    http://127.0.0.1:5000/dashboard
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IMAGE_REPOSITORY` | — | Compose 使用的完整镜像仓库路径 |
+| `IMAGE_REPOSITORY` | — | CD 在服务器记录的镜像仓库路径；本地 Compose 使用固定本地镜像 |
+| `DEPLOY_IMAGE` | — | 生产覆盖文件必填的完整镜像引用，建议使用 commit SHA 标签 |
 | `IMAGE_TAG` | `latest` | 镜像版本；自动部署使用 commit SHA |
 | `APP_ID` / `APP_SECRET` | — | 飞书应用凭据 |
 | `APP_TOKEN` / `TABLE_ID` | — | 飞书多维表格 App Token 和实时数据表 ID |
@@ -354,17 +365,45 @@ deploy.yml（workflow_run）
 构建并推送 <commit SHA> 与 latest 镜像
         │
         ▼
-SSH → 更新服务器 IMAGE_TAG
-     → docker compose pull / up --wait
-     → GET /health
+SSH → 同步精确 SHA，设置 DEPLOY_IMAGE
+     → 两个 Compose 文件 pull / up --wait
+     → 核对运行镜像、GET /health、GET /readyz
         │
         ├─ 成功：完成部署
-        └─ 失败：恢复旧 IMAGE_TAG 并回滚
+        └─ 部署或存活失败：按实际旧镜像 ID 回滚
 ```
 
 生产部署使用精确 commit SHA 作为 `IMAGE_TAG`，服务器上的 `.env`、`data/` 和 `logs/` 会被保留。部署脚本不会执行 `docker compose down -v` 或清理持久化数据。
 
 部署 workflow 需要在 GitHub Actions 中配置以下 Secrets：`SERVER_HOST`、`SERVER_USER`、`SERVER_SSH_KEY`、`DEPLOY_PATH`、`ACR_USERNAME`、`ACR_PASSWORD`；并配置 Variables：`CONTAINER_REGISTRY`、`CONTAINER_IMAGE_NAME`。Add-on 发布 workflow 会在测试成功后，根据 `config.yaml` 中的版本发布 GHCR 镜像。
+
+### 投递与健康约定
+
+HTTP 心跳将 presence 和待处理观察一起写入 SQLite，返回后由调度器投递。没有运行中的业务消费者或消费者失败时，队列保留到下次恢复；因此心跳接收成功表示本地持久化成功，运行时处理可能延后一个调度周期。停止期间采集线程不会发布完成中的轮询。
+
+`/api/system/status` 无鉴权访问只返回健康与计数摘要；控制台使用有效 `HISTORY_API_KEY` 才能获取设备诊断详情。历史快照同一设备、同一采样桶保留首次捕获内容，并复用固定的飞书幂等标识。
+
+CD 使用 `compose.deploy.yaml` 覆盖本地镜像，以 `DEPLOY_IMAGE` 固定本次提交的 SHA 镜像；服务器仓库同步到相同 SHA。失败时优先从本地保留的旧镜像 ID 回滚，避免可变标签导致误回滚。手动运行生产 Compose 时需同时指定两个文件并设置 `DEPLOY_IMAGE`。
+
+```bash
+export DEPLOY_IMAGE="your-registry.example.com/your-namespace/temperature-monitor:<commit-sha>"
+docker compose -f compose.yaml -f compose.deploy.yaml pull
+docker compose -f compose.yaml -f compose.deploy.yaml up -d --remove-orphans --wait --wait-timeout 600
+curl --fail http://127.0.0.1:5000/health
+curl --fail http://127.0.0.1:5000/readyz
+```
+
+以上命令适用于端口 5000；自定义端口时替换 URL。`/readyz` 的非 200 响应需要检查标准同步、任务阻塞与缓存年龄，不能只凭容器存活判定告警链路已就绪。
+
+### 备份保留预览
+
+`python tools/backup_retention.py --directory data/backups` 默认只预览。自动备份使用 `temperature_monitor_YYYYMMDDTHHMMSSZ.db` 命名，至少保留最近 3 份，且仅将超过 30 天的额外备份列为候选。手工备份、上线前快照、符号链接及带 WAL/SHM/journal 的数据库会被排除。明确确认预览结果后，添加 `--apply` 才会删除候选；该工具不在 CD 中自动执行。
+
+飞书预警闭环检查和 Shadow 观察使用按设备筛选的查询；预警仅请求设备和闭环字段，保留本地复核和失败时抑制预警的行为。正常异步投影排队记录 INFO，实际外部失败仍记录 WARNING。
+
+readiness 后台刷新每 5 秒按需触发，获取执行锁最多等待 5 秒；缓存超过 30 秒失效，`/readyz` 返回未就绪。存活检查与业务就绪分开；CD 会报告 readiness 阻塞，但不单凭该阻塞回滚仍存活的新镜像。
+
+巡检的 `state_recorded_at` 若提供则作为有效状态时间，否则使用 `inspected_at`；业务键查询、写入字段与默认幂等键共同使用该时间。设备或父记录归属无法确认时拒绝写入。
 
 ## Project structure
 
@@ -380,7 +419,7 @@ services/            Feishu client, SQLite mirror, history, validation, Modbus
 static/              Industrial console and local Chart.js asset
 homeassistant/       REST commands and automation examples
 hassio/              Home Assistant Add-on manifest and release metadata
-tools/               Modbus simulator and register probe
+tools/               Modbus simulator/probe, SQLite backup and retention preview
 tests/               Unit and integration tests
 app.py               Flask application, logging, Waitress and runtime entry point
 config.py            Environment variables and runtime configuration
@@ -396,6 +435,7 @@ Dockerfile           Non-root Python container image
 python -m pip install -r requirements-dev.txt
 ruff check .
 python -m pytest
+node tests/console_async.test.cjs
 ```
 
 当前测试集按风险而不是按目录层级凑数量，覆盖以下链路：
@@ -409,14 +449,28 @@ python -m pytest
 - **飞书写入**：作业、异常、点检、通知的字段映射、幂等、设备作用域和端到端工具；
 - **接口与投影**：HTTP API、分析看板、设备状态投影，以及写库中断后的恢复一致性。
 
-仓库当前包含 54 个 `tests/test_*.py` 文件。这个数字只用于描述当前代码快照；长期以 `python -m pytest --collect-only -q` 的实际收集结果为准，README 不把文件数等同于测试用例数。
+2026-10-10 本地验证为 683 项 Python 测试通过，另有 JavaScript 异步回归；实际用例数量以 `python -m pytest --collect-only -q` 为准。本地 Python 3.14 偶发 asyncio transport 析构警告，CI 使用 Python 3.12。
 
 ### Evidence and deployment boundaries
 
-- 公开仓库中的 `DEV-xx`、`Area-x`、表单与截图均为脱敏 / Demo；真实凭据、飞书资源 ID、数据库和日志不会提交。
+- 预览采用脱敏 / Demo 数据；运行凭据、数据库和日志不得公开。部署前替换配置模板中的资源 ID、表单地址和链接。
 - 代码与测试能够证明通信、状态机、Shadow / Active 护栏和部署流程的实现；它们不能单独证明某个现场已经启用 Active 或替代既有质量流程。
 - Active 是显式受控的 canary 路径，不是打开 `AUTOMATION_MODE=active` 就全量接管。缺少写入开关、确认令牌、validated standards 或设备白名单时必须 fail closed。
 - 现场阈值和处置规则应由获授权的工艺 / 质量事实源确认；软件负责校验、执行、审计与追溯，不自行创造控制标准。
+
+## Troubleshooting
+
+| 现象 | 检查与处理 |
+| --- | --- |
+| 查询或设置接口返回 `503` | 检查 `HISTORY_API_KEY`、SQLite 是否启用及初始化日志；未配置密钥时接口关闭。 |
+| 返回 `401` | 核对对应的 `X-History-Key` 或 `X-Temperature-Key`；不要把密钥放入 URL。 |
+| `/temperature` 返回 `accepted` / `deferred` | 样本已本地保存，飞书投影仍在排队或重试；使用带密钥的 `/api/system/status` 查看投影诊断。 |
+| `/health` 正常但 `/readyz` 返回 `503` | 检查 validated 标准、任务阻塞、调度器及 readiness 缓存年龄。 |
+| 点检接口返回 `403` | 检查设备是否在 Active 白名单、飞书设备区域是否匹配、父记录是否属于同一区域；身份查询失败也会拒绝写入。 |
+| Docker 无法写数据库或日志 | 检查 `data/`、`logs/` 挂载及 uid/gid 1000 的写权限。 |
+| Modbus RTU 读失败 | 检查串口挂载、宿主设备权限、波特率/校验位和零基寄存器地址；使用 `tools/modbus_probe.py` 单次诊断。 |
+
+排查时先保存健康响应和错误时间，再核对服务日志；对外分享日志和截图前移除凭据、人员信息、内网地址与资源标识。
 
 ## Documentation
 
@@ -428,22 +482,9 @@ python -m pytest
 - [`docs/feishu-mapping.md`](docs/feishu-mapping.md)：飞书业务字段与 Python 映射契约；
 - [`homeassistant/`](homeassistant/)：Home Assistant 接入示例；
 - [`hassio/temperature-monitor/`](hassio/temperature-monitor/)：Add-on 配置；
+- [`docs/code-audit-2026-10-10.md`](docs/code-audit-2026-10-10.md)：最新审计与修复验证；
 - [`docs/images/`](docs/images/)：脱敏后的飞书多维表格与业务 Demo 截图。
 
 ## License
 
 [MIT](LICENSE)
-
-### 审计修复后的投递约定
-
-HTTP 心跳将 presence 和待处理观察一起写入 SQLite，返回后由调度器投递。没有运行中的业务消费者或消费者失败时，队列保留到下次恢复；因此心跳接收成功表示本地持久化成功，运行时处理可能延后一个调度周期。停止期间采集线程不会发布完成中的轮询。
-
-`/api/system/status` 无鉴权访问只返回健康与计数摘要；控制台使用有效 `HISTORY_API_KEY` 才能获取设备诊断详情。历史快照同一设备、同一采样桶保留首次捕获内容，并复用固定的飞书幂等标识。
-
-CD 使用 `compose.deploy.yaml` 覆盖本地镜像，以 `DEPLOY_IMAGE` 固定本次提交的 SHA 镜像；服务器仓库同步到相同 SHA。失败时优先从本地保留的旧镜像 ID 回滚，避免可变标签导致误回滚。手动运行生产 Compose 时需同时指定两个文件并设置 `DEPLOY_IMAGE`。
-
-### 备份保留预览
-
-`python tools/backup_retention.py --directory data/backups` 默认只预览。自动备份使用 `temperature_monitor_YYYYMMDDTHHMMSSZ.db` 命名，至少保留最近 3 份，且仅将超过 30 天的额外备份列为候选。手工备份、上线前快照、符号链接及带 WAL/SHM/journal 的数据库会被排除。明确确认预览结果后，添加 `--apply` 才会删除候选；该工具不在 CD 中自动执行。
-
-飞书预警闭环检查和 Shadow 观察使用按设备筛选的查询；预警仅请求设备和闭环字段，保留本地复核和失败时抑制预警的行为。正常异步投影排队记录 INFO，实际外部失败仍记录 WARNING。
