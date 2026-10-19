@@ -58,7 +58,7 @@ from services import runtime_settings
 from repositories.sqlite import verify_runtime_schema
 from scheduler.worker import TaskScheduler
 
-from .shadow_runner import ShadowRuntime
+from .shadow_runner import ShadowRuntime, ShadowSummaryBusyError
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -513,6 +513,8 @@ def shadow_summary_snapshot(*, hours: int = 24) -> dict[str, Any]:
         }
     try:
         summary = _last_components.shadow_summary(hours=hours)
+    except ShadowSummaryBusyError:
+        return {"available": False, "reason": "shadow summary refresh in progress", "hours": hours}
     except Exception:  # noqa: BLE001 - summary endpoint must never raise
         logger.exception("Shadow summary 聚合失败")
         return {"available": False, "reason": "shadow summary unavailable", "hours": hours}

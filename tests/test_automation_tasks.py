@@ -513,6 +513,37 @@ class AutomationTaskRepositoryTests(unittest.TestCase):
 
 
 class GlobalSyncTaskDeduplicationTests(unittest.TestCase):
+    def test_comparison_backlog_keeps_latest_payload_and_original_due_time(self) -> None:
+        tasks = [self.repository.create_or_get_unfinished(
+            task_type="SHADOW_COMPARE", entity_type="DEVICE", entity_id="TH-01",
+            due_at=self.now + timedelta(seconds=i), payload={"sample": i},
+            dedupe_key="SHADOW_COMPARE:TH-01:latest",
+            created_at=self.now + timedelta(seconds=i),
+        ) for i in range(100)]
+        self.assertEqual(len({task.task_id for task in tasks}), 1)
+        self.assertEqual(tasks[-1].payload, {"sample": 99})
+        self.assertEqual(tasks[-1].due_at, self.now)
+
+    def test_sync_overtakes_due_comparison_backlog(self) -> None:
+        self._schedule(task_type="SHADOW_COMPARE", entity_id="TH-01")
+        sync = self._schedule(due_at=self.now + timedelta(seconds=1))
+        claimed = self.repository.claim_due(now=self.now + timedelta(seconds=2), limit=1)
+        self.assertEqual(claimed[0].task_id, sync.task_id)
+
+    def test_aged_comparison_is_not_starved_by_projection_traffic(self) -> None:
+        compare = self._schedule(task_type="SHADOW_COMPARE", entity_id="TH-01")
+        self._schedule(task_type="FEISHU_PROJECTION", entity_id="TH-02",
+                       due_at=self.now + timedelta(seconds=1))
+        claimed = self.repository.claim_due(now=self.now + timedelta(seconds=61), limit=1)
+        self.assertEqual(claimed[0].task_id, compare.task_id)
+
+    def test_alarm_verification_overtakes_even_aged_comparisons(self) -> None:
+        self._schedule(task_type="SHADOW_COMPARE", entity_id="TH-01")
+        alarm = self._schedule(task_type="VERIFY_ALARM", entity_id="TH-02",
+                               due_at=self.now + timedelta(seconds=61))
+        claimed = self.repository.claim_due(now=self.now + timedelta(seconds=62), limit=1)
+        self.assertEqual(claimed[0].task_id, alarm.task_id)
+
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:", check_same_thread=False)
         self.repository = SQLiteAutomationTaskRepository(self.connection)

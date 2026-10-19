@@ -217,8 +217,9 @@ class FullChainTests(_RuntimeTestBase):
             ).fetchall()
         ]
 
-        self.assertIsNone(payloads[0]["expected"]["previous_state"])
-        previous = payloads[1]["expected"]["previous_state"]
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["sample_time"], self.now.isoformat())
+        previous = payloads[0]["expected"]["previous_state"]
         self.assertEqual(previous["temperature_status"], "NORMAL")
         self.assertEqual(previous["overall_status"], "NORMAL")
         self.assertEqual(previous["alarm_state"], "NORMAL")

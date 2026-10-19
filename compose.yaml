@@ -3,6 +3,9 @@ services:
     image: temperature-monitor:latest
     container_name: temperature-monitor
     restart: unless-stopped
+    mem_limit: 256m
+    mem_reservation: 96m
+    memswap_limit: 512m
     env_file:
       - .env
     ports:

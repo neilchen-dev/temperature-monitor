@@ -8,12 +8,16 @@ available only through explicitly injected Active-mode handlers.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import json
 import logging
+from pathlib import Path
 import sqlite3
 import threading
+import time
 from typing import Any, Callable, Mapping
 
 import config
@@ -47,6 +51,10 @@ logger = logging.getLogger("temperature_monitor")
 # SHADOW_RETRY 任务，automation_tasks 无限膨胀。
 _SHADOW_COMPARE_MAX_ATTEMPTS = 3
 _PURGE_INTERVAL = timedelta(hours=1)
+
+
+class ShadowSummaryBusyError(RuntimeError):
+    """A report is already running; callers should retry without tying up WSGI."""
 
 
 @dataclass(frozen=True)
@@ -172,6 +180,9 @@ class ShadowRuntime:
         self.standard_repository = standard_repository
         self.device_status_projector = device_status_projector
         self.connection = connection
+        self._summary_database = connection.execute("PRAGMA database_list").fetchone()[2]
+        self._summary_lock = threading.Lock()
+        self._summary_cache: OrderedDict[int, tuple[float, dict[str, Any]]] = OrderedDict()
         self.worker_id = worker_id
         self.operation_sync_interval = operation_sync_interval
         self.standard_sync_interval = standard_sync_interval
@@ -342,8 +353,10 @@ class ShadowRuntime:
                             now=self.now_provider()
                         ),
                     )
+                    # Release the shared connection lock between handlers so
+                    # remote I/O cannot block readiness for a whole batch.
                     self._run_scheduler_phase(
-                        "task_dispatch", self.scheduler.run_once
+                        "task_dispatch", lambda: self.scheduler.run_once(limit=1)
                     )
                     # Handlers return while their task is still RUNNING;
                     # run_once marks it terminal before the next recurring
@@ -602,27 +615,70 @@ class ShadowRuntime:
             )
             return status
 
-    def shadow_summary(self, *, hours: int = 24, now: datetime | None = None) -> dict[str, Any]:
-        """Aggregate recent SHADOW_COMPARE outcomes for production checks.
+    @contextmanager
+    def _summary_reader(self):
+        """Keep reporting off the scheduler connection and cap SQLite workspace."""
+        if not self._summary_database:
+            # In-memory databases cannot be reopened as a read-only file.
+            with self._execution_lock:
+                yield self.connection
+            return
+        reader = sqlite3.connect(Path(self._summary_database).as_uri() + "?mode=ro", uri=True)
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.execute("PRAGMA cache_size=-2048")
+            reader.execute("PRAGMA temp_store=FILE")
+            deadline = time.monotonic() + 90.0
+            reader.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+            yield reader
+        finally:
+            reader.close()
 
-        Read-only view over automation_runs; never mutates business state.
-        """
+    def _summary_rows(self, cutoff_text: str):
+        with self._summary_reader() as reader:
+            cursor = reader.execute(
+                "SELECT device_id, matched, difference_type, context_json, created_at "
+                "FROM automation_runs WHERE action_type = 'SHADOW_COMPARE' AND created_at >= ?",
+                (cutoff_text,),
+            )
+            try:
+                while batch := cursor.fetchmany(128):
+                    yield from batch
+            finally:
+                cursor.close()
+
+    def shadow_summary(self, *, hours: int = 24, now: datetime | None = None) -> dict[str, Any]:
+        """Serialize large reports and reuse at most eight short-lived results."""
+        hours = max(1, min(int(hours), 720))
+        if not self._summary_lock.acquire(timeout=0.1):
+            raise ShadowSummaryBusyError("shadow summary refresh in progress; retry shortly")
+        try:
+            cached = self._summary_cache.get(hours)
+            ttl = 60.0 if hours > 24 else 5.0
+            if now is None and cached is not None and time.monotonic() - cached[0] < ttl:
+                return dict(cached[1])
+            failed = getattr(self, "_summary_failure", None)
+            if now is None and failed and failed[0] == hours and time.monotonic() - failed[1] < 5.0:
+                raise RuntimeError(failed[2])
+            try:
+                result = self._compute_shadow_summary(hours=hours, now=now)
+            except Exception as exc:
+                self._summary_failure = (hours, time.monotonic(), str(exc))
+                raise
+            self._summary_failure = None
+            if now is None:
+                self._summary_cache[hours] = (time.monotonic(), result)
+                self._summary_cache.move_to_end(hours)
+                while len(self._summary_cache) > 8:
+                    self._summary_cache.popitem(last=False)
+            return dict(result)
+        finally:
+            self._summary_lock.release()
+
+    def _compute_shadow_summary(self, *, hours: int, now: datetime | None) -> dict[str, Any]:
         current = now or self.now_provider()
         cutoff_text = (current - timedelta(hours=hours)).isoformat()
-        rows = self.connection.execute(
-            """
-            SELECT device_id, matched, difference_type, context_json, created_at
-            FROM automation_runs
-            WHERE action_type = 'SHADOW_COMPARE' AND created_at >= ?
-            """,
-            (cutoff_text,),
-        ).fetchall()
-        total = len(rows)
-        matched = sum(1 for row in rows if row["matched"] == 1)
-        observation_errors = sum(
-            1 for row in rows if row["difference_type"] == "OBSERVATION_ERROR"
-        )
-        mismatch = total - matched - observation_errors
+        total = matched = observation_errors = 0
         by_difference_type: dict[str, int] = {}
         by_device: dict[str, dict[str, int]] = {}
         control_type_diagnostics = {
@@ -634,7 +690,12 @@ class ShadowRuntime:
         }
         control_type_mismatch_devices: set[str] = set()
         last_compare_time: str | None = None
-        for row in rows:
+        for row in self._summary_rows(cutoff_text):
+            total += 1
+            if row["matched"] == 1:
+                matched += 1
+            if row["difference_type"] == "OBSERVATION_ERROR":
+                observation_errors += 1
             key = row["difference_type"] or "MATCH"
             by_difference_type[key] = by_difference_type.get(key, 0) + 1
             device_stats = by_device.setdefault(
@@ -642,32 +703,33 @@ class ShadowRuntime:
                 {"total": 0, "matched": 0, "mismatch": 0, "observation_error": 0},
             )
             device_stats["total"] += 1
-            if row["matched"] == 1:
-                device_stats["matched"] += 1
-            elif row["difference_type"] == "OBSERVATION_ERROR":
-                device_stats["observation_error"] += 1
-            else:
-                device_stats["mismatch"] += 1
+            category = ("matched" if row["matched"] == 1 else
+                        "observation_error" if row["difference_type"] == "OBSERVATION_ERROR" else
+                        "mismatch")
+            device_stats[category] += 1
             try:
-                expected_context = json.loads(row["context_json"]).get("expected", {})
+                context = json.loads(row["context_json"])
+                expected = context.get("expected", {}) if isinstance(context, dict) else {}
+                if not isinstance(expected, dict):
+                    expected = {}
             except (TypeError, ValueError):
-                expected_context = {}
-            consistency = expected_context.get("control_type_consistency")
-            source = expected_context.get("control_type_source")
+                expected = {}
+            consistency = expected.get("control_type_consistency")
             diagnostic_key = {
                 "match": "standard_equals_legacy",
                 "mismatch": "standard_differs_legacy",
                 "standard_missing": "standard_missing",
                 "legacy_missing": "legacy_missing",
-            }.get(consistency)
+            }.get(consistency) if isinstance(consistency, str) else None
             if diagnostic_key is not None:
                 control_type_diagnostics[diagnostic_key] += 1
-            if source == "configuration_error":
+            if expected.get("control_type_source") == "configuration_error":
                 control_type_diagnostics["configuration_error"] += 1
             if consistency == "mismatch":
                 control_type_mismatch_devices.add(row["device_id"])
             if last_compare_time is None or row["created_at"] > last_compare_time:
                 last_compare_time = row["created_at"]
+        mismatch = total - matched - observation_errors
         standard_age = (
             (current - self._last_standard_sync_time).total_seconds()
             if self._last_standard_sync_time is not None
@@ -1134,7 +1196,7 @@ class ShadowRuntime:
                 previous_state=_expected_comparison_values(previous),
             )
         created_at = self.now_provider()
-        self.task_repository.create_or_get(
+        self.task_repository.create_or_get_unfinished(
             task_type="SHADOW_COMPARE",
             entity_type="DEVICE",
             entity_id=expected.device_id,
@@ -1143,7 +1205,7 @@ class ShadowRuntime:
                 "sample_time": sample_time.isoformat(),
                 "expected": _expected_payload(expected),
             },
-            dedupe_key=f"SHADOW_COMPARE:{expected.device_id}:{sample_time.isoformat()}",
+            dedupe_key=f"SHADOW_COMPARE:{expected.device_id}:latest",
             created_at=created_at,
         )
         self._last_expected_state[expected.device_id] = expected

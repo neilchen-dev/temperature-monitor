@@ -10,6 +10,14 @@ import config
 from services import feishu
 
 
+class ResourceLockTests(unittest.TestCase):
+    def test_record_locks_remain_bounded_and_stable(self) -> None:
+        locks = [feishu._resource_lock(f"record:{i}") for i in range(10000)]
+        self.assertLessEqual(len({id(lock) for lock in locks}), 128)
+        self.assertIs(feishu._resource_lock("record:shared"),
+                      feishu._resource_lock("record:shared"))
+
+
 class RecordDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         feishu._record_id_cache.clear()

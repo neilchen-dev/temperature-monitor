@@ -1075,6 +1075,15 @@ class SQLiteAutomationTaskRepository:
                         commit_sqlite(self.connection)
                         return self._require(winner["id"])
 
+                    # Comparisons observe current remote state. Keep the newest
+                    # expectation without postponing the existing queue slot;
+                    # replaying old samples cannot reconstruct past Feishu state.
+                    if task_type == "SHADOW_COMPARE" and winner["status"] == "PENDING":
+                        self.connection.execute(
+                            "UPDATE automation_tasks SET payload_json = ?, updated_at = ? WHERE id = ?",
+                            (payload_json, _datetime_text(created_at), winner["id"]),
+                        )
+
                     self._release_dedupe_key_from_other_row(
                         dedupe_key=dedupe_key,
                         winner_id=winner["id"],
@@ -1220,7 +1229,13 @@ class SQLiteAutomationTaskRepository:
                         status = ? AND lease_until IS NOT NULL AND lease_until <= ?
                     ))
                     """ + exclusion + """
-                    ORDER BY due_at, id
+                    ORDER BY CASE
+                        WHEN task_type IN ('VERIFY_ALARM', 'VERIFY_RECOVERY',
+                                           'RECONCILE_ALARM_EVENT', 'SYNC_STANDARD')
+                             OR task_type LIKE 'NOTIFY_%' THEN 0
+                        WHEN task_type = 'SHADOW_COMPARE' AND due_at > ? THEN 2
+                        ELSE 1 END,
+                             due_at, id
                     LIMIT ?
                     """,
                     (
@@ -1229,6 +1244,7 @@ class SQLiteAutomationTaskRepository:
                         AutomationTaskStatus.RUNNING.value,
                         now_text,
                         *exclude_task_ids,
+                        _datetime_text(now - timedelta(seconds=60)),
                         limit,
                     ),
                 ).fetchall()

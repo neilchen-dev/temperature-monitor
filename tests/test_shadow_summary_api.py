@@ -9,7 +9,12 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+from pathlib import Path
+import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -19,6 +24,7 @@ import config
 import runtime.bootstrap as bootstrap
 from integrations.feishu_records import FeishuRawRecord
 from runtime.bootstrap import RuntimeBootstrapError, build_runtime, shadow_summary_snapshot
+from runtime.shadow_runner import ShadowSummaryBusyError
 from routes.api import api_bp
 
 
@@ -187,6 +193,77 @@ class ShadowSummaryTests(unittest.TestCase):
         self.assertEqual(summary["by_difference_type"], {})
         self.assertEqual(summary["devices_with_no_compare"], ["TH-03", "TH-05", "TH-10"])
         self.assertIsNone(summary["standard_sync_age_seconds"])
+
+    def test_summary_diagnostics_tolerate_invalid_context(self) -> None:
+        for context in (
+            '{invalid', 'null', '[]',
+            json.dumps({"expected": {"control_type_consistency": "mismatch",
+                                     "control_type_source": "configuration_error"}}),
+        ):
+            self._insert_run(device_id="TH-10", matched=0, difference_type="X", created_at=self.now)
+            self.connection.execute("UPDATE automation_runs SET context_json=? WHERE id=?",
+                                    (context, f"run-{self._run_sequence}"))
+        self.connection.commit()
+        summary = self.components.runtime.shadow_summary()
+        self.assertEqual(summary["total_compare"], 4)
+        self.assertEqual(summary["control_type_diagnostics"]["standard_differs_legacy"], 1)
+        self.assertEqual(summary["control_type_diagnostics"]["configuration_error"], 1)
+        self.assertEqual(summary["control_type_mismatch_devices"], ["TH-10"])
+
+    def test_concurrent_summaries_share_one_computation_and_cache_is_bounded(self) -> None:
+        runtime = self.components.runtime
+        with patch.object(runtime, "_compute_shadow_summary", wraps=runtime._compute_shadow_summary) as compute:
+            threads = [threading.Thread(target=runtime.shadow_summary) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(compute.call_count, 1)
+            for hours in range(1, 12):
+                runtime.shadow_summary(hours=hours)
+            self.assertLessEqual(len(runtime._summary_cache), 8)
+
+    def test_file_summary_does_not_wait_for_scheduler_connection(self) -> None:
+        runtime = self.components.runtime
+        self._insert_run(device_id="TH-10", matched=1, difference_type=None, created_at=self.now)
+        self.connection.commit()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.db"
+            with sqlite3.connect(path) as target:
+                self.connection.backup(target)
+            runtime._summary_database = str(path)
+            results = []
+            with runtime._execution_lock:
+                thread = threading.Thread(target=lambda: results.append(runtime.shadow_summary()))
+                thread.start()
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(results[0]["total_compare"], 1)
+
+    def test_failed_summary_is_not_repeated_by_waiting_callers(self) -> None:
+        runtime = self.components.runtime
+        with patch.object(runtime, "_compute_shadow_summary", side_effect=sqlite3.OperationalError("interrupted")) as compute:
+            with self.assertRaises(sqlite3.OperationalError):
+                runtime.shadow_summary(hours=720)
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                runtime.shadow_summary(hours=720)
+            self.assertEqual(compute.call_count, 1)
+
+    def test_busy_summary_releases_http_workers_without_duplicate_scan(self) -> None:
+        runtime = self.components.runtime
+        runtime._summary_lock.acquire()
+        try:
+            with patch.object(runtime, "_compute_shadow_summary") as compute:
+                with self.assertRaises(ShadowSummaryBusyError):
+                    runtime.shadow_summary()
+                response = self.client.get("/api/shadow/summary", headers=self.headers)
+                summary = response.get_json()["summary"]
+                self.assertFalse(summary["available"])
+                self.assertEqual(summary["reason"], "shadow summary refresh in progress")
+                compute.assert_not_called()
+        finally:
+            runtime._summary_lock.release()
 
     def test_route_requires_auth(self) -> None:
         config.HISTORY_API_KEY = ""

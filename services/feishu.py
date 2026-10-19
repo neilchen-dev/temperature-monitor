@@ -19,8 +19,7 @@ from services.token import clear_token, get_token
 logger = logging.getLogger("temperature_monitor")
 # 串行化粒度是"资源"（某张表或某条记录），而不是全局：不同设备写不同
 # record、不同历史表之间可以并行，慢请求的重试退避只阻塞同一资源。
-_resource_locks: dict[str, threading.RLock] = {}
-_resource_locks_guard = threading.Lock()
+_resource_locks = tuple(threading.RLock() for _ in range(128))
 _record_id_cache: dict[str, tuple[str, float]] = {}
 _record_not_found_until: dict[str, float] = {}
 _record_id_lock = threading.Lock()
@@ -30,12 +29,9 @@ _TRANSIENT_BITABLE_CODES = {1254290, 1254291, 1254607, 1255040}
 
 
 def _resource_lock(key: str) -> threading.RLock:
-    with _resource_locks_guard:
-        lock = _resource_locks.get(key)
-        if lock is None:
-            lock = threading.RLock()
-            _resource_locks[key] = lock
-        return lock
+    # A key always selects the same lock for this process. Collisions only
+    # serialize unrelated resources; active locks are never evicted.
+    return _resource_locks[hash(key) % len(_resource_locks)]
 
 
 def _validate_bitable_config(*, require_default_table: bool = False) -> None:

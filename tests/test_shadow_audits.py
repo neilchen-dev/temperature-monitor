@@ -237,7 +237,8 @@ class ShadowAuditTests(unittest.TestCase):
         stop_event = threading.Event()
         calls: list[int] = []
 
-        def flaky_run_once() -> None:
+        def flaky_run_once(*, limit: int) -> None:
+            self.assertEqual(limit, 1)
             calls.append(1)
             if len(calls) == 1:
                 raise sqlite3.OperationalError("database is locked")
