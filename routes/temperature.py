@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import logging
 from datetime import datetime
 from typing import Any
@@ -9,6 +8,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 import config
+from routes.deps import temperature_auth_error
 from services import devices, projection
 from services.feishu import resolve_record_id, update_feishu_fields
 from services.storage import save_history
@@ -17,20 +17,6 @@ from services.validator import is_offline_status, normalize_humidity, normalize_
 
 temperature_bp = Blueprint("temperature", __name__)
 logger = logging.getLogger("temperature_monitor")
-
-
-def _temperature_auth_error() -> Any:
-    """Optional shared-key auth; stays disabled when TEMPERATURE_API_KEY is empty."""
-    if not config.TEMPERATURE_API_KEY:
-        return None
-
-    provided = (
-        request.headers.get("X-Temperature-Key", "")
-        or request.headers.get("X-History-Key", "")
-    )
-    if not provided or not hmac.compare_digest(provided, config.TEMPERATURE_API_KEY):
-        return jsonify({"status": "error", "error": "温度上报鉴权失败"}), 401
-    return None
 
 
 @temperature_bp.post("/temperature")
@@ -54,7 +40,7 @@ def temperature():
     (no guaranteed-wrong compares), and the request returns 200
     accepted/deferred.
     """
-    auth_error = _temperature_auth_error()
+    auth_error = temperature_auth_error()
     if auth_error:
         return auth_error
 
@@ -375,7 +361,7 @@ def temperature_heartbeat():
     presence table keeps them separate from ``device_samples`` so an
     unchanged sensor does not look like a fresh measurement.
     """
-    auth_error = _temperature_auth_error()
+    auth_error = temperature_auth_error()
     if auth_error:
         return auth_error
 

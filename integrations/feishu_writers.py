@@ -20,6 +20,7 @@ import config
 from domain.models import MonitorResult, MonitorSample
 from domain.operation import OperationAction, OperationObservation
 
+from .feishu_field_utils import field_text, parse_feishu_datetime
 from .feishu_records import FeishuRawRecord
 from .feishu_observation import business_closed
 from services.feishu import FeishuAPIError, normalize_client_token
@@ -522,40 +523,48 @@ class FeishuOperationRecordWriter:
         self,
         snapshot: MonitorSample | MonitorResult,
     ) -> dict[str, Any]:
-        fields: dict[str, Any] = {}
-        _put_number(fields, self.fields.interval_start_temperature, snapshot.temperature)
-        _put_number(fields, self.fields.interval_start_humidity, snapshot.humidity)
-        _put_text(
-            fields,
-            self.fields.interval_start_online,
-            _snapshot_online_text(snapshot),
+        return self._prefix_snapshot_fields(
+            snapshot,
+            temperature=self.fields.interval_start_temperature,
+            humidity=self.fields.interval_start_humidity,
+            online=self.fields.interval_start_online,
+            temperature_status=self.fields.interval_start_temperature_status,
+            humidity_status=self.fields.interval_start_humidity_status,
         )
-        if isinstance(snapshot, MonitorResult):
-            fields[self.fields.interval_start_temperature_status] = _temperature_status_text(
-                snapshot.temperature_status.value
-            )
-            fields[self.fields.interval_start_humidity_status] = _temperature_status_text(
-                snapshot.humidity_status.value
-            )
-        return fields
 
     def _interval_end_fields(
         self,
         snapshot: MonitorSample | MonitorResult,
     ) -> dict[str, Any]:
-        fields: dict[str, Any] = {}
-        _put_number(fields, self.fields.interval_end_temperature, snapshot.temperature)
-        _put_number(fields, self.fields.interval_end_humidity, snapshot.humidity)
-        _put_text(
-            fields,
-            self.fields.interval_end_online,
-            _snapshot_online_text(snapshot),
+        return self._prefix_snapshot_fields(
+            snapshot,
+            temperature=self.fields.interval_end_temperature,
+            humidity=self.fields.interval_end_humidity,
+            online=self.fields.interval_end_online,
+            temperature_status=self.fields.interval_end_temperature_status,
+            humidity_status=self.fields.interval_end_humidity_status,
         )
+
+    def _prefix_snapshot_fields(
+        self,
+        snapshot: MonitorSample | MonitorResult,
+        *,
+        temperature: str | None,
+        humidity: str | None,
+        online: str | None,
+        temperature_status: str | None,
+        humidity_status: str | None,
+    ) -> dict[str, Any]:
+        """Assemble one prefixed snapshot column group (interval start/end)."""
+        fields: dict[str, Any] = {}
+        _put_number(fields, temperature, snapshot.temperature)
+        _put_number(fields, humidity, snapshot.humidity)
+        _put_text(fields, online, _snapshot_online_text(snapshot))
         if isinstance(snapshot, MonitorResult):
-            fields[self.fields.interval_end_temperature_status] = _temperature_status_text(
+            fields[temperature_status] = _temperature_status_text(
                 snapshot.temperature_status.value
             )
-            fields[self.fields.interval_end_humidity_status] = _temperature_status_text(
+            fields[humidity_status] = _temperature_status_text(
                 snapshot.humidity_status.value
             )
         return fields
@@ -1844,6 +1853,14 @@ def _required_id(value: str, name: str) -> str:
     return normalized
 
 
+def _strict_alias(aliases: Mapping[str, str], text: str, *, error: str) -> str:
+    """Strict alias lookup: unknown text raises a descriptive ValueError."""
+    try:
+        return aliases[text]
+    except KeyError as exc:
+        raise ValueError(f"{error}: {text!r}") from exc
+
+
 def _device_id(value: Any) -> str:
     normalized = _required_id(str(value), "device_id").upper()
     return normalized
@@ -1852,35 +1869,33 @@ def _device_id(value: Any) -> str:
 def _action_text(value: OperationAction | str) -> str:
     if isinstance(value, OperationAction):
         value = value.value
-    aliases = {
-        "StartOperation": "开始作业",
-        "SwitchOperation": "工艺切换",
-        "EndOperation": "结束作业",
-        "开始作业": "开始作业",
-        "工艺切换": "工艺切换",
-        "结束作业": "结束作业",
-    }
-    text = str(value).strip()
-    try:
-        return aliases[text]
-    except KeyError as exc:
-        raise ValueError(f"不支持的作业动作: {value!r}") from exc
+    return _strict_alias(
+        {
+            "StartOperation": "开始作业",
+            "SwitchOperation": "工艺切换",
+            "EndOperation": "结束作业",
+            "开始作业": "开始作业",
+            "工艺切换": "工艺切换",
+            "结束作业": "结束作业",
+        },
+        str(value).strip(),
+        error="不支持的作业动作",
+    )
 
 
 def _operation_state_text(value: str) -> str:
-    aliases = {
-        "OPERATING": "作业中",
-        "IDLE": "无作业",
-        "NOT_APPLICABLE": "N/A",
-        "作业中": "作业中",
-        "无作业": "无作业",
-        "N/A": "N/A",
-    }
-    text = str(value).strip()
-    try:
-        return aliases[text]
-    except KeyError as exc:
-        raise ValueError(f"不支持的作业状态: {value!r}") from exc
+    return _strict_alias(
+        {
+            "OPERATING": "作业中",
+            "IDLE": "无作业",
+            "NOT_APPLICABLE": "N/A",
+            "作业中": "作业中",
+            "无作业": "无作业",
+            "N/A": "N/A",
+        },
+        str(value).strip(),
+        error="不支持的作业状态",
+    )
 
 
 _OPERATION_AREAS = frozenset({"精密装配间", "电力电子实验室", "通用总装线", "特种工艺间"})
@@ -1938,16 +1953,15 @@ def _interval_operation_type_text(value: Any) -> str:
 
 
 def _interval_status_text(value: Any) -> str:
-    aliases = {
-        "作业中": "作业中",
-        "已结束": "已结束",
-        "工艺切换结束": "工艺切换结束",
-    }
-    text = str(value).strip()
-    try:
-        return aliases[text]
-    except KeyError as exc:
-        raise ValueError(f"不支持的作业区间状态: {value!r}") from exc
+    return _strict_alias(
+        {
+            "作业中": "作业中",
+            "已结束": "已结束",
+            "工艺切换结束": "工艺切换结束",
+        },
+        str(value).strip(),
+        error="不支持的作业区间状态",
+    )
 
 
 def _datetime_cell(value: datetime) -> int:
@@ -2008,35 +2022,35 @@ def _put_monitoring_system_status(
 ) -> None:
     if value is None:
         return
-    aliases = {
-        "ONLINE": "在线正常",
-        "在线": "在线正常",
-        "在线正常": "在线正常",
-        "OFFLINE": "离线/数据异常",
-        "离线": "离线/数据异常",
-        "离线/数据异常": "离线/数据异常",
-        "UNKNOWN": "待确认",
-        "待确认": "待确认",
-    }
-    text = str(getattr(value, "value", value)).strip()
-    if text not in aliases:
-        raise ValueError(f"不支持的监测系统状态: {value!r}")
-    fields[name] = aliases[text]
+    fields[name] = _strict_alias(
+        {
+            "ONLINE": "在线正常",
+            "在线": "在线正常",
+            "在线正常": "在线正常",
+            "OFFLINE": "离线/数据异常",
+            "离线": "离线/数据异常",
+            "离线/数据异常": "离线/数据异常",
+            "UNKNOWN": "待确认",
+            "待确认": "待确认",
+        },
+        str(getattr(value, "value", value)).strip(),
+        error="不支持的监测系统状态",
+    )
 
 
 def _put_site_storage_status(fields: dict[str, Any], name: str, value: Any) -> None:
     if value is None:
         return
-    aliases = {
-        "正常": "正常，无明显异常",
-        "正常，无明显异常": "正常，无明显异常",
-        "发现异常": "发现异常",
-        "待跟进": "待跟进",
-    }
-    text = str(getattr(value, "value", value)).strip()
-    if text not in aliases:
-        raise ValueError(f"不支持的现场仓储状态: {value!r}")
-    fields[name] = aliases[text]
+    fields[name] = _strict_alias(
+        {
+            "正常": "正常，无明显异常",
+            "正常，无明显异常": "正常，无明显异常",
+            "发现异常": "发现异常",
+            "待跟进": "待跟进",
+        },
+        str(getattr(value, "value", value)).strip(),
+        error="不支持的现场仓储状态",
+    )
 
 
 def _put_status(fields: dict[str, Any], name: str, value: Any) -> None:
@@ -2050,18 +2064,18 @@ def _put_status(fields: dict[str, Any], name: str, value: Any) -> None:
 def _put_alarm_status(fields: dict[str, Any], name: str, value: Any) -> None:
     if value is None:
         return
-    aliases = {
-        "NORMAL": "未触发",
-        "PENDING": "计时中",
-        "ALARM": "已发警报",
-        "未触发": "未触发",
-        "计时中": "计时中",
-        "已发警报": "已发警报",
-    }
-    text = str(getattr(value, "value", value)).strip()
-    if text not in aliases:
-        raise ValueError(f"不支持的报警状态: {value!r}")
-    fields[name] = aliases[text]
+    fields[name] = _strict_alias(
+        {
+            "NORMAL": "未触发",
+            "PENDING": "计时中",
+            "ALARM": "已发警报",
+            "未触发": "未触发",
+            "计时中": "计时中",
+            "已发警报": "已发警报",
+        },
+        str(getattr(value, "value", value)).strip(),
+        error="不支持的报警状态",
+    )
 
 
 def _temperature_status_text(value: str) -> str:
@@ -2156,26 +2170,11 @@ def _created_record_id(response: Mapping[str, Any]) -> str | None:
 
 
 def _field_text(value: Any) -> str:
-    if isinstance(value, list):
-        return " ".join(_field_text(item) for item in value).strip()
-    if isinstance(value, Mapping):
-        if "value" in value:
-            return _field_text(value["value"])
-        return str(value.get("text", value.get("name", ""))).strip()
-    return str(value or "").strip()
+    return field_text(value)
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        from datetime import timezone
-
-        seconds = float(value) / 1000 if float(value) > 10_000_000_000 else float(value)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
     try:
-        return datetime.fromisoformat(_field_text(value).replace("Z", "+00:00"))
+        return parse_feishu_datetime(value)
     except ValueError as exc:
         raise FeishuWriteError(f"无法解析时间字段: {value!r}") from exc

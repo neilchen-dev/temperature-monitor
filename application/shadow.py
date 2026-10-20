@@ -8,6 +8,8 @@ from typing import Any, Mapping, Protocol
 
 from domain.models import AlarmLifecycleState, OperationState, OperationStatus
 
+from .timeutils import iso_value, parse_datetime
+
 
 @dataclass(frozen=True)
 class ExpectedAutomationState:
@@ -56,6 +58,78 @@ class ObservedAutomationState:
     # 已写恢复时间但仍未人工关闭的飞书事件数（“待人工闭环”）。
     # 它们不是当前活动报警，而是报警生命周期的收尾尾巴。
     pending_closure_count: int | None = None
+
+
+def expected_state_payload(expected: ExpectedAutomationState) -> dict[str, Any]:
+    """Full round-trip serialization of an expected state (task payload form)."""
+    return {
+        "device_id": expected.device_id,
+        "alarm_state": expected.alarm_state,
+        "operation_state": expected.operation_state,
+        "event_exists": expected.event_exists,
+        "overall_status": expected.overall_status,
+        "standard_id": expected.standard_id,
+        "standard_revision": expected.standard_revision,
+        "standard_source": expected.standard_source,
+        "active_event_count": expected.active_event_count,
+        "expected_at": iso_value(expected.expected_at),
+        "applicability": expected.applicability,
+        "data_quality": expected.data_quality,
+        "temperature_status": expected.temperature_status,
+        "humidity_status": expected.humidity_status,
+        "active_event_ids": list(expected.active_event_ids),
+        "operation_type": expected.operation_type,
+        "resolved_control_type": expected.resolved_control_type,
+        "control_type_source": expected.control_type_source,
+        "control_type_consistency": expected.control_type_consistency,
+        "previous_state": (
+            dict(expected.previous_state) if expected.previous_state is not None else None
+        ),
+    }
+
+
+def expected_comparison_values(expected: ExpectedAutomationState) -> dict[str, Any]:
+    """Business-rule subset used to compare expected vs observed projections."""
+    return {
+        "alarm_state": expected.alarm_state,
+        "operation_state": expected.operation_state,
+        "event_exists": expected.event_exists,
+        "overall_status": expected.overall_status,
+        "standard_id": expected.standard_id,
+        "standard_revision": expected.standard_revision,
+        "standard_source": expected.standard_source,
+        "applicability": expected.applicability,
+        "data_quality": expected.data_quality,
+        "temperature_status": expected.temperature_status,
+        "humidity_status": expected.humidity_status,
+        "operation_type": expected.operation_type,
+    }
+
+
+def expected_state_from_payload(payload: Mapping[str, Any]) -> ExpectedAutomationState:
+    """Rebuild an expected state from its serialized task payload."""
+    return ExpectedAutomationState(
+        device_id=str(payload["device_id"]),
+        alarm_state=str(payload["alarm_state"]),
+        operation_state=str(payload["operation_state"]),
+        event_exists=bool(payload["event_exists"]),
+        overall_status=payload.get("overall_status"),
+        standard_id=payload.get("standard_id"),
+        standard_revision=payload.get("standard_revision"),
+        standard_source=payload.get("standard_source"),
+        active_event_count=payload.get("active_event_count"),
+        expected_at=parse_datetime(payload.get("expected_at")),
+        applicability=payload.get("applicability"),
+        data_quality=payload.get("data_quality"),
+        temperature_status=payload.get("temperature_status"),
+        humidity_status=payload.get("humidity_status"),
+        active_event_ids=tuple(payload.get("active_event_ids") or ()),
+        operation_type=payload.get("operation_type"),
+        resolved_control_type=payload.get("resolved_control_type"),
+        control_type_source=payload.get("control_type_source"),
+        control_type_consistency=payload.get("control_type_consistency"),
+        previous_state=payload.get("previous_state"),
+    )
 
 
 @dataclass(frozen=True)

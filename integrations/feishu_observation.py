@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from collections.abc import Mapping
 import math
 from typing import Any, Protocol
 
 from application.shadow import ObservedAutomationState
 from services.event_identity import epoch_milliseconds
+
+from .feishu_field_utils import field_text_at, parse_feishu_datetime
 
 
 class FeishuObservationSource(Protocol):
@@ -374,33 +376,12 @@ def _optional_ids(raw: Mapping[str, Any], field_name: str | None) -> tuple[str, 
 def _optional_datetime(raw: Mapping[str, Any], field_name: str | None) -> datetime | None:
     if field_name is None:
         return None
-    value = raw.get(field_name)
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        seconds = float(value) / 1000 if float(value) > 10_000_000_000 else float(value)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
-    return datetime.fromisoformat(_text(value).replace("Z", "+00:00"))
+    return parse_feishu_datetime(raw.get(field_name))
 
 
 def _field_text(fields: Mapping[str, Any] | Any, field_name: str | None = None) -> str:
-    if field_name is None:
-        value = fields
-    else:
-        value = fields.get(field_name)
-    return _text(value)
+    return field_text_at(fields, field_name)
 
 
 def _record_time(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        from datetime import timezone
-
-        seconds = float(value) / 1000 if float(value) > 10_000_000_000 else float(value)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
-    return datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    return parse_feishu_datetime(value)

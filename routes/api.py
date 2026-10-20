@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
-import hmac
 import requests
 from typing import Any
 
@@ -35,8 +34,14 @@ from runtime.bootstrap import (
 
 import config
 from application.active_scope import active_scope_allows, normalize_device_id
+from routes.deps import (
+    feishu_write_disabled_error,
+    history_auth_error,
+    json_payload,
+    mirror_disabled_error,
+)
 from integrations.feishu_records import FeishuBitableRecordSource
-from integrations.feishu_observation import _field_text
+from integrations.feishu_field_utils import field_text_at
 from integrations.feishu_writers import (
     FeishuBitableRecordWriter,
     FeishuEnvironmentEventWriter,
@@ -49,41 +54,6 @@ from services.collector import get_collector_status
 
 
 api_bp = Blueprint("api", __name__)
-
-def _auth_error():
-    if not config.HISTORY_API_KEY:
-        return jsonify({
-            "status": "error",
-            "error": "本地查询未配置：缺少 HISTORY_API_KEY",
-        }), 503
-
-    provided = (
-        request.headers.get("X-History-Key", "")
-        or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    )
-    if not provided or not hmac.compare_digest(provided, config.HISTORY_API_KEY):
-        return jsonify({"status": "error", "error": "API 鉴权失败"}), 401
-    return None
-
-
-def _mirror_disabled_error():
-    """A dead/disabled SQLite mirror must surface as 503, not empty lists."""
-    if db.is_enabled():
-        return None
-    return jsonify({
-        "status": "error",
-        "error": "SQLite 本地镜像未启用或初始化失败",
-    }), 503
-
-
-def _feishu_write_disabled_error():
-    if config.FEISHU_WRITE_ENABLED and str(config.AUTOMATION_MODE).lower() == "active":
-        return None
-    return jsonify({
-        "status": "error",
-        "error": "飞书写入未启用；请同时设置 FEISHU_WRITE_ENABLED=true 和 AUTOMATION_MODE=active",
-    }), 503
-
 
 def _active_scope_error(device_id: object, *, reason: str | None = None):
     normalized = normalize_device_id(device_id)
@@ -164,13 +134,6 @@ def _resolve_environment_event_device_id(
     return next(iter(device_ids)), None
 
 
-def _json_payload() -> tuple[dict | None, tuple]:
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return None, (jsonify({"status": "error", "error": "请求体必须是 JSON 对象"}), 400)
-    return payload, ()
-
-
 def _inspection_scope_error(payload: dict, source: FeishuBitableRecordSource):
     """Bind a regional inspection and its parent to the allowed device."""
     device_id = normalize_device_id(payload.get("device_id"))
@@ -191,12 +154,12 @@ def _inspection_scope_error(payload: dict, source: FeishuBitableRecordSource):
         matches = [record for record in records
                    if _record_field_device_ids(record.fields.get(config.DEVICE_ID_FIELD))
                    == {device_id}]
-        if len(matches) != 1 or _field_text(matches[0].fields, "区域") != area.strip():
+        if len(matches) != 1 or field_text_at(matches[0].fields, "区域") != area.strip():
             return _active_scope_error(device_id, reason="点检区域与设备权威区域不一致")
         if parent_id is not None:
             parents = [record for record in source.read_records(config.FEISHU_INSPECTION_TABLE_ID)
                        if record.record_id == parent_id.strip()]
-            if len(parents) != 1 or _field_text(parents[0].fields, "仓库区域") != area.strip():
+            if len(parents) != 1 or field_text_at(parents[0].fields, "仓库区域") != area.strip():
                 return _active_scope_error(device_id, reason="父记录不属于当前点检区域")
     except Exception:  # noqa: BLE001 - uncertain identity must fail closed
         return _active_scope_error(device_id, reason="无法确认点检区域或父记录归属，拒绝写入")
@@ -240,7 +203,7 @@ def _serialize_device_state(row: dict) -> dict:
 
 @api_bp.get("/api/devices")
 def list_devices():
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -252,7 +215,7 @@ def list_devices():
 
 @api_bp.get("/api/devices/<device_id>")
 def device_detail(device_id: str):
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -302,7 +265,7 @@ def device_detail(device_id: str):
 
 @api_bp.get("/api/events")
 def list_events():
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -320,10 +283,10 @@ def list_events():
 @api_bp.post("/api/operations")
 def create_operation_registration():
     """Create one validated operation registration in the Feishu source table."""
-    error = _auth_error() or _feishu_write_disabled_error()
+    error = history_auth_error() or feishu_write_disabled_error()
     if error:
         return error
-    payload, payload_error = _json_payload()
+    payload, payload_error = json_payload()
     if payload_error:
         return payload_error
     assert payload is not None
@@ -370,10 +333,10 @@ def create_operation_registration():
 @api_bp.post("/api/environment-events")
 def create_environment_event():
     """Create one ENV event after enforcing the single-active-event rule."""
-    error = _auth_error() or _feishu_write_disabled_error()
+    error = history_auth_error() or feishu_write_disabled_error()
     if error:
         return error
-    payload, payload_error = _json_payload()
+    payload, payload_error = json_payload()
     if payload_error:
         return payload_error
     assert payload is not None
@@ -408,10 +371,10 @@ def create_environment_event():
 @api_bp.patch("/api/environment-events/<record_id>")
 def close_environment_event(record_id: str):
     """Close an ENV event only after the required manual closure fields exist."""
-    error = _auth_error() or _feishu_write_disabled_error()
+    error = history_auth_error() or feishu_write_disabled_error()
     if error:
         return error
-    payload, payload_error = _json_payload()
+    payload, payload_error = json_payload()
     if payload_error:
         return payload_error
     assert payload is not None
@@ -449,10 +412,10 @@ def close_environment_event(record_id: str):
 @api_bp.post("/api/inspections")
 def create_inspection_record():
     """Create one warehouse inspection record with safe link/number handling."""
-    error = _auth_error() or _feishu_write_disabled_error()
+    error = history_auth_error() or feishu_write_disabled_error()
     if error:
         return error
-    payload, payload_error = _json_payload()
+    payload, payload_error = json_payload()
     if payload_error:
         return payload_error
     assert payload is not None
@@ -501,7 +464,7 @@ def create_inspection_record():
 
 @api_bp.get("/api/thresholds")
 def list_thresholds():
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -511,7 +474,7 @@ def list_thresholds():
 
 @api_bp.put("/api/thresholds/<device_id>")
 def replace_threshold(device_id: str):
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -563,7 +526,7 @@ def _settings_runtime_summary() -> dict:
 @api_bp.get("/api/settings")
 def get_settings():
     """List the whitelisted runtime settings with schema and provenance."""
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -577,11 +540,11 @@ def get_settings():
 @api_bp.patch("/api/settings")
 def patch_settings():
     """Apply one whitelisted settings change set (validated, audited, hot)."""
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
-    payload, payload_error = _json_payload()
+    payload, payload_error = json_payload()
     if payload_error:
         return payload_error
     assert payload is not None
@@ -608,7 +571,7 @@ def patch_settings():
 @api_bp.get("/api/settings/audit")
 def settings_audit():
     """Recent runtime-settings change records, newest first (limit <= 100)."""
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -627,7 +590,7 @@ def system_status():
     summary = db.fetch_device_summary()
     last_sample_ms = summary.get("last_sample_time_ms")
     if request.headers.get("X-History-Key") or request.headers.get("Authorization"):
-        auth_error = _auth_error()
+        auth_error = history_auth_error()
         if auth_error:
             return auth_error
     else:
@@ -673,7 +636,7 @@ def shadow_summary_route():
     Requires HISTORY_API_KEY like other read endpoints; exposes counts only
     (never record payloads or credentials).
     """
-    auth_error = _auth_error()
+    auth_error = history_auth_error()
     if auth_error:
         return auth_error
     hours = request.args.get("hours", default=24, type=int)

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write
-from repositories.sqlite import begin_sqlite_write, commit_sqlite, rollback_sqlite
+from repositories.sqlite import apply_column_migrations, commit_sqlite, rollback_sqlite, sqlite_write_txn
 
 
 class EnvironmentEventStatus(str):
@@ -69,6 +69,26 @@ def _time_value(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value is not None else None
 
 
+def remote_record_missing_payload(
+    *, missing_at_text: str, error: str
+) -> dict[str, Any]:
+    """Canonical payload keys describing a linked remote-record deletion.
+
+    Both the repository (``mark_external_record_missing``) and the legacy
+    mirror's best-effort sweep (``services.db.mark_feishu_record_missing``)
+    must stamp identical keys, so the shape lives exactly once here.
+    """
+    return {
+        "feishu_record_missing": True,
+        "feishu_record_missing_at": missing_at_text,
+        "feishu_record_missing_error": str(error),
+        "feishu_binding_status": "DELETED",
+        "feishu_update_pending": False,
+        "feishu_recovery_pending": False,
+        "local_close_reason": "linked_feishu_record_deleted",
+    }
+
+
 class SQLiteEnvironmentEventRepository:
     """Use SQLite constraints and a write transaction for event idempotency."""
 
@@ -83,15 +103,15 @@ class SQLiteEnvironmentEventRepository:
                 self._apply_migrations()
 
     def _apply_migrations(self) -> None:
-        columns = {
-            row[1]
-            for row in self.connection.execute("PRAGMA table_info(environment_events)")
-        }
-        for column in ("external_create_owner", "external_create_lease_until"):
-            if column not in columns:
-                self.connection.execute(
-                    f"ALTER TABLE environment_events ADD COLUMN {column} TEXT"
-                )
+        apply_column_migrations(
+            self.connection,
+            {
+                "environment_events": (
+                    ("external_create_owner", "TEXT"),
+                    ("external_create_lease_until", "TEXT"),
+                ),
+            },
+        )
 
     @retry_sqlite_write
     def create_or_get_active(
@@ -119,47 +139,39 @@ class SQLiteEnvironmentEventRepository:
             sort_keys=True,
             separators=(",", ":"),
         )
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                existing = self._find_by_key(event_key)
-                if existing is None:
-                    existing = self._find_active(device_id)
-                if existing is not None:
-                    commit_sqlite(self.connection)
-                    return existing
+        with sqlite_write_txn(self.connection, self._lock):
+            existing = self._find_by_key(event_key)
+            if existing is None:
+                existing = self._find_active(device_id)
+            if existing is not None:
+                return existing
 
-                event_id = uuid.uuid4().hex
-                try:
-                    self.connection.execute(
-                        """
-                        INSERT INTO environment_events (
-                            event_id, device_id, event_key, status,
-                            opened_at, closed_at, payload_json
-                        ) VALUES (?, ?, ?, ?, ?, NULL, ?)
-                        """,
-                        (
-                            event_id,
-                            device_id,
-                            event_key,
-                            EnvironmentEventStatus.OPEN,
-                            _time_text(opened_at),
-                            payload_json,
-                        ),
-                    )
-                except sqlite3.IntegrityError:
-                    # A separate connection may have won after this process
-                    # began.  Roll back before reading the committed winner.
-                    rollback_sqlite(self.connection)
-                    existing = self._find_by_key(event_key) or self._find_active(device_id)
-                    if existing is None:
-                        raise
-                    return existing
-                commit_sqlite(self.connection)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+            event_id = uuid.uuid4().hex
+            try:
+                self.connection.execute(
+                    """
+                    INSERT INTO environment_events (
+                        event_id, device_id, event_key, status,
+                        opened_at, closed_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        event_id,
+                        device_id,
+                        event_key,
+                        EnvironmentEventStatus.OPEN,
+                        _time_text(opened_at),
+                        payload_json,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # A separate connection may have won after this process
+                # began.  Roll back before reading the committed winner.
+                rollback_sqlite(self.connection)
+                existing = self._find_by_key(event_key) or self._find_active(device_id)
+                if existing is None:
+                    raise
+                return existing
             return self._require(event_id)
 
     @retry_sqlite_write
@@ -200,47 +212,34 @@ class SQLiteEnvironmentEventRepository:
         error: str,
     ) -> EnvironmentEventRecord:
         """Close local tracking when the linked Feishu row was deleted."""
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                payload.update(
-                    {
-                        "feishu_record_missing": True,
-                        "feishu_record_missing_at": _time_text(missing_at),
-                        "feishu_record_missing_error": str(error),
-                        "feishu_binding_status": "DELETED",
-                        "feishu_update_pending": False,
-                        "feishu_recovery_pending": False,
-                        "local_close_reason": "linked_feishu_record_deleted",
-                    }
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            payload.update(
+                remote_record_missing_payload(
+                    missing_at_text=_time_text(missing_at), error=str(error)
                 )
-                self.connection.execute(
-                    """
-                    UPDATE environment_events
-                    SET status = ?, closed_at = COALESCE(closed_at, ?),
-                        payload_json = ?
-                    WHERE event_id = ?
-                    """,
-                    (
-                        EnvironmentEventStatus.CLOSED,
-                        _time_text(missing_at),
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        event_id,
+            )
+            self.connection.execute(
+                """
+                UPDATE environment_events
+                SET status = ?, closed_at = COALESCE(closed_at, ?),
+                    payload_json = ?
+                WHERE event_id = ?
+                """,
+                (
+                    EnvironmentEventStatus.CLOSED,
+                    _time_text(missing_at),
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
-                )
-                commit_sqlite(self.connection)
-                return self._require(event_id)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+                    event_id,
+                ),
+            )
+            return self._require(event_id)
 
     def mark_recovered(
         self,
@@ -258,21 +257,15 @@ class SQLiteEnvironmentEventRepository:
     @retry_sqlite_write
     def patch_external_projection(self, event_id: str, **values: Any) -> EnvironmentEventRecord:
         """Merge projection metadata under a database write transaction."""
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                payload.update(values)
-                self.connection.execute(
-                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                    (json.dumps(payload, ensure_ascii=False), event_id),
-                )
-                commit_sqlite(self.connection)
-                return self._require(event_id)
-            except Exception:
-                rollback_sqlite(self.connection)
-                raise
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            payload.update(values)
+            self.connection.execute(
+                "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                (json.dumps(payload, ensure_ascii=False), event_id),
+            )
+            return self._require(event_id)
 
     @retry_sqlite_write
     def reserve_external_post(self, event_id: str) -> bool:
@@ -284,40 +277,32 @@ class SQLiteEnvironmentEventRepository:
         that is the only state which re-opens the same local event identity for
         another POST.
         """
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                if payload.get("feishu_record_id"):
-                    commit_sqlite(self.connection)
-                    return False
-                create_state = payload.get("feishu_create_state")
-                if payload.get("feishu_create_attempted") and create_state != ExternalCreateOutcome.RETRYABLE:
-                    commit_sqlite(self.connection)
-                    return False
-                payload["feishu_create_attempted"] = True
-                payload["feishu_create_state"] = ExternalCreateOutcome.IN_FLIGHT
-                payload["feishu_create_attempt_count"] = int(
-                    payload.get("feishu_create_attempt_count", 0)
-                ) + 1
-                self.connection.execute(
-                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                    (
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        event_id,
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            if payload.get("feishu_record_id"):
+                return False
+            create_state = payload.get("feishu_create_state")
+            if payload.get("feishu_create_attempted") and create_state != ExternalCreateOutcome.RETRYABLE:
+                return False
+            payload["feishu_create_attempted"] = True
+            payload["feishu_create_state"] = ExternalCreateOutcome.IN_FLIGHT
+            payload["feishu_create_attempt_count"] = int(
+                payload.get("feishu_create_attempt_count", 0)
+            ) + 1
+            self.connection.execute(
+                "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
-                )
-                commit_sqlite(self.connection)
-                return True
-            except Exception:
-                rollback_sqlite(self.connection)
-                raise
+                    event_id,
+                ),
+            )
+            return True
 
     @retry_sqlite_write
     def mark_external_create_outcome(
@@ -338,41 +323,34 @@ class SQLiteEnvironmentEventRepository:
         }
         if outcome not in allowed:
             raise ValueError(f"unsupported external CREATE outcome: {outcome}")
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                payload["feishu_create_state"] = outcome
-                if error:
-                    payload["feishu_create_last_error"] = str(error)
-                else:
-                    payload.pop("feishu_create_last_error", None)
-                if observed_at is not None:
-                    payload["feishu_create_outcome_at"] = _time_text(observed_at)
-                self.connection.execute(
-                    """
-                    UPDATE environment_events
-                    SET payload_json = ?, external_create_owner = NULL,
-                        external_create_lease_until = NULL
-                    WHERE event_id = ?
-                    """,
-                    (
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        event_id,
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            payload["feishu_create_state"] = outcome
+            if error:
+                payload["feishu_create_last_error"] = str(error)
+            else:
+                payload.pop("feishu_create_last_error", None)
+            if observed_at is not None:
+                payload["feishu_create_outcome_at"] = _time_text(observed_at)
+            self.connection.execute(
+                """
+                UPDATE environment_events
+                SET payload_json = ?, external_create_owner = NULL,
+                    external_create_lease_until = NULL
+                WHERE event_id = ?
+                """,
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
-                )
-                commit_sqlite(self.connection)
-                return self._require(event_id)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+                    event_id,
+                ),
+            )
+            return self._require(event_id)
 
     @retry_sqlite_write
     def bind_external_record(
@@ -384,75 +362,68 @@ class SQLiteEnvironmentEventRepository:
         """Bind a cycle to its Feishu event and transfer ownership on reuse."""
         if not record_id.strip():
             raise ValueError("record_id cannot be empty")
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                existing = payload.get("feishu_record_id")
-                if existing is not None and existing != record_id:
-                    raise ValueError(
-                        f"environment event {event_id} is already bound to {existing}"
-                    )
-                for row in self.connection.execute(
-                    """
-                    SELECT event_id, device_id, status, opened_at, payload_json FROM environment_events
-                    WHERE event_id <> ?
-                    """,
-                    (event_id,),
-                ):
-                    other_payload = json.loads(row["payload_json"])
-                    if other_payload.get("feishu_record_id") == record_id:
-                        if (
-                            row["device_id"] != record.device_id
-                            or row["status"] != EnvironmentEventStatus.CLOSED
-                            or _time_value(row["opened_at"]) >= record.opened_at
-                        ):
-                            raise ValueError(
-                                f"Feishu record {record_id} is already bound to "
-                                f"environment event {row['event_id']}"
-                            )
-                        # Retain the historical binding but transfer projection
-                        # ownership so delayed recovery cannot overwrite a new cycle.
-                        other_payload.update(
-                            feishu_superseded_by=event_id,
-                            feishu_recovery_pending=False,
-                            feishu_update_pending=False,
-                        )
-                        self.connection.execute(
-                            "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                            (json.dumps(other_payload, ensure_ascii=False), row["event_id"]),
-                        )
-                payload["feishu_record_id"] = record_id
-                payload["feishu_binding_status"] = "BOUND"
-                payload["feishu_create_state"] = ExternalCreateOutcome.SUCCEEDED
-                payload.pop("feishu_create_last_error", None)
-                if record.closed_at is not None:
-                    payload.setdefault("feishu_recovered_at", record.closed_at.isoformat())
-                    payload.setdefault("feishu_recovery_pending", True)
-                self.connection.execute(
-                    """
-                    UPDATE environment_events
-                    SET payload_json = ?, external_create_owner = NULL,
-                        external_create_lease_until = NULL
-                    WHERE event_id = ?
-                    """,
-                    (
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        event_id,
-                    ),
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            existing = payload.get("feishu_record_id")
+            if existing is not None and existing != record_id:
+                raise ValueError(
+                    f"environment event {event_id} is already bound to {existing}"
                 )
-                commit_sqlite(self.connection)
-                return self._require(event_id)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+            for row in self.connection.execute(
+                """
+                SELECT event_id, device_id, status, opened_at, payload_json FROM environment_events
+                WHERE event_id <> ?
+                """,
+                (event_id,),
+            ):
+                other_payload = json.loads(row["payload_json"])
+                if other_payload.get("feishu_record_id") == record_id:
+                    if (
+                        row["device_id"] != record.device_id
+                        or row["status"] != EnvironmentEventStatus.CLOSED
+                        or _time_value(row["opened_at"]) >= record.opened_at
+                    ):
+                        raise ValueError(
+                            f"Feishu record {record_id} is already bound to "
+                            f"environment event {row['event_id']}"
+                        )
+                    # Retain the historical binding but transfer projection
+                    # ownership so delayed recovery cannot overwrite a new cycle.
+                    other_payload.update(
+                        feishu_superseded_by=event_id,
+                        feishu_recovery_pending=False,
+                        feishu_update_pending=False,
+                    )
+                    self.connection.execute(
+                        "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                        (json.dumps(other_payload, ensure_ascii=False), row["event_id"]),
+                    )
+            payload["feishu_record_id"] = record_id
+            payload["feishu_binding_status"] = "BOUND"
+            payload["feishu_create_state"] = ExternalCreateOutcome.SUCCEEDED
+            payload.pop("feishu_create_last_error", None)
+            if record.closed_at is not None:
+                payload.setdefault("feishu_recovered_at", record.closed_at.isoformat())
+                payload.setdefault("feishu_recovery_pending", True)
+            self.connection.execute(
+                """
+                UPDATE environment_events
+                SET payload_json = ?, external_create_owner = NULL,
+                    external_create_lease_until = NULL
+                WHERE event_id = ?
+                """,
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    event_id,
+                ),
+            )
+            return self._require(event_id)
 
     def get_external_effect(
         self, event_id: str, effect_key: str,
@@ -546,39 +517,31 @@ class SQLiteEnvironmentEventRepository:
     ) -> EnvironmentEventRecord:
         if not effect_key.strip():
             raise ValueError("effect_key cannot be empty")
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                effects = payload.get("feishu_external_effects", {})
-                effects = dict(effects) if isinstance(effects, Mapping) else {}
-                existing = effects.get(effect_key)
-                if isinstance(existing, Mapping) and existing.get("status") == "SUCCEEDED":
-                    commit_sqlite(self.connection)
-                    return record
-                marker = dict(existing) if isinstance(existing, Mapping) else {}
-                marker.update(values)
-                effects[effect_key] = marker
-                payload["feishu_external_effects"] = effects
-                self.connection.execute(
-                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                    (
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        event_id,
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            effects = payload.get("feishu_external_effects", {})
+            effects = dict(effects) if isinstance(effects, Mapping) else {}
+            existing = effects.get(effect_key)
+            if isinstance(existing, Mapping) and existing.get("status") == "SUCCEEDED":
+                return record
+            marker = dict(existing) if isinstance(existing, Mapping) else {}
+            marker.update(values)
+            effects[effect_key] = marker
+            payload["feishu_external_effects"] = effects
+            self.connection.execute(
+                "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
-                )
-                commit_sqlite(self.connection)
-                return self._require(event_id)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+                    event_id,
+                ),
+            )
+            return self._require(event_id)
 
     @retry_sqlite_write
     def mark_external_binding_pending(
@@ -588,34 +551,26 @@ class SQLiteEnvironmentEventRepository:
         requested_at: datetime,
     ) -> EnvironmentEventRecord:
         """Persist that this local cycle entered an external CREATE path."""
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                record = self._require(event_id)
-                payload = dict(record.payload)
-                if payload.get("feishu_record_id"):
-                    commit_sqlite(self.connection)
-                    return record
-                payload["feishu_binding_status"] = "PENDING"
-                payload.setdefault("feishu_create_requested_at", _time_text(requested_at))
-                self.connection.execute(
-                    "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
-                    (
-                        json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        event_id,
+        with sqlite_write_txn(self.connection, self._lock):
+            record = self._require(event_id)
+            payload = dict(record.payload)
+            if payload.get("feishu_record_id"):
+                return record
+            payload["feishu_binding_status"] = "PENDING"
+            payload.setdefault("feishu_create_requested_at", _time_text(requested_at))
+            self.connection.execute(
+                "UPDATE environment_events SET payload_json = ? WHERE event_id = ?",
+                (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
-                )
-                commit_sqlite(self.connection)
-                return self._require(event_id)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+                    event_id,
+                ),
+            )
+            return self._require(event_id)
 
     def list_pending_external_bindings(self) -> tuple[EnvironmentEventRecord, ...]:
         """Return unbound events independently of local lifecycle status.

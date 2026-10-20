@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 import config
 from domain.models import AlarmActionType
+from integrations.feishu_field_utils import field_text
 from integrations.feishu_records import FeishuRawRecord
 from integrations.feishu_observation import business_closed
 from repositories.environment_events import SQLiteEnvironmentEventRepository
@@ -969,17 +970,7 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 
 def _text(value: Any) -> str:
-    if isinstance(value, Mapping):
-        if "value" in value:
-            return _text(value["value"])
-        if "text" in value:
-            return _text(value["text"])
-        if "name" in value:
-            return _text(value["name"])
-        return ""
-    if isinstance(value, list):
-        return " ".join(item for item in (_text(part) for part in value) if item)
-    return str(value).strip() if value is not None else ""
+    return field_text(value)
 
 
 def _number_text(value: Any) -> str:

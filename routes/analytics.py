@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import math
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -8,36 +7,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from flask import Blueprint, jsonify, request
 
 import config
+from routes.deps import history_auth_error, mirror_disabled_error
 from services import db
 
 
 analytics_bp = Blueprint("analytics", __name__)
-
-
-def _auth_error():
-    """Reuse the X-History-Key scheme so read endpoints never leak data."""
-    if not config.HISTORY_API_KEY:
-        return jsonify({
-            "status": "error",
-            "error": "本地查询未配置：缺少 HISTORY_API_KEY",
-        }), 503
-
-    provided_key = request.headers.get("X-History-Key", "")
-    if not provided_key or not hmac.compare_digest(
-        provided_key,
-        config.HISTORY_API_KEY,
-    ):
-        return jsonify({"status": "error", "error": "本地查询鉴权失败"}), 401
-    return None
-
-
-def _mirror_disabled_error():
-    if db.is_enabled():
-        return None
-    return jsonify({
-        "status": "error",
-        "error": "SQLite 本地镜像未启用或初始化失败",
-    }), 503
 
 
 def _parse_time_to_ms(raw: str | None) -> int | None:
@@ -82,7 +56,7 @@ def _parse_time_arg(name: str) -> tuple[int | None, str | None]:
 
 @analytics_bp.get("/history/query")
 def query_snapshots():
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -119,7 +93,7 @@ def query_snapshots():
 
 @analytics_bp.get("/history/stats/daily")
 def daily_stats():
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 
@@ -165,7 +139,7 @@ def daily_stats():
 
 @analytics_bp.get("/history/stats/devices")
 def device_stats():
-    error = _auth_error() or _mirror_disabled_error()
+    error = history_auth_error() or mirror_disabled_error()
     if error:
         return error
 

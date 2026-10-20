@@ -38,13 +38,14 @@ from functools import wraps
 import json
 import sqlite3
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
 
 import config
 from repositories.sqlite import (
     SQLITE_WRITE_LOCK, connect as connect_runtime_sqlite,
-    commit_sqlite, rollback_sqlite, sqlite_unit_of_work,
+    apply_column_migrations, commit_sqlite, rollback_sqlite, sqlite_unit_of_work,
 )
+from repositories.environment_events import remote_record_missing_payload
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -200,36 +201,46 @@ CREATE TABLE IF NOT EXISTS runtime_setting_audit (
 
 # 加性列迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补列。
 # 旧版本建的库（例如 device_events 缺 source 列）在连接初始化时逐列补齐。
-_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
-    ("device_events", "source", "ALTER TABLE device_events ADD COLUMN source TEXT"),
+_COLUMN_MIGRATIONS: Mapping[str, tuple[tuple[str, str], ...]] = {
+    "device_events": (("source", "TEXT"),),
     # crash-consistency：投影水位与派发水位分离（旧部署的表增量补列）
-    (
-        "sample_projection_state",
-        "last_projected_sample_time_ms",
-        "ALTER TABLE sample_projection_state"
-        " ADD COLUMN last_projected_sample_time_ms INTEGER",
-    ),
-)
+    "sample_projection_state": (("last_projected_sample_time_ms", "INTEGER"),),
+}
 
 
 def _apply_column_migrations(connection: sqlite3.Connection) -> None:
-    for table, column, ddl in _COLUMN_MIGRATIONS:
-        exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            (table,),
-        ).fetchone()
-        if not exists:
-            continue
-        columns = {
-            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+    existing_columns = {
+        (table, column)
+        for table, columns in _COLUMN_MIGRATIONS.items()
+        if _table_exists(connection, table)
+        for column in _table_columns(connection, table)
+    }
+    apply_column_migrations(connection, _COLUMN_MIGRATIONS, skip_missing_tables=True)
+    commit_sqlite(connection)
+    for table, column in sorted(
+        {
+            (table, column)
+            for table, columns in _COLUMN_MIGRATIONS.items()
+            if _table_exists(connection, table)
+            for column in _table_columns(connection, table)
         }
-        if column not in columns:
-            connection.execute(ddl)
-            commit_sqlite(connection)
-            logger.info(
-                "SQLite 结构迁移：为 %s 补充列 %s | path=%s",
-                table, column, config.SQLITE_DB_PATH,
-            )
+        - existing_columns
+    ):
+        logger.info(
+            "SQLite 结构迁移：为 %s 补充列 %s | path=%s",
+            table, column, config.SQLITE_DB_PATH,
+        )
+
+
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone() is not None
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
 def _backfill_device_presence(connection: sqlite3.Connection) -> None:
@@ -583,15 +594,9 @@ def mark_feishu_record_missing(
                     if not linked:
                         continue
                     payload.update(
-                        {
-                            "feishu_record_missing": True,
-                            "feishu_record_missing_at": when,
-                            "feishu_record_missing_error": error_text,
-                            "feishu_binding_status": "DELETED",
-                            "feishu_update_pending": False,
-                            "feishu_recovery_pending": False,
-                            "local_close_reason": "linked_feishu_record_deleted",
-                        }
+                        remote_record_missing_payload(
+                            missing_at_text=when, error=error_text
+                        )
                     )
                     connection.execute(
                         """

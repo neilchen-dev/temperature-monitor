@@ -37,6 +37,7 @@ from .action_executor import (
 )
 from .actions import ApplicationAction, ApplicationActionKind, ApplicationActionMapper
 from .active_scope import active_scope_allows, normalize_device_id
+from .timeutils import iso_value, parse_datetime
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -336,15 +337,19 @@ class MonitorApplicationService:
             created_at=evaluated_at,
         )
         self._persist_prewarning_outcomes(executions, updated_at=evaluated_at)
-        self._finish_successful_event_reconciliation_tasks(
+        self._finish_successful_tasks(
             event_reconciliation_task_ids,
             executions,
+            action_types=self._EVENT_RECONCILIATION_ACTION_TYPES,
             updated_at=evaluated_at,
+            log_label="event reconciliation task",
         )
-        self._finish_successful_notification_tasks(
+        self._finish_successful_tasks(
             notification_task_ids,
             executions,
+            action_types=self._NOTIFICATION_ACTION_TYPES,
             updated_at=evaluated_at,
+            log_label="notification task",
         )
         return MonitorHandlingResult(
             operation_state=operation_state,
@@ -1337,56 +1342,37 @@ class MonitorApplicationService:
             task_ids.append(task.task_id)
         return tuple(task_ids)
 
-    def _finish_successful_event_reconciliation_tasks(
-        self,
-        task_ids: tuple[str, ...],
-        executions: tuple[ActionExecution, ...],
-        *,
-        updated_at: datetime,
-    ) -> None:
-        if self.task_repository is None or not task_ids:
-            return
-        task_index = 0
-        for execution in executions:
-            if execution.action.action_type not in {
-                AlarmActionType.CREATE_ALARM_EVENT,
-                AlarmActionType.UPDATE_ALARM_EVENT,
-                AlarmActionType.MARK_ALARM_RECOVERED,
-            }:
-                continue
-            if task_index >= len(task_ids):
-                break
-            task_id = task_ids[task_index]
-            task_index += 1
-            if execution.status is not ActionExecutionStatus.SUCCEEDED:
-                continue
-            try:
-                self.task_repository.cancel(task_id, updated_at=updated_at)
-            except (KeyError, ValueError):
-                # A scheduler may have reclaimed the safety task already; its
-                # own execution remains a valid idempotent retry path.
-                logger.debug(
-                    "event reconciliation task was already claimed or finished | task=%s",
-                    task_id,
-                )
+    _EVENT_RECONCILIATION_ACTION_TYPES = frozenset({
+        AlarmActionType.CREATE_ALARM_EVENT,
+        AlarmActionType.UPDATE_ALARM_EVENT,
+        AlarmActionType.MARK_ALARM_RECOVERED,
+    })
+    _NOTIFICATION_ACTION_TYPES = frozenset({
+        AlarmActionType.NOTIFY_ALARM,
+        AlarmActionType.NOTIFY_RECOVERY,
+        AlarmActionType.NOTIFY_PREWARNING,
+        AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
+    })
 
-    def _finish_successful_notification_tasks(
+    def _finish_successful_tasks(
         self,
         task_ids: tuple[str, ...],
         executions: tuple[ActionExecution, ...],
         *,
+        action_types: frozenset[AlarmActionType],
         updated_at: datetime,
+        log_label: str,
     ) -> None:
+        """Cancel the durable safety tasks whose inline execution succeeded.
+
+        A scheduler may have reclaimed a task already; its own execution
+        remains a valid idempotent retry path, so claim races are debug-only.
+        """
         if self.task_repository is None or not task_ids:
             return
         task_index = 0
         for execution in executions:
-            if execution.action.action_type not in {
-                AlarmActionType.NOTIFY_ALARM,
-                AlarmActionType.NOTIFY_RECOVERY,
-                AlarmActionType.NOTIFY_PREWARNING,
-                AlarmActionType.NOTIFY_PREWARNING_RECOVERY,
-            }:
+            if execution.action.action_type not in action_types:
                 continue
             if task_index >= len(task_ids):
                 break
@@ -1398,7 +1384,8 @@ class MonitorApplicationService:
                 self.task_repository.cancel(task_id, updated_at=updated_at)
             except (KeyError, ValueError):
                 logger.debug(
-                    "notification task was already claimed or finished | task=%s",
+                    "%s was already claimed or finished | task=%s",
+                    log_label,
                     task_id,
                 )
 
@@ -1713,7 +1700,7 @@ def _standard_dict(
 
 
 def _iso_value(value: Any) -> str | None:
-    return value.isoformat() if isinstance(value, datetime) else value
+    return iso_value(value)
 
 
 def _max_number(previous: Any, current: Any) -> float | None:
@@ -1876,12 +1863,7 @@ def _sample_dict(sample: MonitorSample) -> dict[str, Any]:
 
 
 def _parse_payload_datetime(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    try:
-        return datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
+    return parse_datetime(value)
 
 
 def _same_instant(left: datetime, right: datetime) -> bool:

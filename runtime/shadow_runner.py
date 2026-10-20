@@ -27,9 +27,13 @@ from application.operation_sync import OperationObservationService
 from application.shadow import (
     ExpectedAutomationState,
     ShadowComparisonService,
+    expected_comparison_values,
     expected_state_from,
+    expected_state_from_payload,
+    expected_state_payload,
 )
 from application.standard_sync import StandardSyncService
+from application.timeutils import align_datetime, iso_value, parse_datetime
 from domain.models import DataQualityStatus, DeviceContext, MonitorSample
 from domain.operation import ActiveOperation
 from integrations.feishu_operation import FeishuOperationAdapter
@@ -102,21 +106,21 @@ class RuntimeStatus:
             "active_device_count": self.active_device_count,
             "active_canary_enabled": self.active_canary_enabled,
             "active_epoch": self.active_epoch,
-            "active_cutover_at": _iso(self.active_cutover_at),
+            "active_cutover_at": iso_value(self.active_cutover_at),
             "scheduler_running": self.scheduler_running,
-            "last_standard_sync_time": _iso(self.last_standard_sync_time),
+            "last_standard_sync_time": iso_value(self.last_standard_sync_time),
             "enabled_standard_count": self.enabled_standard_count,
             "active_snapshot_id": self.active_snapshot_id,
             "last_known_good_snapshot_id": self.last_known_good_snapshot_id,
             "validated_standard_count": self.validated_standard_count,
             "expected_standard_count": self.expected_standard_count,
             "latest_sync_status": self.latest_sync_status,
-            "last_sync_attempt_at": _iso(self.last_sync_attempt_at),
-            "last_successful_sync_at": _iso(self.last_successful_sync_at),
+            "last_sync_attempt_at": iso_value(self.last_sync_attempt_at),
+            "last_successful_sync_at": iso_value(self.last_successful_sync_at),
             "standard_source": self.standard_source,
             "standards_ready": self.standards_ready,
-            "last_processed_sample_time": _iso(self.last_processed_sample_time),
-            "last_shadow_compare_time": _iso(self.last_shadow_compare_time),
+            "last_processed_sample_time": iso_value(self.last_processed_sample_time),
+            "last_shadow_compare_time": iso_value(self.last_shadow_compare_time),
             "last_shadow_diff": self.last_shadow_diff,
         }
 
@@ -593,7 +597,7 @@ class ShadowRuntime:
             )
             operation_stats = self.operation_adapter.last_fetch_stats.as_dict()
             operation_stats["accepted"] = self._operation_sync_accepted
-            operation_stats["last_sync_at"] = _iso(self._last_operation_sync_time)
+            operation_stats["last_sync_at"] = iso_value(self._last_operation_sync_time)
             operation_stats["last_error"] = self._operation_sync_last_error
             status["operation_sync"] = operation_stats
             status.update(
@@ -908,7 +912,7 @@ class ShadowRuntime:
         now: datetime,
         sequence: int,
     ) -> str:
-        started_at = _align_datetime(operation.started_at, now)
+        started_at = align_datetime(operation.started_at, now)
         elapsed_hours = max(0.0, (now - started_at).total_seconds() / 3600)
         record_url = config.FEISHU_OPERATION_TABLE_URL
         if record_url:
@@ -969,7 +973,7 @@ class ShadowRuntime:
             )
 
     def handle_shadow_compare(self, task: Any) -> None:
-        expected = _expected_from_payload(task.payload["expected"])
+        expected = expected_state_from_payload(task.payload["expected"])
         try:
             with self._execution_lock:
                 diff = self.shadow_comparison.compare(
@@ -1018,7 +1022,7 @@ class ShadowRuntime:
                 self.shadow_comparison.record_failure(
                     device_id=expected.device_id,
                     sample_time=datetime.fromisoformat(task.payload["sample_time"]),
-                    expected=_expected_payload(expected),
+                    expected=expected_state_payload(expected),
                     error=f"{type(exc).__name__}: {exc}",
                     created_at=self.now_provider(),
                 )
@@ -1193,7 +1197,7 @@ class ShadowRuntime:
         if previous is not None:
             expected = replace(
                 expected,
-                previous_state=_expected_comparison_values(previous),
+                previous_state=expected_comparison_values(previous),
             )
         created_at = self.now_provider()
         self.task_repository.create_or_get_unfinished(
@@ -1203,7 +1207,7 @@ class ShadowRuntime:
             due_at=created_at,
             payload={
                 "sample_time": sample_time.isoformat(),
-                "expected": _expected_payload(expected),
+                "expected": expected_state_payload(expected),
             },
             dedupe_key=f"SHADOW_COMPARE:{expected.device_id}:latest",
             created_at=created_at,
@@ -1266,14 +1270,14 @@ class ShadowRuntime:
             elif status == "SENT":
                 sequence = max(0, int(operation.overdue_notification_sequence or 0)) + 1
                 due_at = (
-                    _align_datetime(operation.overdue_notification_at, now)
+                    align_datetime(operation.overdue_notification_at, now)
                     + repeat_every
                     if operation.overdue_notification_at is not None
-                    else _align_datetime(operation.started_at, now) + overdue_after
+                    else align_datetime(operation.started_at, now) + overdue_after
                 )
             else:
                 sequence = 0
-                due_at = _align_datetime(operation.started_at, now) + overdue_after
+                due_at = align_datetime(operation.started_at, now) + overdue_after
             dedupe_key = (
                 f"NOTIFY_OPERATION_OVERDUE:{device_id}:"
                 f"{operation.source_record_id}:{sequence}"
@@ -1286,7 +1290,7 @@ class ShadowRuntime:
                 )
                 if callable(get_unfinished) and get_unfinished(dedupe_key) is not None:
                     continue
-            if now < _align_datetime(due_at, now):
+            if now < align_datetime(due_at, now):
                 continue
             payload = {
                 "device_id": device_id,
@@ -1454,96 +1458,10 @@ class ShadowRuntime:
             )
 
 
-def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
-
-
-def _align_datetime(value: datetime, reference: datetime) -> datetime:
-    """Align legacy naive values to the reference timezone for comparison."""
-    if value.tzinfo is None and reference.tzinfo is not None:
-        return value.replace(tzinfo=reference.tzinfo)
-    if value.tzinfo is not None and reference.tzinfo is None:
-        return value.replace(tzinfo=None)
-    return value
-
-
 def _parse_event_start(value: Any) -> datetime | None:
     if value is None:
         return None
     text = str(value).strip()
     if text.startswith("ENV:"):
         text = text.split(":", 2)[-1]
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        return None
-
-
-def _expected_payload(expected: ExpectedAutomationState) -> dict[str, Any]:
-    return {
-        "device_id": expected.device_id,
-        "alarm_state": expected.alarm_state,
-        "operation_state": expected.operation_state,
-        "event_exists": expected.event_exists,
-        "overall_status": expected.overall_status,
-        "standard_id": expected.standard_id,
-        "standard_revision": expected.standard_revision,
-        "standard_source": expected.standard_source,
-        "active_event_count": expected.active_event_count,
-        "expected_at": _iso(expected.expected_at),
-        "applicability": expected.applicability,
-        "data_quality": expected.data_quality,
-        "temperature_status": expected.temperature_status,
-        "humidity_status": expected.humidity_status,
-        "active_event_ids": list(expected.active_event_ids),
-        "operation_type": expected.operation_type,
-        "resolved_control_type": expected.resolved_control_type,
-        "control_type_source": expected.control_type_source,
-        "control_type_consistency": expected.control_type_consistency,
-        "previous_state": (
-            dict(expected.previous_state) if expected.previous_state is not None else None
-        ),
-    }
-
-
-def _expected_comparison_values(expected: ExpectedAutomationState) -> dict[str, Any]:
-    return {
-        "alarm_state": expected.alarm_state,
-        "operation_state": expected.operation_state,
-        "event_exists": expected.event_exists,
-        "overall_status": expected.overall_status,
-        "standard_id": expected.standard_id,
-        "standard_revision": expected.standard_revision,
-        "standard_source": expected.standard_source,
-        "applicability": expected.applicability,
-        "data_quality": expected.data_quality,
-        "temperature_status": expected.temperature_status,
-        "humidity_status": expected.humidity_status,
-        "operation_type": expected.operation_type,
-    }
-
-
-def _expected_from_payload(payload: Mapping[str, Any]) -> ExpectedAutomationState:
-    expected_at = payload.get("expected_at")
-    return ExpectedAutomationState(
-        device_id=str(payload["device_id"]),
-        alarm_state=str(payload["alarm_state"]),
-        operation_state=str(payload["operation_state"]),
-        event_exists=bool(payload["event_exists"]),
-        overall_status=payload.get("overall_status"),
-        standard_id=payload.get("standard_id"),
-        standard_revision=payload.get("standard_revision"),
-        standard_source=payload.get("standard_source"),
-        active_event_count=payload.get("active_event_count"),
-        expected_at=(datetime.fromisoformat(expected_at) if expected_at else None),
-        applicability=payload.get("applicability"),
-        data_quality=payload.get("data_quality"),
-        temperature_status=payload.get("temperature_status"),
-        humidity_status=payload.get("humidity_status"),
-        active_event_ids=tuple(payload.get("active_event_ids") or ()),
-        operation_type=payload.get("operation_type"),
-        resolved_control_type=payload.get("resolved_control_type"),
-        control_type_source=payload.get("control_type_source"),
-        control_type_consistency=payload.get("control_type_consistency"),
-        previous_state=payload.get("previous_state"),
-    )
+    return parse_datetime(text)

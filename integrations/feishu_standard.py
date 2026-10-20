@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 import math
 from typing import Any, Iterable, Protocol
-from zoneinfo import ZoneInfo
 
 import config
 from domain.models import EnvironmentStandard, parse_control_type
 
+from .feishu_field_utils import parse_feishu_datetime
 from .feishu_records import FeishuRawRecord
 
 
@@ -220,20 +220,4 @@ def _optional_datetime(values: dict[str, Any] | Any, field_name: str) -> datetim
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        seconds = float(value) / 1000 if float(value) > 10_000_000_000 else float(value)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
-    else:
-        text = str(value).strip().replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError as exc:
-            raise ValueError(f"Feishu field is not datetime: {value!r}") from exc
-
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        parsed = parsed.replace(tzinfo=ZoneInfo(config.HISTORY_TIMEZONE))
-    return parsed
+    return parse_feishu_datetime(value, assume_timezone=config.HISTORY_TIMEZONE)

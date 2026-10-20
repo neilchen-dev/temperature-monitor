@@ -16,7 +16,7 @@ from repositories.sqlite import (
     run_sqlite_write_with_retry,
 )
 
-from repositories.sqlite import begin_sqlite_write, commit_sqlite, rollback_sqlite
+from repositories.sqlite import apply_column_migrations, commit_sqlite, sqlite_write_txn
 
 
 _SCHEMA = """
@@ -136,21 +136,18 @@ class SQLiteAutomationTaskRepository:
                 )
 
     def _apply_migrations(self) -> None:
-        columns = {
-            row[1]
-            for row in self.connection.execute("PRAGMA table_info(automation_tasks)")
-        }
-        for column, definition in (
-            ("claimed_at", "TEXT"),
-            ("lease_until", "TEXT"),
-            ("worker_id", "TEXT"),
-            ("created_mode", "TEXT"),
-            ("active_epoch", "TEXT"),
-        ):
-            if column not in columns:
-                self.connection.execute(
-                    f"ALTER TABLE automation_tasks ADD COLUMN {column} {definition}"
-                )
+        apply_column_migrations(
+            self.connection,
+            {
+                "automation_tasks": (
+                    ("claimed_at", "TEXT"),
+                    ("lease_until", "TEXT"),
+                    ("worker_id", "TEXT"),
+                    ("created_mode", "TEXT"),
+                    ("active_epoch", "TEXT"),
+                ),
+            },
+        )
 
     @retry_sqlite_write
     def set_runtime_context(
@@ -171,49 +168,43 @@ class SQLiteAutomationTaskRepository:
         if mode_value not in {"disabled", "shadow", "active"}:
             raise ValueError(f"unsupported runtime mode: {mode!r}")
         current_time = now or datetime.now().astimezone()
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                previous = self.connection.execute(
-                    "SELECT * FROM automation_runtime_state WHERE singleton_id = 1"
-                ).fetchone()
-                if (
-                    mode_value == "active"
-                    and previous is not None
-                    and previous["current_mode"] == "active"
-                    and previous["active_epoch"]
-                ):
-                    epoch = previous["active_epoch"]
-                    cutover_at = previous["active_cutover_at"]
-                elif mode_value == "active":
-                    epoch = active_epoch or uuid.uuid4().hex
-                    cutover_at = _datetime_text(current_time)
-                else:
-                    epoch = None
-                    cutover_at = None
-                self.connection.execute(
-                    """
-                    INSERT INTO automation_runtime_state (
-                        singleton_id, current_mode, active_epoch,
-                        active_cutover_at, updated_at
-                    ) VALUES (1, ?, ?, ?, ?)
-                    ON CONFLICT(singleton_id) DO UPDATE SET
-                        current_mode = excluded.current_mode,
-                        active_epoch = excluded.active_epoch,
-                        active_cutover_at = excluded.active_cutover_at,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        mode_value,
-                        epoch,
-                        cutover_at,
-                        _datetime_text(current_time),
-                    ),
-                )
-                commit_sqlite(self.connection)
-            except Exception:
-                rollback_sqlite(self.connection)
-                raise
+        with sqlite_write_txn(self.connection, self._lock):
+            previous = self.connection.execute(
+                "SELECT * FROM automation_runtime_state WHERE singleton_id = 1"
+            ).fetchone()
+            if (
+                mode_value == "active"
+                and previous is not None
+                and previous["current_mode"] == "active"
+                and previous["active_epoch"]
+            ):
+                epoch = previous["active_epoch"]
+                cutover_at = previous["active_cutover_at"]
+            elif mode_value == "active":
+                epoch = active_epoch or uuid.uuid4().hex
+                cutover_at = _datetime_text(current_time)
+            else:
+                epoch = None
+                cutover_at = None
+            self.connection.execute(
+                """
+                INSERT INTO automation_runtime_state (
+                    singleton_id, current_mode, active_epoch,
+                    active_cutover_at, updated_at
+                ) VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    current_mode = excluded.current_mode,
+                    active_epoch = excluded.active_epoch,
+                    active_cutover_at = excluded.active_cutover_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    mode_value,
+                    epoch,
+                    cutover_at,
+                    _datetime_text(current_time),
+                ),
+            )
         return self.runtime_context()
 
     def runtime_context(self) -> RuntimeActivation:
@@ -782,39 +773,33 @@ class SQLiteAutomationTaskRepository:
         current_time = now or datetime.now().astimezone()
         now_text = _datetime_text(current_time)
         stale_cutoff = _datetime_text(current_time - stale_after)
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                cursor = self.connection.execute(
-                    """
-                    UPDATE automation_tasks
-                    SET status = ?, due_at = ?, updated_at = ?,
-                        lease_until = NULL, worker_id = NULL,
-                        last_error = COALESCE(
-                            last_error,
-                            'requeued after stale runtime restart'
-                        )
-                    WHERE (
-                        status = ? AND lease_until IS NOT NULL
-                        AND lease_until <= ?
-                    ) OR (
-                        status = ? AND due_at <= ?
+        with sqlite_write_txn(self.connection, self._lock):
+            cursor = self.connection.execute(
+                """
+                UPDATE automation_tasks
+                SET status = ?, due_at = ?, updated_at = ?,
+                    lease_until = NULL, worker_id = NULL,
+                    last_error = COALESCE(
+                        last_error,
+                        'requeued after stale runtime restart'
                     )
-                    """,
-                    (
-                        AutomationTaskStatus.PENDING.value,
-                        now_text,
-                        now_text,
-                        AutomationTaskStatus.RUNNING.value,
-                        now_text,
-                        AutomationTaskStatus.PENDING.value,
-                        stale_cutoff,
-                    ),
+                WHERE (
+                    status = ? AND lease_until IS NOT NULL
+                    AND lease_until <= ?
+                ) OR (
+                    status = ? AND due_at <= ?
                 )
-                commit_sqlite(self.connection)
-            except Exception:
-                rollback_sqlite(self.connection)
-                raise
+                """,
+                (
+                    AutomationTaskStatus.PENDING.value,
+                    now_text,
+                    now_text,
+                    AutomationTaskStatus.RUNNING.value,
+                    now_text,
+                    AutomationTaskStatus.PENDING.value,
+                    stale_cutoff,
+                ),
+            )
         return max(cursor.rowcount, 0)
 
     def external_effect_allowed(self, task: AutomationTask) -> bool:
@@ -970,184 +955,175 @@ class SQLiteAutomationTaskRepository:
             sort_keys=True,
             separators=(",", ":"),
         )
-        with self._lock:
+        with sqlite_write_txn(self.connection, self._lock):
             created_mode, active_epoch = self._creation_metadata()
-            begin_sqlite_write(self.connection)
-            try:
-                if task_type == "RECONCILE_ALARM_EVENT":
-                    # Reconciliation identity is one local alarm cycle, not
-                    # one device. A device can have multiple recovered/CLOSED
-                    # cycles waiting for external binding. Retry rows retain
-                    # the same cycle prefix, so a live backoff retry is not
-                    # replaced by a fresh task on every incoming sample.
-                    active_rows = self.connection.execute(
-                        """
-                        SELECT * FROM automation_tasks
-                        WHERE task_type = ?
-                          AND (dedupe_key = ? OR substr(dedupe_key, 1, length(?)) = ?
-                               OR (? IS NOT NULL AND json_extract(payload_json, '$.local_event_id') = ?))
-                          AND status IN (?, ?)
-                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
-                                 due_at, id
+            if task_type == "RECONCILE_ALARM_EVENT":
+                # Reconciliation identity is one local alarm cycle, not
+                # one device. A device can have multiple recovered/CLOSED
+                # cycles waiting for external binding. Retry rows retain
+                # the same cycle prefix, so a live backoff retry is not
+                # replaced by a fresh task on every incoming sample.
+                active_rows = self.connection.execute(
+                    """
+                    SELECT * FROM automation_tasks
+                    WHERE task_type = ?
+                      AND (dedupe_key = ? OR substr(dedupe_key, 1, length(?)) = ?
+                           OR (? IS NOT NULL AND json_extract(payload_json, '$.local_event_id') = ?))
+                      AND status IN (?, ?)
+                    ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                             due_at, id
+                    """,
+                    (
+                        task_type,
+                        dedupe_key,
+                        f"{dedupe_key}:retry:",
+                        f"{dedupe_key}:retry:",
+                        (payload or {}).get("local_event_id"),
+                        (payload or {}).get("local_event_id"),
+                        AutomationTaskStatus.PENDING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                    ),
+                ).fetchall()
+            elif task_type == "PROJECT_DEVICE_STATUS":
+                # Projection identity is device + desired-state hash.
+                # A different desired hash for the same device must not
+                # be hidden behind an older unfinished projection task;
+                # the handler will safely no-op superseded tasks.
+                active_rows = self.connection.execute(
+                    """
+                    SELECT * FROM automation_tasks
+                    WHERE task_type = ? AND dedupe_key = ?
+                      AND status IN (?, ?)
+                    ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                             due_at, id
+                    """,
+                    (
+                        task_type,
+                        dedupe_key,
+                        AutomationTaskStatus.PENDING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                    ),
+                ).fetchall()
+            else:
+                active_rows = self.connection.execute(
+                    """
+                    SELECT * FROM automation_tasks
+                    WHERE task_type = ? AND entity_id = ?
+                      AND status IN (?, ?)
+                    ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
+                             due_at, id
+                    """,
+                    (
+                        task_type,
+                        entity_id,
+                        AutomationTaskStatus.PENDING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                        AutomationTaskStatus.RUNNING.value,
+                    ),
+                ).fetchall()
+
+            winner = active_rows[0] if active_rows else None
+            if winner is not None:
+                winner_is_retry = task_type == "RECONCILE_ALARM_EVENT"
+                duplicate_pending_ids = [
+                    row["id"]
+                    for row in active_rows[1:]
+                    if row["status"] == AutomationTaskStatus.PENDING.value
+                ]
+                if duplicate_pending_ids:
+                    placeholders = ",".join("?" for _ in duplicate_pending_ids)
+                    self.connection.execute(
+                        f"""
+                        UPDATE automation_tasks
+                        SET status = ?, updated_at = ?, finished_at = ?,
+                            lease_until = NULL, worker_id = NULL
+                        WHERE id IN ({placeholders}) AND status = ?
                         """,
                         (
-                            task_type,
-                            dedupe_key,
-                            f"{dedupe_key}:retry:",
-                            f"{dedupe_key}:retry:",
-                            (payload or {}).get("local_event_id"),
-                            (payload or {}).get("local_event_id"),
+                            AutomationTaskStatus.CANCELLED.value,
+                            _datetime_text(created_at),
+                            _datetime_text(created_at),
+                            *duplicate_pending_ids,
                             AutomationTaskStatus.PENDING.value,
-                            AutomationTaskStatus.RUNNING.value,
-                            AutomationTaskStatus.RUNNING.value,
                         ),
-                    ).fetchall()
-                elif task_type == "PROJECT_DEVICE_STATUS":
-                    # Projection identity is device + desired-state hash.
-                    # A different desired hash for the same device must not
-                    # be hidden behind an older unfinished projection task;
-                    # the handler will safely no-op superseded tasks.
-                    active_rows = self.connection.execute(
-                        """
-                        SELECT * FROM automation_tasks
-                        WHERE task_type = ? AND dedupe_key = ?
-                          AND status IN (?, ?)
-                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
-                                 due_at, id
-                        """,
-                        (
-                            task_type,
-                            dedupe_key,
-                            AutomationTaskStatus.PENDING.value,
-                            AutomationTaskStatus.RUNNING.value,
-                            AutomationTaskStatus.RUNNING.value,
-                        ),
-                    ).fetchall()
-                else:
-                    active_rows = self.connection.execute(
-                        """
-                        SELECT * FROM automation_tasks
-                        WHERE task_type = ? AND entity_id = ?
-                          AND status IN (?, ?)
-                        ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END,
-                                 due_at, id
-                        """,
-                        (
-                            task_type,
-                            entity_id,
-                            AutomationTaskStatus.PENDING.value,
-                            AutomationTaskStatus.RUNNING.value,
-                            AutomationTaskStatus.RUNNING.value,
-                        ),
-                    ).fetchall()
-
-                winner = active_rows[0] if active_rows else None
-                if winner is not None:
-                    winner_is_retry = task_type == "RECONCILE_ALARM_EVENT"
-                    duplicate_pending_ids = [
-                        row["id"]
-                        for row in active_rows[1:]
-                        if row["status"] == AutomationTaskStatus.PENDING.value
-                    ]
-                    if duplicate_pending_ids:
-                        placeholders = ",".join("?" for _ in duplicate_pending_ids)
-                        self.connection.execute(
-                            f"""
-                            UPDATE automation_tasks
-                            SET status = ?, updated_at = ?, finished_at = ?,
-                                lease_until = NULL, worker_id = NULL
-                            WHERE id IN ({placeholders}) AND status = ?
-                            """,
-                            (
-                                AutomationTaskStatus.CANCELLED.value,
-                                _datetime_text(created_at),
-                                _datetime_text(created_at),
-                                *duplicate_pending_ids,
-                                AutomationTaskStatus.PENDING.value,
-                            ),
-                        )
-
-                    if winner_is_retry:
-                        # A retry row already represents this exact alarm
-                        # cycle. Preserve its due_at so exponential backoff
-                        # remains effective; the base key can be reclaimed
-                        # after the retry reaches a terminal state.
-                        commit_sqlite(self.connection)
-                        return self._require(winner["id"])
-
-                    # Comparisons observe current remote state. Keep the newest
-                    # expectation without postponing the existing queue slot;
-                    # replaying old samples cannot reconstruct past Feishu state.
-                    if task_type == "SHADOW_COMPARE" and winner["status"] == "PENDING":
-                        self.connection.execute(
-                            "UPDATE automation_tasks SET payload_json = ?, updated_at = ? WHERE id = ?",
-                            (payload_json, _datetime_text(created_at), winner["id"]),
-                        )
-
-                    self._release_dedupe_key_from_other_row(
-                        dedupe_key=dedupe_key,
-                        winner_id=winner["id"],
                     )
-                    if winner["dedupe_key"] != dedupe_key:
-                        self.connection.execute(
-                            "UPDATE automation_tasks SET dedupe_key = ? WHERE id = ?",
-                            (dedupe_key, winner["id"]),
-                        )
-                    if (
-                        winner["status"] == AutomationTaskStatus.PENDING.value
-                        and due_at < datetime.fromisoformat(winner["due_at"])
-                    ):
-                        self.connection.execute(
-                            """
-                            UPDATE automation_tasks
-                            SET due_at = ?, updated_at = ?
-                            WHERE id = ? AND status = ? AND due_at > ?
-                            """,
-                            (
-                                _datetime_text(due_at),
-                                _datetime_text(created_at),
-                                winner["id"],
-                                AutomationTaskStatus.PENDING.value,
-                                _datetime_text(due_at),
-                            ),
-                        )
-                    commit_sqlite(self.connection)
+
+                if winner_is_retry:
+                    # A retry row already represents this exact alarm
+                    # cycle. Preserve its due_at so exponential backoff
+                    # remains effective; the base key can be reclaimed
+                    # after the retry reaches a terminal state.
                     return self._require(winner["id"])
+
+                # Comparisons observe current remote state. Keep the newest
+                # expectation without postponing the existing queue slot;
+                # replaying old samples cannot reconstruct past Feishu state.
+                if task_type == "SHADOW_COMPARE" and winner["status"] == "PENDING":
+                    self.connection.execute(
+                        "UPDATE automation_tasks SET payload_json = ?, updated_at = ? WHERE id = ?",
+                        (payload_json, _datetime_text(created_at), winner["id"]),
+                    )
 
                 self._release_dedupe_key_from_other_row(
                     dedupe_key=dedupe_key,
-                    winner_id=None,
+                    winner_id=winner["id"],
                 )
-                task_id = uuid.uuid4().hex
-                self.connection.execute(
-                    """
-                    INSERT INTO automation_tasks (
-                        id, task_type, entity_type, entity_id, due_at, status,
-                        payload_json, dedupe_key, created_at, updated_at,
-                        created_mode, active_epoch
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        task_type,
-                        entity_type,
-                        entity_id,
-                        _datetime_text(due_at),
-                        AutomationTaskStatus.PENDING.value,
-                        payload_json,
-                        dedupe_key,
-                        _datetime_text(created_at),
-                        _datetime_text(created_at),
-                        created_mode,
-                        active_epoch,
-                    ),
-                )
-                commit_sqlite(self.connection)
-                return self._require(task_id)
-            except Exception:
-                if self.connection.in_transaction:
-                    rollback_sqlite(self.connection)
-                raise
+                if winner["dedupe_key"] != dedupe_key:
+                    self.connection.execute(
+                        "UPDATE automation_tasks SET dedupe_key = ? WHERE id = ?",
+                        (dedupe_key, winner["id"]),
+                    )
+                if (
+                    winner["status"] == AutomationTaskStatus.PENDING.value
+                    and due_at < datetime.fromisoformat(winner["due_at"])
+                ):
+                    self.connection.execute(
+                        """
+                        UPDATE automation_tasks
+                        SET due_at = ?, updated_at = ?
+                        WHERE id = ? AND status = ? AND due_at > ?
+                        """,
+                        (
+                            _datetime_text(due_at),
+                            _datetime_text(created_at),
+                            winner["id"],
+                            AutomationTaskStatus.PENDING.value,
+                            _datetime_text(due_at),
+                        ),
+                    )
+                return self._require(winner["id"])
+
+            self._release_dedupe_key_from_other_row(
+                dedupe_key=dedupe_key,
+                winner_id=None,
+            )
+            task_id = uuid.uuid4().hex
+            self.connection.execute(
+                """
+                INSERT INTO automation_tasks (
+                    id, task_type, entity_type, entity_id, due_at, status,
+                    payload_json, dedupe_key, created_at, updated_at,
+                    created_mode, active_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    task_type,
+                    entity_type,
+                    entity_id,
+                    _datetime_text(due_at),
+                    AutomationTaskStatus.PENDING.value,
+                    payload_json,
+                    dedupe_key,
+                    _datetime_text(created_at),
+                    _datetime_text(created_at),
+                    created_mode,
+                    active_epoch,
+                ),
+            )
+            return self._require(task_id)
 
     def get_unfinished_by_dedupe_key(self, dedupe_key: str) -> AutomationTask | None:
         """Return the pending/running task with this external-effect identity."""
@@ -1217,68 +1193,62 @@ class SQLiteAutomationTaskRepository:
         # before it can enter RUNNING, even if startup reconciliation raced
         # with the first scheduler poll.
         self.quarantine_legacy_external_tasks(now=now)
-        with self._lock:
-            begin_sqlite_write(self.connection)
-            try:
-                rows = self.connection.execute(
+        with sqlite_write_txn(self.connection, self._lock):
+            rows = self.connection.execute(
+                """
+                SELECT id FROM automation_tasks
+                WHERE ((
+                    status = ? AND due_at <= ?
+                ) OR (
+                    status = ? AND lease_until IS NOT NULL AND lease_until <= ?
+                ))
+                """ + exclusion + """
+                ORDER BY CASE
+                    WHEN task_type IN ('VERIFY_ALARM', 'VERIFY_RECOVERY',
+                                       'RECONCILE_ALARM_EVENT', 'SYNC_STANDARD')
+                         OR task_type LIKE 'NOTIFY_%' THEN 0
+                    WHEN task_type = 'SHADOW_COMPARE' AND due_at > ? THEN 2
+                    ELSE 1 END,
+                         due_at, id
+                LIMIT ?
+                """,
+                (
+                    AutomationTaskStatus.PENDING.value,
+                    now_text,
+                    AutomationTaskStatus.RUNNING.value,
+                    now_text,
+                    *exclude_task_ids,
+                    _datetime_text(now - timedelta(seconds=60)),
+                    limit,
+                ),
+            ).fetchall()
+            task_ids = [row["id"] for row in rows]
+            for task_id in task_ids:
+                self.connection.execute(
                     """
-                    SELECT id FROM automation_tasks
-                    WHERE ((
-                        status = ? AND due_at <= ?
-                    ) OR (
-                        status = ? AND lease_until IS NOT NULL AND lease_until <= ?
-                    ))
-                    """ + exclusion + """
-                    ORDER BY CASE
-                        WHEN task_type IN ('VERIFY_ALARM', 'VERIFY_RECOVERY',
-                                           'RECONCILE_ALARM_EVENT', 'SYNC_STANDARD')
-                             OR task_type LIKE 'NOTIFY_%' THEN 0
-                        WHEN task_type = 'SHADOW_COMPARE' AND due_at > ? THEN 2
-                        ELSE 1 END,
-                             due_at, id
-                    LIMIT ?
+                    UPDATE automation_tasks
+                    SET status = ?, started_at = COALESCE(started_at, ?),
+                        claimed_at = ?, lease_until = ?, worker_id = ?,
+                        updated_at = ?, attempt_count = attempt_count + 1
+                    WHERE id = ? AND (
+                        (status = ? AND due_at <= ?)
+                        OR (status = ? AND lease_until IS NOT NULL AND lease_until <= ?)
+                    )
                     """,
                     (
+                        AutomationTaskStatus.RUNNING.value,
+                        now_text,
+                        now_text,
+                        lease_until_text,
+                        worker_id,
+                        now_text,
+                        task_id,
                         AutomationTaskStatus.PENDING.value,
                         now_text,
                         AutomationTaskStatus.RUNNING.value,
                         now_text,
-                        *exclude_task_ids,
-                        _datetime_text(now - timedelta(seconds=60)),
-                        limit,
                     ),
-                ).fetchall()
-                task_ids = [row["id"] for row in rows]
-                for task_id in task_ids:
-                    self.connection.execute(
-                        """
-                        UPDATE automation_tasks
-                        SET status = ?, started_at = COALESCE(started_at, ?),
-                            claimed_at = ?, lease_until = ?, worker_id = ?,
-                            updated_at = ?, attempt_count = attempt_count + 1
-                        WHERE id = ? AND (
-                            (status = ? AND due_at <= ?)
-                            OR (status = ? AND lease_until IS NOT NULL AND lease_until <= ?)
-                        )
-                        """,
-                        (
-                            AutomationTaskStatus.RUNNING.value,
-                            now_text,
-                            now_text,
-                            lease_until_text,
-                            worker_id,
-                            now_text,
-                            task_id,
-                            AutomationTaskStatus.PENDING.value,
-                            now_text,
-                            AutomationTaskStatus.RUNNING.value,
-                            now_text,
-                        ),
-                    )
-                commit_sqlite(self.connection)
-            except Exception:
-                rollback_sqlite(self.connection)
-                raise
+                )
 
             claimed = [self.get(task_id) for task_id in task_ids]
             return tuple(task for task in claimed if task is not None)

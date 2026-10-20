@@ -12,7 +12,7 @@ from application.action_executor import ActionExecution
 from application.shadow import AutomationDiff
 from repositories.sqlite import SQLITE_WRITE_LOCK, retry_sqlite_write, run_sqlite_write_with_retry
 
-from repositories.sqlite import commit_sqlite
+from repositories.sqlite import apply_column_migrations, commit_sqlite
 
 
 _SCHEMA = """
@@ -76,29 +76,24 @@ class SQLiteAutomationRunRepository:
         self.connection.row_factory = sqlite3.Row
         with self._lock:
             self.connection.executescript(_SCHEMA)
-            columns = {
-                row["name"]
-                for row in self.connection.execute(
-                    "PRAGMA table_info(automation_runs)"
-                ).fetchall()
-            }
-            for column in (
-                "event_id",
-                "automation_task_id",
-                "dedupe_key",
-                "standard_id",
-                "standard_revision",
-                "standard_source",
-                "recipient",
-                "message_id",
-                "result",
-                "error_code",
-                "sent_at",
-            ):
-                if column not in columns:
-                    self.connection.execute(
-                        f"ALTER TABLE automation_runs ADD COLUMN {column} TEXT"
-                    )
+            apply_column_migrations(
+                self.connection,
+                {
+                    "automation_runs": (
+                        ("event_id", "TEXT"),
+                        ("automation_task_id", "TEXT"),
+                        ("dedupe_key", "TEXT"),
+                        ("standard_id", "TEXT"),
+                        ("standard_revision", "TEXT"),
+                        ("standard_source", "TEXT"),
+                        ("recipient", "TEXT"),
+                        ("message_id", "TEXT"),
+                        ("result", "TEXT"),
+                        ("error_code", "TEXT"),
+                        ("sent_at", "TEXT"),
+                    ),
+                },
+            )
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_automation_runs_task "
                 "ON automation_runs(automation_task_id)"

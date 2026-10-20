@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from functools import wraps
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import count
 import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Mapping, TypeVar
 
 
 logger = logging.getLogger("temperature_monitor")
@@ -106,6 +106,56 @@ def sqlite_unit_of_work(connection: sqlite3.Connection | None):
                     connection.rollback()
                 _transaction_local.frames.pop(connection, None)
                 raise
+
+
+@contextmanager
+def sqlite_write_txn(
+    connection: sqlite3.Connection,
+    lock: threading.RLock | None = None,
+):
+    """Repository write transaction under the instance lock.
+
+    Replaces the hand-written ``with self._lock: begin/try/commit/except
+    rollback/raise`` boilerplate.  The body must contain only SQLite work;
+    never perform external I/O in this scope.  A trailing ``commit_sqlite``
+    call inside the body is unnecessary — this scope commits on success.
+    """
+    with (lock if lock is not None else nullcontext()):
+        begin_sqlite_write(connection)
+        try:
+            yield
+        except Exception:
+            if connection.in_transaction:
+                rollback_sqlite(connection)
+            raise
+        commit_sqlite(connection)
+
+
+def apply_column_migrations(
+    connection: sqlite3.Connection,
+    migrations: Mapping[str, tuple[tuple[str, str], ...]],
+    *,
+    skip_missing_tables: bool = False,
+) -> None:
+    """Add missing table columns; idempotent and additive-only.
+
+    ``migrations`` maps a table name to its ``(column, definition)`` pairs,
+    applied in order.  Callers own the surrounding lock/transaction.
+    """
+    for table, columns in migrations.items():
+        if skip_missing_tables and connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone() is None:
+            continue
+        existing = {
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for column, definition in columns:
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
