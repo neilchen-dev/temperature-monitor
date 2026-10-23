@@ -326,7 +326,7 @@ class AnalyticsRouteTests(unittest.TestCase):
         )
 
     def test_health_is_independent_of_sqlite_state_reads(self) -> None:
-        with mock.patch(
+        with mock.patch("config.AUTOMATION_MODE", "active"), mock.patch(
             "runtime.bootstrap.runtime_liveness",
             return_value={
                 "available": True,
@@ -356,7 +356,7 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertTrue(payload["runtime"]["scheduler_running"])
 
     def test_health_is_degraded_when_active_runtime_is_unavailable(self) -> None:
-        with mock.patch(
+        with mock.patch("config.AUTOMATION_MODE", "active"), mock.patch(
             "runtime.bootstrap.runtime_liveness",
             return_value={
                 "available": False,
@@ -381,7 +381,7 @@ class AnalyticsRouteTests(unittest.TestCase):
         self.assertEqual(response.get_json()["status"], "degraded")
 
     def test_health_liveness_stays_healthy_when_active_readiness_is_blocked(self) -> None:
-        with mock.patch(
+        with mock.patch("config.AUTOMATION_MODE", "active"), mock.patch(
             "runtime.bootstrap.runtime_liveness",
             return_value={
                 "available": True,
