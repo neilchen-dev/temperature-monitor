@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.3
+
+- 生产 Compose 与 Home Assistant Add-on 默认要求温度上报和 heartbeat 使用 `TEMPERATURE_API_KEY`；新增 `temperature_auth_required` Add-on 选项，生产 Compose 强制开启。
+- 修复生产部署对 `disabled` 自动化模式的健康门禁判定，并限制 workflow_run 发布只接受本仓库 main 分支的 push 测试。
+
 ## 1.2.2
 
 - 修复 Home Assistant Add-on 无法本地构建的问题：改用 GitHub Container Registry 的公开版本镜像。
@@ -19,7 +24,7 @@ IIoT 数据采集（Modbus TCP / RTU）：
 
 安全加固：
 
-- `POST /temperature` 支持可选共享密钥 `TEMPERATURE_API_KEY`：设置后请求必须携带 `X-Temperature-Key`（或复用 `X-History-Key`）头；留空保持无鉴权以兼容旧 HA 配置。Add-on 新增 `temperature_api_key` 选项。
+- `POST /temperature` 支持共享密钥 `TEMPERATURE_API_KEY`：设置后请求必须携带 `X-Temperature-Key`（或复用 `X-History-Key`）头；`TEMPERATURE_AUTH_REQUIRED` 可在旧部署中显式关闭，但 Compose 生产部署与 Add-on 默认开启鉴权。Add-on 提供密钥和鉴权开关选项。
 - 容器改为非 root 用户（uid/gid 1000）运行；自动部署脚本会修正宿主 `data/`、`logs/` 目录属主，手动部署需确保目录可被 uid 1000 写入。
 - 新增请求体大小上限 `MAX_CONTENT_LENGTH`（默认 16KB），超限返回 413。
 - Compose 为容器 stdout 配置 `json-file` 日志轮转（10MB × 3 个文件）。

@@ -296,19 +296,31 @@ def temperature():
 
 @temperature_bp.get("/health")
 def health():
-    # Docker/Kubernetes must observe the alarm runtime, not merely the Flask
-    # listener.  Otherwise sample ingestion can look healthy while event and
-    # notification processing has silently stopped.
+    # In shadow/active modes, Docker/Kubernetes must observe the alarm runtime,
+    # not merely the Flask listener. In disabled mode the runtime is purposely
+    # stopped and health tracks the base ingestion service instead.
     from runtime.bootstrap import runtime_liveness, runtime_readiness
 
     runtime = runtime_liveness()
     readiness = runtime_readiness()
-    active_mode = str(config.AUTOMATION_MODE).strip().lower() == "active"
+    automation_mode = str(config.AUTOMATION_MODE).strip().lower()
+    active_mode = automation_mode == "active"
+    runtime_required = automation_mode in {"active", "shadow"}
     scheduler_running = bool(
         runtime.get("scheduler_running")
         or runtime.get("scheduler", {}).get("running")
     )
-    runtime_healthy = bool(runtime.get("available")) and scheduler_running
+    # disabled is a supported legacy-ingestion mode: its background runtime
+    # intentionally does not start, while the Flask/collector service remains
+    # live. Invalid modes and enabled runtimes still fail closed here.
+    runtime_healthy = (
+        automation_mode == "disabled"
+        or (
+            runtime_required
+            and bool(runtime.get("available"))
+            and scheduler_running
+        )
+    )
     started_at = runtime.get("started_at")
     startup_grace = False
     if active_mode and not readiness.get("ready") and started_at:
@@ -330,7 +342,8 @@ def health():
     status_code = 200 if runtime_healthy else 503
     return jsonify({
         "status": (
-            "ok" if health_ok and readiness.get("ready")
+            "disabled" if automation_mode == "disabled"
+            else "ok" if health_ok and readiness.get("ready")
             else "starting" if health_ok and startup_grace
             else "degraded"
         ),

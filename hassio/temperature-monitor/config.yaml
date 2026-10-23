@@ -1,5 +1,5 @@
 name: Temperature Monitor
-version: 1.2.2
+version: 1.2.3
 slug: temperature_monitor
 description: Receive Home Assistant temperature and humidity readings and sync them to Feishu Bitable.
 url: https://github.com/neilchen-dev/temperature-monitor
@@ -73,6 +73,7 @@ options:
   feishu_projection_inline_suppress_seconds: 30
   feishu_projection_attempt_timeout_seconds: 5
   history_api_key: ""
+  temperature_auth_required: true
   temperature_api_key: ""
   history_devices: ""
   history_interval_minutes: 10
@@ -157,6 +158,7 @@ schema:
   feishu_projection_inline_suppress_seconds: int(0,3600)
   feishu_projection_attempt_timeout_seconds: int(1,60)
   history_api_key: password
+  temperature_auth_required: bool
   temperature_api_key: password
   history_devices: str
   history_interval_minutes: int(1,1440)

@@ -84,12 +84,13 @@ PUT 写入口返回冲突，不得改变生产运行标准。
 
 ## 部署门禁
 
-部署 workflow 在拉取新镜像和启动迁移前，使用 SQLite online backup API 创建
-`data/backups/temperature_monitor_<UTC>.db`，兼容 WAL，并对备份执行 `PRAGMA quick_check`。
-备份、quick check 或容器内备份目录创建任一步失败，都会阻止后续部署。启动后的健康检查
-还必须确认 `/api/system/status` 中 `runtime.available=true`；首次部署时允许
-`standards_ready=false`，但必须等一次严格 Feishu sync 成功后才允许 Active 写回。
-失败同步只保留 `last-known-good`，保留的备份用于人工回滚数据库；标准历史和 snapshot
+当前 GitHub 部署 workflow 不会自动创建 SQLite 备份，也不执行全库扫描。涉及 schema
+迁移或高风险变更的发布前，维护人员必须按维护手册完成 SQLite online backup 和
+`PRAGMA quick_check`，并确认独立存储中有可恢复副本；普通镜像回滚不会还原数据库。
+部署后的 `/health` 按 `AUTOMATION_MODE` 检查：`disabled` 只要求基础服务存活，
+`shadow`/`active` 还要求 Runtime 和 scheduler 可用；`/readyz` 是更严格的业务就绪门禁。
+首次部署时允许 `standards_ready=false`，但 Active 写回必须等一次严格 Feishu sync
+成功且 readiness 条件满足。失败同步只保留 `last-known-good`；标准历史和 snapshot
 记录不做覆盖式迁移。
 
 ## 故障语义

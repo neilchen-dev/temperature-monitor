@@ -166,7 +166,7 @@ Home Assistant Add-on options.json (/data/options.json)
 - **Add-on 环境自动切换数据目录**（`config.py:121-125`）：容器内 `/app/data` 升级即丢，HA Supervisor 的 `/data` 才持久。检测到 options.json 存在即默认切到 `/data`。
 - **类型化读取器 fail-fast**：`_get_int/_get_float`（`config.py:89-106`）遇到非法值直接抛 `ValueError`，带"哪个变量、当前值是什么"的错误消息——配置错误在启动瞬间暴露，而不是运行到一半才发现。
 - **两类校验时机**：结构校验（设备映射的 JSON 格式、去重，`config.py:169-256`）在 import 时执行；Modbus 寄存器映射故意**惰性解析**（`config.py:293` 只存原始字符串，`MODBUS_ENABLED=true` 且真正构造 poller 时才 parse，非法只禁用采集不影响启动，`collector.py:76-82`）。
-- **安全默认**：`MODBUS_ENABLED=false`（未开启时行为与旧版完全一致）、`HISTORY_CLEANUP_ENABLED=false`（删除类功能默认硬关）、鉴权 key 默认空但读 API 未配 key 返回 503（见 §9）。
+- **安全默认**：`MODBUS_ENABLED=false`、`HISTORY_CLEANUP_ENABLED=false`；读 API 未配 `HISTORY_API_KEY` 返回 503。温度上报在代码兼容模式中可匿名，但生产 Compose 与 Add-on 强制 `TEMPERATURE_AUTH_REQUIRED=true`，部署前检查 `TEMPERATURE_API_KEY`（见 §9）。
 
 ---
 
@@ -178,7 +178,8 @@ Home Assistant Add-on options.json (/data/options.json)
 POST /temperature  {device, temperature, humidity, status?}
 │
 ├─ 1 鉴权（temperature.py:22-33）
-│    TEMPERATURE_API_KEY 为空 → 放行（兼容旧部署）
+│    TEMPERATURE_API_KEY 为空且 TEMPERATURE_AUTH_REQUIRED=true → 503
+│    鉴权未强制且 key 为空 → 放行（兼容旧部署）
 │    非空 → 必须带 X-Temperature-Key（或 X-History-Key），hmac.compare_digest 比较
 │    ※ compare_digest 而不是 ==：防时序侧信道逐字节猜测密钥
 │
@@ -371,9 +372,9 @@ poll_once()（:422-490）
 | `/history/query` `/history/stats/*`（analytics.py:16-30） | 503 | 401 |
 | `/dashboard`（dashboard.py:124-141） | 503 | 401（支持 `?key=` 或 Bearer） |
 | `/health` `/api/system/status` | 无鉴权（只回健康摘要） | — |
-| `/temperature` | 无鉴权（可选 TEMPERATURE_API_KEY） | 401 |
+| `/temperature`、`/temperature/heartbeat` | 生产 Compose / Add-on 必须配置 `TEMPERATURE_API_KEY`；HA 应发送 `X-Temperature-Key`，接口仍兼容 `X-History-Key`；鉴权未开启且 key 为空时可匿名 | 401；鉴权强制但 key 未配置时 503 |
 
-**"未配 key 返回 503 而不是放行"是推翻过一次的决策**：早期版本"未配置即开放"图省事，review 时认定违反最小权限——已有部署升级后绝不能静默获得无鉴权读能力，宁可 503 逼运维显式配置。503（服务不可用）而非 401（未认证）语义也更准确：不是"你没权限"，是"这套能力没启用"。
+`HISTORY_API_KEY` 缺失时，受保护的查询接口返回 503。温度上报使用单独的兼容开关：生产 Compose 和 Add-on 默认强制鉴权，未配置 key 时返回 503；旧式部署只有在未强制鉴权时才保留匿名兼容行为。
 
 ### 9.2 统一模型读 API（routes/api.py）
 
@@ -639,7 +640,7 @@ db.py（初始化失败只停用镜像）、devices.record_sample（异常全吞
 pymodbus/pyserial 是可选依赖：未启用 Modbus 的部署不需要装；import 延迟到工厂函数内；寄存器映射解析延迟到真正启用时，非法值只禁用采集（collector.py:76-82）。效果：核心服务（飞书链路）的可用性与工业采集依赖完全解耦。
 
 **⑫ CI/CD 用 commit SHA 镜像 + 应用层回滚。**
-SHA 不可变可回滚；workflow_run 保证测试与部署同一 commit；rollback 是 shell 函数（改 .env tag → up → health gate），分钟级恢复，零基础设施成本（§15.2）。
+SHA 不可变可回滚；受保护的 workflow_run 只接受本仓库 main 分支 push 的成功测试，并部署同一 commit；rollback 是 shell 函数（改 .env tag → up → health gate）。镜像回滚不恢复 SQLite；schema/高风险发布前需人工备份（§15.2）。
 
 ---
 

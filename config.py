@@ -28,6 +28,7 @@ def _load_hassio_options() -> None:
         "app_token": "APP_TOKEN",
         "table_id": "TABLE_ID",
         "history_api_key": "HISTORY_API_KEY",
+        "temperature_auth_required": "TEMPERATURE_AUTH_REQUIRED",
         "temperature_api_key": "TEMPERATURE_API_KEY",
         "history_devices": "HISTORY_DEVICES",
         "history_interval_minutes": "HISTORY_INTERVAL_MINUTES",
@@ -200,9 +201,10 @@ SQLITE_DB_PATH = Path(
     os.getenv("SQLITE_DB_PATH", str(DATA_DIR / "temperature_monitor.db"))
 )
 
-# 温度上报接口的可选共享密钥；设置后 /temperature 必须携带
-# X-Temperature-Key 头（或 X-History-Key），留空则保持无鉴权以兼容旧配置。
+# 温度上报接口共享密钥；设置后 /temperature 必须携带
+# X-Temperature-Key 头（兼容 X-History-Key）。生产 Compose 与 Add-on 显式要求鉴权。
 TEMPERATURE_API_KEY = os.getenv("TEMPERATURE_API_KEY", "").strip()
+TEMPERATURE_AUTH_REQUIRED = _get_bool("TEMPERATURE_AUTH_REQUIRED", False)
 
 # 请求体大小上限，防止异常大的 payload 占用内存。
 MAX_CONTENT_LENGTH = _get_int("MAX_CONTENT_LENGTH", 16 * 1024)

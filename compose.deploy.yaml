@@ -2,3 +2,5 @@
 services:
   temperature-monitor:
     image: ${DEPLOY_IMAGE:?Set DEPLOY_IMAGE to the release image}
+    environment:
+      TEMPERATURE_AUTH_REQUIRED: "true"

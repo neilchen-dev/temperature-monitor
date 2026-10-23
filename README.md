@@ -120,10 +120,10 @@ Home Assistant 是一种数据源，不是系统架构中心。Modbus 采集器�
 
 | Endpoint | Purpose | Auth |
 | --- | --- | --- |
-| `GET /health` | 进程及运行时存活探针；不因业务 readiness 阻塞而重启 | 无 |
+| `GET /health` | 基础进程存活探针；Active/Shadow 也检查运行时存活，不因业务 readiness 阻塞而重启 | 无 |
 | `GET /readyz` | 严格告警链路就绪探针，未就绪返回 `503` | 无 |
-| `POST /temperature` | 接收 Home Assistant 温湿度上报 | `TEMPERATURE_API_KEY` 可选 |
-| `POST /temperature/heartbeat` | 接收 Home Assistant 在线心跳，不新增测量历史 | `TEMPERATURE_API_KEY` 可选 |
+| `POST /temperature` | 接收 Home Assistant 温湿度上报 | 生产 Compose / Add-on 必须提供正确密钥；HA 应发送 `X-Temperature-Key`，兼容路径也接受 `X-History-Key` |
+| `POST /temperature/heartbeat` | 接收 Home Assistant 在线心跳，不新增测量历史 | 生产 Compose / Add-on 必须提供正确密钥；HA 应发送 `X-Temperature-Key`，兼容路径也接受 `X-History-Key` |
 | `POST /history/sample` | 生成历史快照 | `X-History-Key` |
 | `GET /console` | 工业监控台 | 页面壳无；数据请求需 `X-History-Key` |
 | `GET /dashboard` | 本地分析看板 | `HISTORY_API_KEY` 登录 |
@@ -198,10 +198,11 @@ APP_SECRET=your_feishu_app_secret
 APP_TOKEN=your_bitable_app_token
 TABLE_ID=your_table_id
 HISTORY_API_KEY=replace-with-a-long-random-secret
+TEMPERATURE_AUTH_REQUIRED=true
 TEMPERATURE_API_KEY=replace-with-another-long-random-secret
 ```
 
-生产配置建议启用温度上报鉴权，并同步设置 Home Assistant 的 `X-Temperature-Key` 请求头。可用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 本地生成随机密钥，不要提交 `.env`。
+Compose 生产部署和 Home Assistant Add-on 默认要求温度上报鉴权；请为服务设置至少 32 字节随机 `TEMPERATURE_API_KEY`，并把同一密钥存入 HA `secrets.yaml`，通过 `X-Temperature-Key` 发送。可用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 本地生成，不要提交 `.env` 或 secrets.yaml。代码为旧部署保留兼容默认值（未开启 `TEMPERATURE_AUTH_REQUIRED` 时可匿名）；对外暴露服务必须显式开启鉴权，只有隔离可信网络才考虑保留匿名兼容。
 
 启动服务：
 
@@ -266,7 +267,8 @@ Analytics:    http://127.0.0.1:5000/dashboard
 | `FEISHU_NOTIFY_ATTEMPT_TIMEOUT_SECONDS` | `5` | 单次通知外部请求超时；调度器负责跨任务重试 |
 | `ACTIVE_EVENT_RECONCILIATION_*` | `30` / `600` | Active 异常事件 CREATE/UPDATE 失败后的持久化 reconciliation 退避秒数与上限 |
 | `SHADOW_*_SECONDS` | 见 `.env.example` | Shadow 调度、作业同步、标准同步和飞书延迟窗口 |
-| `TEMPERATURE_API_KEY` | 空 | 可选的温度上报接口共享密钥 |
+| `TEMPERATURE_AUTH_REQUIRED` | Compose 示例及 Add-on 默认 `true`；代码兼容默认 `false` | 是否在缺少上报密钥时拒绝温度和 heartbeat 请求；生产 Compose 强制开启 |
+| `TEMPERATURE_API_KEY` | 空 | 温度上报共享密钥；生产至少 32 字节，并与 HA secret 一致 |
 | `HISTORY_DEVICES` | `TH-01,…,TH-11` | 历史采样设备列表；覆盖时必须同步配置 `HISTORY_TABLE_MAP` |
 | `HISTORY_TABLE_MAP` | 空 | 设备编号到历史表 ID 的 JSON 映射 |
 | `HISTORY_INTERVAL_MINUTES` | `10` | 历史采样去重时间桶 |
@@ -304,6 +306,7 @@ rest_command:
     method: POST
     headers:
       Content-Type: application/json
+      X-Temperature-Key: !secret temperature_monitor_temperature_api_key
     payload: >
       {
         "device": "{{ device }}",
@@ -316,6 +319,7 @@ rest_command:
     method: POST
     headers:
       Content-Type: application/json
+      X-Temperature-Key: !secret temperature_monitor_temperature_api_key
       X-History-Key: !secret temperature_monitor_history_api_key
     payload: "{}"
 
@@ -359,7 +363,7 @@ Pull request / push
         ▼
 tests.yml
 Python 3.12 · ruff · pytest
-        │ main 分支测试成功
+        │ main 分支 push 的测试成功
         ▼
 deploy.yml（workflow_run）
 构建并推送 <commit SHA> 与 latest 镜像
@@ -367,7 +371,7 @@ deploy.yml（workflow_run）
         ▼
 SSH → 同步精确 SHA，设置 DEPLOY_IMAGE
      → 两个 Compose 文件 pull / up --wait
-     → 核对运行镜像、GET /health、GET /readyz
+     → 核对运行镜像、GET /health；active/shadow 再看 GET /readyz
         │
         ├─ 成功：完成部署
         └─ 部署或存活失败：按实际旧镜像 ID 回滚
@@ -390,10 +394,15 @@ export DEPLOY_IMAGE="your-registry.example.com/your-namespace/temperature-monito
 docker compose -f compose.yaml -f compose.deploy.yaml pull
 docker compose -f compose.yaml -f compose.deploy.yaml up -d --remove-orphans --wait --wait-timeout 600
 curl --fail http://127.0.0.1:5000/health
-curl --fail http://127.0.0.1:5000/readyz
 ```
 
-以上命令适用于端口 5000；自定义端口时替换 URL。`/readyz` 的非 200 响应需要检查标准同步、任务阻塞与缓存年龄，不能只凭容器存活判定告警链路已就绪。
+以上命令适用于端口 5000；自定义端口时替换 URL。`AUTOMATION_MODE=disabled` 是基础采集模式，`/health` 返回 200、状态为 `disabled`，无需通过 `/readyz`。Active/Shadow 下 `/readyz` 的非 200 响应需要检查标准同步、任务阻塞与缓存年龄；当前 CD 会报告 readiness 阻塞，但不会只凭该阻塞回滚仍存活的新镜像。
+
+只有 `AUTOMATION_MODE=active` 或 `shadow` 时，再单独检查告警链路就绪：
+
+```bash
+curl --fail http://127.0.0.1:5000/readyz
+```
 
 ### 备份保留预览
 
@@ -473,6 +482,9 @@ node tests/console_async.test.cjs
 排查时先保存健康响应和错误时间，再核对服务日志；对外分享日志和截图前移除凭据、人员信息、内网地址与资源标识。
 
 ## Documentation
+
+- [系统维护与传感器接入手册](docs/maintenance-handover.md)：新设备全链路接入、日常巡检、备份恢复和发布回滚。
+- [温湿度控制操作手册](docs/temperature-humidity-control-manual.md)：现场巡检、异常闭环和飞书环境标准维护。
 
 - [`.env.example`](.env.example)：完整配置模板和安全说明；
 - [`overview.md`](overview.md)：项目调用链和三条数据链路概览；

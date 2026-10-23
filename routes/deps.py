@@ -1,9 +1,11 @@
 """Shared request dependencies for the route blueprints.
 
-All key checks are timing-safe (``hmac.compare_digest``) and fail closed:
-an unconfigured key returns 503 instead of silently granting access.
-Query-string keys are deliberately not accepted — they leak into browser
-history, bookmarks, and gateway access logs.
+All configured key comparisons are timing-safe (``hmac.compare_digest``).
+Protected history endpoints fail closed when their key is unconfigured;
+temperature ingestion retains a legacy compatibility mode unless
+``TEMPERATURE_AUTH_REQUIRED`` is enabled. Query-string keys are deliberately
+not accepted — they leak into browser history, bookmarks, and gateway access
+logs.
 """
 
 from __future__ import annotations
@@ -41,10 +43,17 @@ def history_auth_error() -> Any:
 def temperature_auth_error() -> Any:
     """Optional shared-key gate for ``/temperature``.
 
-    Stays disabled (returns None) when ``TEMPERATURE_API_KEY`` is empty to
-    keep legacy unauthenticated HA configurations working.
+    Legacy installations may leave ``TEMPERATURE_AUTH_REQUIRED`` false (the
+    application compatibility default). Production Compose and the Home
+    Assistant Add-on set it true, so a missing key fails closed instead of
+    silently exposing ingestion.
     """
     if not config.TEMPERATURE_API_KEY:
+        if config.TEMPERATURE_AUTH_REQUIRED:
+            return jsonify({
+                "status": "error",
+                "error": "温度上报鉴权未配置",
+            }), 503
         return None
 
     provided = (
